@@ -29,6 +29,10 @@ async def send_modlog_embed(
         return
 
     try:
-        await channel.send(embed=embed, view=view)
+        await channel.send(
+            embed=embed,
+            view=view,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
     except (discord.Forbidden, discord.HTTPException):
         return

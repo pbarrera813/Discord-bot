@@ -190,9 +190,9 @@ class DiscordModBot(commands.Bot):
         )
         if command_input:
             embed.add_field(
-                name=tr(lang, "Input", "Entrada"),
+                name=tr(lang, "Entry", "Entrada"),
                 value=command_input[:1024],
-                inline=False,
+                inline=True,
             )
         await send_modlog_embed(guild, self.db, embed)
 

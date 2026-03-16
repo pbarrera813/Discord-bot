@@ -1227,7 +1227,7 @@ class ModerationCog(commands.Cog):
 
         lines: list[str] = []
         if added_roles:
-            roles_text = ", ".join(role.name for role in added_roles)
+            roles_text = ", ".join(role.mention for role in added_roles)
             lines.append(
                 tr(
                     lang,
@@ -1236,7 +1236,7 @@ class ModerationCog(commands.Cog):
                 )
             )
         if removed_roles:
-            roles_text = ", ".join(role.name for role in removed_roles)
+            roles_text = ", ".join(role.mention for role in removed_roles)
             lines.append(
                 tr(
                     lang,
@@ -2178,7 +2178,7 @@ class ModerationCog(commands.Cog):
             ctx.guild,
             title="Channel Locked",
             moderator=ctx.author,
-            target=f"#{channel.name} ({channel.id})",
+            target=channel.mention,
             reason="Manual channel lock",
         )
 
@@ -2266,7 +2266,7 @@ class ModerationCog(commands.Cog):
             ctx.guild,
             title="Channel Unlocked",
             moderator=ctx.author,
-            target=f"#{channel.name} ({channel.id})",
+            target=channel.mention,
             reason="Manual channel unlock",
         )
 
@@ -2365,7 +2365,7 @@ class ModerationCog(commands.Cog):
             ctx.guild,
             title="Slowmode Updated",
             moderator=ctx.author,
-            target=f"#{channel.name} ({channel.id})",
+            target=channel.mention,
             reason="Manual slowmode update",
             details=f"Slowmode: {seconds}s",
         )
