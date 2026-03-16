@@ -132,6 +132,27 @@ class FootballCog(commands.Cog):
         return str(home_name or "Unknown"), str(away_name or "Unknown")
 
     @staticmethod
+    def _fixture_team_logos(item: dict[str, Any]) -> tuple[str | None, str | None]:
+        teams = item.get("teams")
+        if not isinstance(teams, dict):
+            return None, None
+        home = teams.get("home")
+        away = teams.get("away")
+        home_logo = home.get("logo") if isinstance(home, dict) else None
+        away_logo = away.get("logo") if isinstance(away, dict) else None
+        home_logo_url = (
+            str(home_logo).strip()
+            if isinstance(home_logo, str) and str(home_logo).strip()
+            else None
+        )
+        away_logo_url = (
+            str(away_logo).strip()
+            if isinstance(away_logo, str) and str(away_logo).strip()
+            else None
+        )
+        return home_logo_url, away_logo_url
+
+    @staticmethod
     def _fixture_score(item: dict[str, Any]) -> str:
         goals = item.get("goals")
         if not isinstance(goals, dict):
@@ -166,6 +187,56 @@ class FootballCog(commands.Cog):
         if isinstance(iso, str) and iso.strip():
             return iso.strip().replace("T", " ").replace("+00:00", " UTC")
         return "N/A"
+
+    def _build_match_embed(
+        self,
+        *,
+        lang: str,
+        league_label: str,
+        item: dict[str, Any],
+        title_en: str,
+        title_es: str,
+        color: discord.Color,
+        index: int,
+        total: int,
+    ) -> discord.Embed:
+        fixture = item.get("fixture")
+        if not isinstance(fixture, dict):
+            fixture = {}
+        home, away = self._fixture_teams(item)
+        home_logo, away_logo = self._fixture_team_logos(item)
+        score = self._fixture_score(item)
+        status = self._fixture_status(fixture)
+        round_name = self._fixture_round(item)
+        match_time = self._match_datetime(item)
+
+        page_suffix = f" ({index}/{total})" if total > 1 else ""
+        title = tr(
+            lang,
+            f"{league_label} - {title_en}{page_suffix}",
+            f"{league_label} - {title_es}{page_suffix}",
+        )
+        embed = discord.Embed(
+            title=title,
+            color=color,
+            timestamp=datetime.now(timezone.utc),
+        )
+        if home_logo:
+            embed.set_author(name=home, icon_url=home_logo)
+        else:
+            embed.set_author(name=home)
+
+        details = [f"**{home} vs {away}**", f"**{score}**", status, match_time]
+        if round_name:
+            details.append(round_name)
+        embed.description = "\n".join(details)[:4096]
+
+        if away_logo:
+            embed.set_footer(text=away, icon_url=away_logo)
+        else:
+            embed.set_footer(text=away)
+
+        return embed
 
     async def _defer_if_needed(self, ctx: commands.Context) -> None:
         if ctx.interaction and not ctx.interaction.response.is_done():
@@ -224,25 +295,34 @@ class FootballCog(commands.Cog):
             )
             return
 
-        embed = discord.Embed(
-            title=tr(lang, f"{league_label} - Live", f"{league_label} - En vivo"),
-            color=discord.Color.green(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        for item in fixtures[:10]:
-            title, details = self._format_fixture_line(item)
-            embed.add_field(name=title, value=details[:1024], inline=False)
-
-        if len(fixtures) > 10:
-            embed.set_footer(
-                text=tr(
-                    lang,
-                    f"Showing 10 of {len(fixtures)} live matches.",
-                    f"Mostrando 10 de {len(fixtures)} partidos en vivo.",
+        shown = min(len(fixtures), 10)
+        embeds: list[discord.Embed] = []
+        for idx, item in enumerate(fixtures[:shown], start=1):
+            embeds.append(
+                self._build_match_embed(
+                    lang=lang,
+                    league_label=league_label,
+                    item=item,
+                    title_en="Live",
+                    title_es="En vivo",
+                    color=discord.Color.green(),
+                    index=idx,
+                    total=shown,
                 )
             )
 
-        await ctx.send(embed=embed)
+        if len(fixtures) > shown:
+            embeds[-1].add_field(
+                name=tr(lang, "Notice", "Aviso"),
+                value=tr(
+                    lang,
+                    f"Showing {shown} of {len(fixtures)} live matches.",
+                    f"Mostrando {shown} de {len(fixtures)} partidos en vivo.",
+                ),
+                inline=False,
+            )
+
+        await ctx.send(embeds=embeds)
 
     @football.command(
         name="today",
@@ -294,17 +374,23 @@ class FootballCog(commands.Cog):
             )
             return
 
-        embed = discord.Embed(
-            title=tr(lang, f"{league_label} - Today", f"{league_label} - Hoy"),
-            color=discord.Color.blurple(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        for item in fixtures[:10]:
-            title, details = self._format_fixture_line(item)
-            match_time = self._match_datetime(item)
-            embed.add_field(name=title, value=f"{details}\n{match_time}"[:1024], inline=False)
+        shown = min(len(fixtures), 10)
+        embeds: list[discord.Embed] = []
+        for idx, item in enumerate(fixtures[:shown], start=1):
+            embeds.append(
+                self._build_match_embed(
+                    lang=lang,
+                    league_label=league_label,
+                    item=item,
+                    title_en="Today",
+                    title_es="Hoy",
+                    color=discord.Color.blurple(),
+                    index=idx,
+                    total=shown,
+                )
+            )
 
-        await ctx.send(embed=embed)
+        await ctx.send(embeds=embeds)
 
     @football.command(
         name="next",
@@ -379,17 +465,23 @@ class FootballCog(commands.Cog):
             )
             return
 
-        embed = discord.Embed(
-            title=tr(lang, f"{league_label} - Upcoming", f"{league_label} - Proximos"),
-            color=discord.Color.gold(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        for item in fixtures[:count]:
-            title, details = self._format_fixture_line(item)
-            match_time = self._match_datetime(item)
-            embed.add_field(name=title, value=f"{match_time}\n{details}"[:1024], inline=False)
+        shown = min(len(fixtures), count)
+        embeds: list[discord.Embed] = []
+        for idx, item in enumerate(fixtures[:shown], start=1):
+            embeds.append(
+                self._build_match_embed(
+                    lang=lang,
+                    league_label=league_label,
+                    item=item,
+                    title_en="Upcoming",
+                    title_es="Proximos",
+                    color=discord.Color.gold(),
+                    index=idx,
+                    total=shown,
+                )
+            )
 
-        await ctx.send(embed=embed)
+        await ctx.send(embeds=embeds)
 
     async def _run_next_for_team(
         self,
@@ -469,6 +561,8 @@ class FootballCog(commands.Cog):
         title, details = self._format_fixture_line(item)
         match_time = self._match_datetime(item)
         round_name = self._fixture_round(item)
+        home, away = self._fixture_teams(item)
+        home_logo, away_logo = self._fixture_team_logos(item)
 
         embed = discord.Embed(
             title=tr(
@@ -479,6 +573,10 @@ class FootballCog(commands.Cog):
             color=discord.Color.gold(),
             timestamp=datetime.now(timezone.utc),
         )
+        if home_logo:
+            embed.set_author(name=home, icon_url=home_logo)
+        elif home:
+            embed.set_author(name=home)
         embed.add_field(
             name=tr(lang, "Match", "Partido"),
             value=title,
@@ -500,6 +598,10 @@ class FootballCog(commands.Cog):
                 value=round_name,
                 inline=False,
             )
+        if away_logo:
+            embed.set_footer(text=away, icon_url=away_logo)
+        elif away:
+            embed.set_footer(text=away)
 
         await ctx.send(embed=embed)
 
@@ -588,6 +690,7 @@ class FootballCog(commands.Cog):
         league_label = self._league_label(league_key, lang)
         item = fixtures[0]
         home, away = self._fixture_teams(item)
+        home_logo, away_logo = self._fixture_team_logos(item)
         score = self._fixture_score(item)
         fixture = item.get("fixture") if isinstance(item.get("fixture"), dict) else {}
         status = self._fixture_status(fixture)
@@ -603,6 +706,10 @@ class FootballCog(commands.Cog):
             color=discord.Color.green(),
             timestamp=datetime.now(timezone.utc),
         )
+        if home_logo:
+            embed.set_author(name=home, icon_url=home_logo)
+        elif home:
+            embed.set_author(name=home)
         embed.add_field(
             name=tr(lang, "Match", "Partido"),
             value=f"{home} vs {away}",
@@ -629,6 +736,10 @@ class FootballCog(commands.Cog):
                 value=round_name,
                 inline=False,
             )
+        if away_logo:
+            embed.set_footer(text=away, icon_url=away_logo)
+        elif away:
+            embed.set_footer(text=away)
 
         await ctx.send(embed=embed)
 
