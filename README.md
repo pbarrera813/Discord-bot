@@ -1,7 +1,7 @@
 # Nitori Discord Bot
 
 ## Why This Bot Exists
-Nitori was built as a single, no-paywall Discord bot for communities that want one bot for moderation, AI chat, memes, jokes, WHOIS, advice, dad jokes, Minecraft checks, Liga MX stats, reminders, and code execution.
+Nitori was built as a single, no-paywall Discord bot for communities that want one bot for moderation, AI chat, memes, jokes, WHOIS, advice, dad jokes, Minecraft checks, Liga MX, Premier League, LaLiga and Concacaf champions cup checks, reminders, and code execution.
 
 ## Core Idea
 - One bot, all-in-one workflow.
