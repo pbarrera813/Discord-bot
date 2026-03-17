@@ -234,5 +234,5 @@ WantedBy=multi-user.target
 ```
 
 ## Git Safety
-- Do not commit `.env`.
-- Keep tokens and secrets out of repository history.
+- Do not commit `.env`. (bad people could steal your api keys, they got scan bots for that!)
+- Keep tokens and secrets out of repository history (in case you clone it, keep this in mind).
