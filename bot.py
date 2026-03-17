@@ -181,19 +181,13 @@ class DiscordModBot(commands.Bot):
         embed.add_field(
             name=tr(lang, "Command", "Comando"),
             value=f"`{command_name}`",
-            inline=True,
+            inline=False,
         )
         embed.add_field(
             name=tr(lang, "Type", "Tipo"),
             value=command_source,
             inline=True,
         )
-        if command_input:
-            embed.add_field(
-                name=tr(lang, "Entry", "Entrada"),
-                value=command_input[:1024],
-                inline=True,
-            )
         await send_modlog_embed(guild, self.db, embed)
 
     async def setup_hook(self) -> None:

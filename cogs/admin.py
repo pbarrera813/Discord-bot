@@ -505,13 +505,23 @@ class AdminCog(commands.Cog):
             if resolved is None:
                 labels = HELP_SECTION_LABELS_EN if lang == "en" else HELP_SECTION_LABELS_ES
                 available = ", ".join(f"`{labels.get(key, key)}`" for key in section_keys)
-                await ctx.send(
-                    tr(
-                        lang,
-                        f"Unknown help section. Try one of: {available}",
-                        f"Seccion de ayuda no valida. Prueba una de estas: {available}",
+                if ctx.interaction is not None:
+                    await ctx.send(
+                        tr(
+                            lang,
+                            f"Unknown help section. Try one of: {available}",
+                            f"Seccion de ayuda no valida. Prueba una de estas: {available}",
+                        ),
+                        ephemeral=True,
                     )
-                )
+                else:
+                    await ctx.send(
+                        tr(
+                            lang,
+                            f"Unknown help section. Try one of: {available}",
+                            f"Seccion de ayuda no valida. Prueba una de estas: {available}",
+                        ),
+                    )
                 return
             page_index = resolved
 
@@ -521,7 +531,10 @@ class AdminCog(commands.Cog):
             lang=lang,
         )
         view.current_page = page_index
-        sent = await ctx.send(embed=pages[page_index], view=view)
+        if ctx.interaction is not None:
+            sent = await ctx.send(embed=pages[page_index], view=view, ephemeral=True)
+        else:
+            sent = await ctx.send(embed=pages[page_index], view=view)
         if isinstance(sent, discord.Message):
             view.message = sent
 
