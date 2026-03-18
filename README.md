@@ -20,6 +20,7 @@ Nitori was built as a single, no-paywall Discord bot for communities that want o
 - Code execution (Glot API) for common languages.
 - Reminder system with DM and optional channel mention.
 - Welcome/Goodbye configurable announcement modules.
+- Birthday + anniversary module (community self-service + admin automation controls).
 - Per-server settings (prefix, language, AI channel scope, modlog).
 
 ## Requirements
@@ -164,6 +165,27 @@ Temp time format:
 Reminder units:
 - `m`, `h`, `d`, `w`, `mo`, `y`
 
+### Birthdays / Anniversaries
+Community commands:
+- `/birthday set <MM-DD|DD/MM> [birth_year] [timezone]`
+- `/birthday remove`
+- `/birthday next [count]`
+
+Admin commands (slash-visible for admins only):
+- `/birthday setup [channel] [role] [timezone]`
+- `/birthday channel [#channel]`
+- `/birthday role [@role]`
+- `/birthday timezone <iana_tz>`
+- `/birthday mode <user|server>`
+- `/birthday ages <true|false>`
+- `/birthday event <event_type> [enabled] [message_hour] [ping_setting]`
+- `/birthday templateadd <event_type> <template_text>`
+- `/birthday templatelist <event_type>`
+- `/birthday templateremove <event_type> <template_id>`
+- `/birthday blacklistuser <user> <true|false>`
+- `/birthday blacklistrole <role> <true|false>`
+- `/birthday trusted [role] [prevent_message] [prevent_role] [prevent_list]`
+
 ### Minecraft
 - `/srvstatus <ip-or-domain>`
 
@@ -234,5 +256,5 @@ WantedBy=multi-user.target
 ```
 
 ## Git Safety
-- Do not commit `.env`. (bad people could steal your api keys, they got scan bots for that!)
-- Keep tokens and secrets out of repository history (in case you clone it, keep this in mind).
+- Do not commit `.env` (scan bots can steal exposed API keys quickly).
+- Keep tokens and secrets out of repository history (even if you later rotate keys).

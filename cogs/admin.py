@@ -20,6 +20,12 @@ HELP_SECTION_ALIASES: dict[str, str] = {
     "indice": "sections",
     "secciones": "sections",
     "general": "general",
+    "birthday": "birthday",
+    "birthdays": "birthday",
+    "cumple": "birthday",
+    "cumples": "birthday",
+    "cumpleanos": "birthday",
+    "cumpleaños": "birthday",
     "ai": "general",
     "ia": "general",
     "chat": "general",
@@ -52,6 +58,7 @@ HELP_SECTION_LABELS_EN: dict[str, str] = {
     "basic": "basic",
     "sections": "sections",
     "general": "general",
+    "birthday": "birthday",
     "coding": "coding",
     "sports": "sports",
     "fun": "fun",
@@ -65,6 +72,7 @@ HELP_SECTION_LABELS_ES: dict[str, str] = {
     "basic": "basico",
     "sections": "secciones",
     "general": "general",
+    "birthday": "cumpleaños",
     "coding": "programacion",
     "sports": "deportes",
     "fun": "diversion",
@@ -118,7 +126,7 @@ class HelpPaginatorView(discord.ui.View):
             tr(
                 self.lang,
                 "Only the user who opened this help panel can control these buttons.",
-                "Solo el usuario que abriÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³ este panel de ayuda puede usar estos botones.",
+                "Solo el usuario que abrió este panel de ayuda puede usar estos botones.",
             ),
             ephemeral=True,
         )
@@ -305,8 +313,8 @@ class AdminCog(commands.Cog):
                     lang,
                     "I could not find enough user messages from the last 7 days in that channel. "
                     "If the channel is old/inactive, choose a more active one.",
-                    "No encontrÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â© suficientes mensajes de usuarios de los ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Âºltimos 7 dÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â­as en ese canal. "
-                    "Si el canal es antiguo o inactivo, elige uno mÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡s activo.",
+                    "No encontré suficientes mensajes de usuarios de los últimos 7 días en ese canal. "
+                    "Si el canal es antiguo o inactivo, elige uno más activo.",
                 )
             )
             return
@@ -342,7 +350,7 @@ class AdminCog(commands.Cog):
             tr(
                 lang,
                 "I now understand how the people in the server behave, I will talk like you from now!",
-                "Ahora entiendo cÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â³mo se comporta la gente en el servidor, ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡hablarÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â© como ustedes de ahora en adelante!",
+                "Ahora entiendo cómo se comporta la gente en el servidor, ¡hablaré como ustedes de ahora en adelante!",
             )
         )
 
@@ -357,9 +365,9 @@ class AdminCog(commands.Cog):
                 "If you want me to learn your server vibe, run `/setservercontext` and choose a text channel from the server list. "
                 "I will analyze the last 7 days of that channel.",
                 "Hola! Soy Nitori. Puedo ayudarte a moderar tu servidor, chatear con los usuarios "
-                "revisar el estado de servidores de Minecraft, seguir Liga MX y generar memes tambiÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©n!\n"
+                "revisar el estado de servidores de Minecraft, seguir Liga MX y generar memes también!\n"
                 "Si quieres que aprenda mejor la vibra del servidor, usa `/setservercontext` y elige un canal de texto de la lista del servidor. "
-                "AnalizarÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â© los ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Âºltimos 7 dÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â­as de ese canal.",
+                "Analizaré los últimos 7 días de ese canal.",
             )
         )
 
@@ -560,7 +568,7 @@ class AdminCog(commands.Cog):
     def _help_section_keys(self, member: discord.Member | None) -> list[str]:
         is_admin = self._is_admin_member(member)
         is_mod = self._is_mod_member(member)
-        keys = ["basic", "sections", "general", "coding", "sports", "fun"]
+        keys = ["basic", "sections", "general", "birthday", "coding", "sports", "fun"]
         if is_mod:
             keys.append("moderation")
         if is_admin:
@@ -659,6 +667,41 @@ Example: `/roast @User`"""
 `/srvstatus <ip_o_dominio>`
 Unidades de tiempo: `m`, `h`, `d`, `w`, `mo`, `y`
 Ejemplo: `/roast @User`"""
+
+        birthday_en = """`/birthday set <MM-DD|DD/MM> [birth_year] [timezone]` - Save your birthday.
+`/birthday remove` - Remove your birthday data from this server.
+`/birthday next [count]` - Show upcoming birthdays in this server.
+Examples:
+`/birthday set 07-14`
+`/birthday set 14/07 2001 America/Mexico_City`
+`/birthday remove`"""
+        birthday_es = """`/birthday set <MM-DD|DD/MM> [año_nacimiento] [zona_horaria]` - Guarda tu cumpleaños.
+`/birthday remove` - Elimina tus datos de cumpleaños de este servidor.
+`/birthday next [cantidad]` - Muestra los próximos cumpleaños del servidor.
+Ejemplos:
+`/birthday set 07-14`
+`/birthday set 14/07 2001 America/Mexico_City`
+`/birthday remove`"""
+        birthday_admin_en = """`/birthday setup [channel] [role] [timezone]` - Quick server birthday setup.
+`/birthday channel [#channel]` - Set/clear announcement channel.
+`/birthday role [@role]` - Set/clear birthday role.
+`/birthday timezone <iana_tz>` - Set server timezone.
+`/birthday mode <user|server>` - Choose timezone mode for birthdays.
+`/birthday ages <true|false>` - Show or hide ages.
+`/birthday event <type> [enabled] [hour] [ping]` - Configure event behavior.
+`/birthday templateadd|templatelist|templateremove` - Manage custom templates.
+`/birthday blacklistuser|blacklistrole <target> <true|false>` - Exclude users/roles.
+`/birthday trusted [role] [prevent_message] [prevent_role] [prevent_list]` - Trusted-role restrictions."""
+        birthday_admin_es = """`/birthday setup [canal] [rol] [zona_horaria]` - Configuracion rapida del modulo.
+`/birthday channel [#canal]` - Define/limpia el canal de anuncios.
+`/birthday role [@rol]` - Define/limpia el rol de cumpleanos.
+`/birthday timezone <zona_iana>` - Define zona horaria del servidor.
+`/birthday mode <user|server>` - Modo de zona horaria para cumpleanos.
+`/birthday ages <true|false>` - Muestra u oculta edades.
+`/birthday event <tipo> [activo] [hora] [ping]` - Configura el comportamiento del evento.
+`/birthday templateadd|templatelist|templateremove` - Gestiona plantillas personalizadas.
+`/birthday blacklistuser|blacklistrole <objetivo> <true|false>` - Excluye usuarios/roles.
+`/birthday trusted [rol] [prevent_message] [prevent_role] [prevent_list]` - Restricciones por rol confiable."""
 
         coding_en = """`/code code:<code> language:<language> [source_file]` - Compile/run code.
 `/codelangs` - List supported languages and file extensions.
@@ -874,24 +917,26 @@ Para canales en texto personalizado: usa `{#nombre-canal}` o `{12345678901234567
             "1. Basic help",
             "2. Sections index",
             "3. General / AI",
-            "4. Coding",
-            "5. Sports",
-            "6. Fun",
+            "4. Birthday",
+            "5. Coding",
+            "6. Sports",
+            "7. Fun",
         ]
         section_items_es = [
             "1. Ayuda basica",
             "2. Indice de secciones",
             "3. General / IA",
-            "4. Programacion",
-            "5. Deportes",
-            "6. Diversion",
+            "4. Cumpleaños",
+            "5. Programacion",
+            "6. Deportes",
+            "7. Diversion",
         ]
         if is_mod:
-            section_items_en.append("7. Moderation")
-            section_items_es.append("7. Moderacion")
+            section_items_en.append("8. Moderation")
+            section_items_es.append("8. Moderacion")
         if is_admin:
-            section_items_en.extend(["8. Admin", "9. Welcome/Goodbye", "10. Variables"])
-            section_items_es.extend(["8. Admin", "9. Welcome/Goodbye", "10. Variables"])
+            section_items_en.extend(["9. Admin", "10. Welcome/Goodbye", "11. Variables"])
+            section_items_es.extend(["9. Admin", "10. Welcome/Goodbye", "11. Variables"])
         sections_en = "\n".join(section_items_en)
         sections_es = "\n".join(section_items_es)
 
@@ -906,16 +951,25 @@ Para canales en texto personalizado: usa `{#nombre-canal}` o `{12345678901234567
         page3 = discord.Embed(title=tr(lang, "General / AI", "General / IA"), color=discord.Color.green())
         page3.add_field(name=tr(lang, "General + AI", "General + IA"), value=tr(lang, general_en, general_es), inline=False)
 
-        page4 = discord.Embed(title=tr(lang, "Coding", "Programacion"), color=discord.Color.dark_teal())
-        page4.add_field(name=tr(lang, "Code Execution", "Ejecucion de codigo"), value=tr(lang, coding_en, coding_es), inline=False)
+        page4 = discord.Embed(title=tr(lang, "Birthday", "Cumpleaños"), color=discord.Color.purple())
+        page4.add_field(name=tr(lang, "User Commands", "Comandos de usuario"), value=tr(lang, birthday_en, birthday_es), inline=False)
+        if is_admin:
+            page4.add_field(
+                name=tr(lang, "Admin Commands", "Comandos de admin"),
+                value=tr(lang, birthday_admin_en, birthday_admin_es),
+                inline=False,
+            )
 
-        page5 = discord.Embed(title=tr(lang, "Sports", "Deportes"), color=discord.Color.gold())
-        page5.add_field(name=tr(lang, "Football", "Football"), value=tr(lang, sports_en, sports_es), inline=False)
+        page5 = discord.Embed(title=tr(lang, "Coding", "Programacion"), color=discord.Color.dark_teal())
+        page5.add_field(name=tr(lang, "Code Execution", "Ejecucion de codigo"), value=tr(lang, coding_en, coding_es), inline=False)
 
-        page6 = discord.Embed(title=tr(lang, "Fun", "Diversion"), color=discord.Color.teal())
-        page6.add_field(name=tr(lang, "Meme + Ninja APIs", "Memes + APIs Ninja"), value=tr(lang, fun_en, fun_es), inline=False)
+        page6 = discord.Embed(title=tr(lang, "Sports", "Deportes"), color=discord.Color.gold())
+        page6.add_field(name=tr(lang, "Football", "Football"), value=tr(lang, sports_en, sports_es), inline=False)
 
-        pages = [page1, page2, page3, page4, page5, page6]
+        page7 = discord.Embed(title=tr(lang, "Fun", "Diversion"), color=discord.Color.teal())
+        page7.add_field(name=tr(lang, "Meme + Ninja APIs", "Memes + APIs Ninja"), value=tr(lang, fun_en, fun_es), inline=False)
+
+        pages = [page1, page2, page3, page4, page5, page6, page7]
         if is_mod:
             page_mod = discord.Embed(title=tr(lang, "Moderation Commands", "Comandos de Moderacion"), color=discord.Color.orange())
             page_mod.add_field(name=tr(lang, "Messages + Warnings", "Mensajes + Advertencias"), value=tr(lang, mod_a_en, mod_a_es), inline=False)
@@ -956,7 +1010,7 @@ Para canales en texto personalizado: usa `{#nombre-canal}` o `{12345678901234567
     def _set_page_footers(self, pages: list[discord.Embed], lang: str) -> None:
         total = len(pages)
         for index, embed in enumerate(pages, start=1):
-            prefix = tr(lang, "Page", "PÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡gina")
+            prefix = tr(lang, "Page", "P\u00e1gina")
             footer = tr(
                 lang,
                 "Use /help and the buttons to navigate.",
