@@ -1,7 +1,7 @@
 # Nitori Discord Bot
 
 ## Why This Bot Exists
-Nitori was built as a single, no-paywall Discord bot for communities that want one bot for moderation, AI chat, memes, jokes, WHOIS, advice, dad jokes, Minecraft checks, Liga MX, Premier League, LaLiga and Concacaf champions cup checks, reminders, and code execution.
+Nitori was built as a single, no-paywall Discord bot for communities that want basically an all in one bot. Nitori can chat with you via AI, moderate your server, run your code, check several football leagues, minecraft server status and remind everyone in the server of birthdays, join and server anniversaries. All of this without the need to pay for any of the functions and be able to use them, just add it to your server (or run it yourself), run the /setup command to know what to do and you are on!
 
 ## Core Idea
 - One bot, all-in-one workflow.
