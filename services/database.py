@@ -10,6 +10,7 @@ import aiosqlite
 
 AI_CHANNEL_ALL_MARKER = 0
 AI_CHANNEL_NONE_MARKER = -1
+BIRTHDAY_EVENT_TYPES = {"birthday", "member_anniversary", "server_anniversary"}
 
 
 @dataclass
@@ -218,6 +219,108 @@ class Database:
                 """
             )
 
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS birthday_guild_settings (
+                    guild_id INTEGER PRIMARY KEY,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    channel_id INTEGER,
+                    role_id INTEGER,
+                    server_timezone TEXT NOT NULL DEFAULT 'UTC',
+                    birthday_timezone_mode TEXT NOT NULL DEFAULT 'user',
+                    disable_ages INTEGER NOT NULL DEFAULT 0,
+                    trusted_role_id INTEGER,
+                    trusted_prevent_message INTEGER NOT NULL DEFAULT 0,
+                    trusted_prevent_role INTEGER NOT NULL DEFAULT 0,
+                    trusted_prevent_list INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS birthday_user_profiles (
+                    guild_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    month INTEGER NOT NULL,
+                    day INTEGER NOT NULL,
+                    birth_year INTEGER,
+                    timezone TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(guild_id, user_id)
+                )
+                """
+            )
+
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS birthday_event_settings (
+                    guild_id INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    message_hour INTEGER NOT NULL DEFAULT 9,
+                    ping_setting TEXT NOT NULL DEFAULT 'none',
+                    image_format TEXT NOT NULL DEFAULT 'none',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(guild_id, event_type)
+                )
+                """
+            )
+
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS birthday_message_templates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    template_text TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS birthday_dispatch_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    user_id INTEGER,
+                    event_date TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(guild_id, event_type, user_id, event_date)
+                )
+                """
+            )
+
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS birthday_blacklist_users (
+                    guild_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(guild_id, user_id)
+                )
+                """
+            )
+
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS birthday_blacklist_roles (
+                    guild_id INTEGER NOT NULL,
+                    role_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(guild_id, role_id)
+                )
+                """
+            )
+
             await conn.commit()
 
     @asynccontextmanager
@@ -270,6 +373,435 @@ class Database:
 
     async def get_guild_settings(self, guild_id: int) -> GuildSettings:
         return await self.get_or_create_guild_settings(guild_id)
+
+    @staticmethod
+    def _validate_birthday_event_type(event_type: str) -> str:
+        normalized = event_type.strip().lower()
+        if normalized not in BIRTHDAY_EVENT_TYPES:
+            raise ValueError(f"Unsupported birthday event type: {event_type}")
+        return normalized
+
+    async def get_or_create_birthday_guild_settings(self, guild_id: int) -> dict[str, Any]:
+        now = self._now_iso()
+        async with self._connect() as conn:
+            await conn.execute(
+                """
+                INSERT OR IGNORE INTO birthday_guild_settings
+                (guild_id, enabled, channel_id, role_id, server_timezone, birthday_timezone_mode,
+                 disable_ages, trusted_role_id, trusted_prevent_message, trusted_prevent_role,
+                 trusted_prevent_list, created_at, updated_at)
+                VALUES (?, 1, NULL, NULL, 'UTC', 'user', 0, NULL, 0, 0, 0, ?, ?)
+                """,
+                (guild_id, now, now),
+            )
+            await conn.commit()
+            cursor = await conn.execute(
+                """
+                SELECT guild_id, enabled, channel_id, role_id, server_timezone, birthday_timezone_mode,
+                       disable_ages, trusted_role_id, trusted_prevent_message, trusted_prevent_role,
+                       trusted_prevent_list
+                FROM birthday_guild_settings
+                WHERE guild_id = ?
+                """,
+                (guild_id,),
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row is not None else {}
+
+    async def update_birthday_guild_settings(
+        self,
+        guild_id: int,
+        *,
+        enabled: bool | None = None,
+        channel_id: int | None | object = Ellipsis,
+        role_id: int | None | object = Ellipsis,
+        server_timezone: str | None = None,
+        birthday_timezone_mode: str | None = None,
+        disable_ages: bool | None = None,
+        trusted_role_id: int | None | object = Ellipsis,
+        trusted_prevent_message: bool | None = None,
+        trusted_prevent_role: bool | None = None,
+        trusted_prevent_list: bool | None = None,
+    ) -> dict[str, Any]:
+        await self.get_or_create_birthday_guild_settings(guild_id)
+        updates: list[str] = []
+        values: list[Any] = []
+
+        if enabled is not None:
+            updates.append("enabled = ?")
+            values.append(1 if enabled else 0)
+        if channel_id is not Ellipsis:
+            updates.append("channel_id = ?")
+            values.append(channel_id)
+        if role_id is not Ellipsis:
+            updates.append("role_id = ?")
+            values.append(role_id)
+        if server_timezone is not None:
+            updates.append("server_timezone = ?")
+            values.append(server_timezone.strip())
+        if birthday_timezone_mode is not None:
+            updates.append("birthday_timezone_mode = ?")
+            values.append(birthday_timezone_mode.strip().lower())
+        if disable_ages is not None:
+            updates.append("disable_ages = ?")
+            values.append(1 if disable_ages else 0)
+        if trusted_role_id is not Ellipsis:
+            updates.append("trusted_role_id = ?")
+            values.append(trusted_role_id)
+        if trusted_prevent_message is not None:
+            updates.append("trusted_prevent_message = ?")
+            values.append(1 if trusted_prevent_message else 0)
+        if trusted_prevent_role is not None:
+            updates.append("trusted_prevent_role = ?")
+            values.append(1 if trusted_prevent_role else 0)
+        if trusted_prevent_list is not None:
+            updates.append("trusted_prevent_list = ?")
+            values.append(1 if trusted_prevent_list else 0)
+
+        if updates:
+            updates.append("updated_at = ?")
+            values.append(self._now_iso())
+            values.append(guild_id)
+            async with self._connect() as conn:
+                await conn.execute(
+                    f"UPDATE birthday_guild_settings SET {', '.join(updates)} WHERE guild_id = ?",
+                    tuple(values),
+                )
+                await conn.commit()
+        return await self.get_or_create_birthday_guild_settings(guild_id)
+
+    async def upsert_birthday_profile(
+        self,
+        *,
+        guild_id: int,
+        user_id: int,
+        month: int,
+        day: int,
+        birth_year: int | None,
+        timezone_name: str | None,
+    ) -> None:
+        now = self._now_iso()
+        async with self._connect() as conn:
+            await conn.execute(
+                """
+                INSERT INTO birthday_user_profiles
+                (guild_id, user_id, month, day, birth_year, timezone, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, user_id)
+                DO UPDATE SET
+                    month = excluded.month,
+                    day = excluded.day,
+                    birth_year = excluded.birth_year,
+                    timezone = excluded.timezone,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    guild_id,
+                    user_id,
+                    month,
+                    day,
+                    birth_year,
+                    timezone_name.strip() if isinstance(timezone_name, str) and timezone_name.strip() else None,
+                    now,
+                    now,
+                ),
+            )
+            await conn.commit()
+
+    async def get_birthday_profile(self, guild_id: int, user_id: int) -> dict[str, Any] | None:
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT guild_id, user_id, month, day, birth_year, timezone, created_at, updated_at
+                FROM birthday_user_profiles
+                WHERE guild_id = ? AND user_id = ?
+                """,
+                (guild_id, user_id),
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row is not None else None
+
+    async def delete_birthday_profile(self, guild_id: int, user_id: int) -> bool:
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                "DELETE FROM birthday_user_profiles WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
+            await conn.commit()
+            return bool(cursor.rowcount)
+
+    async def list_birthday_profiles(self, guild_id: int) -> list[dict[str, Any]]:
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT guild_id, user_id, month, day, birth_year, timezone, created_at, updated_at
+                FROM birthday_user_profiles
+                WHERE guild_id = ?
+                ORDER BY month ASC, day ASC, user_id ASC
+                """,
+                (guild_id,),
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_or_create_birthday_event_settings(
+        self,
+        guild_id: int,
+        event_type: str,
+    ) -> dict[str, Any]:
+        normalized = self._validate_birthday_event_type(event_type)
+        now = self._now_iso()
+        async with self._connect() as conn:
+            await conn.execute(
+                """
+                INSERT OR IGNORE INTO birthday_event_settings
+                (guild_id, event_type, enabled, message_hour, ping_setting, image_format, created_at, updated_at)
+                VALUES (?, ?, 1, 9, 'none', 'none', ?, ?)
+                """,
+                (guild_id, normalized, now, now),
+            )
+            await conn.commit()
+            cursor = await conn.execute(
+                """
+                SELECT guild_id, event_type, enabled, message_hour, ping_setting, image_format
+                FROM birthday_event_settings
+                WHERE guild_id = ? AND event_type = ?
+                """,
+                (guild_id, normalized),
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row is not None else {}
+
+    async def update_birthday_event_settings(
+        self,
+        guild_id: int,
+        event_type: str,
+        *,
+        enabled: bool | None = None,
+        message_hour: int | None = None,
+        ping_setting: str | None = None,
+        image_format: str | None = None,
+    ) -> dict[str, Any]:
+        normalized = self._validate_birthday_event_type(event_type)
+        await self.get_or_create_birthday_event_settings(guild_id, normalized)
+        updates: list[str] = []
+        values: list[Any] = []
+        if enabled is not None:
+            updates.append("enabled = ?")
+            values.append(1 if enabled else 0)
+        if message_hour is not None:
+            updates.append("message_hour = ?")
+            values.append(int(message_hour))
+        if ping_setting is not None:
+            updates.append("ping_setting = ?")
+            values.append(ping_setting.strip())
+        if image_format is not None:
+            updates.append("image_format = ?")
+            values.append(image_format.strip().lower())
+
+        if updates:
+            updates.append("updated_at = ?")
+            values.append(self._now_iso())
+            values.extend([guild_id, normalized])
+            async with self._connect() as conn:
+                await conn.execute(
+                    f"UPDATE birthday_event_settings SET {', '.join(updates)} WHERE guild_id = ? AND event_type = ?",
+                    tuple(values),
+                )
+                await conn.commit()
+        return await self.get_or_create_birthday_event_settings(guild_id, normalized)
+
+    async def list_birthday_event_settings(self, guild_id: int) -> list[dict[str, Any]]:
+        for event_type in sorted(BIRTHDAY_EVENT_TYPES):
+            await self.get_or_create_birthday_event_settings(guild_id, event_type)
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT guild_id, event_type, enabled, message_hour, ping_setting, image_format
+                FROM birthday_event_settings
+                WHERE guild_id = ?
+                ORDER BY event_type ASC
+                """,
+                (guild_id,),
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def count_birthday_templates(self, guild_id: int, event_type: str) -> int:
+        normalized = self._validate_birthday_event_type(event_type)
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM birthday_message_templates
+                WHERE guild_id = ? AND event_type = ?
+                """,
+                (guild_id, normalized),
+            )
+            row = await cursor.fetchone()
+            return int(row["total"]) if row else 0
+
+    async def add_birthday_template(
+        self,
+        guild_id: int,
+        event_type: str,
+        template_text: str,
+    ) -> int:
+        normalized = self._validate_birthday_event_type(event_type)
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                """
+                INSERT INTO birthday_message_templates
+                (guild_id, event_type, template_text, enabled, created_at, updated_at)
+                VALUES (?, ?, ?, 1, ?, ?)
+                """,
+                (guild_id, normalized, template_text, self._now_iso(), self._now_iso()),
+            )
+            await conn.commit()
+            return int(cursor.lastrowid)
+
+    async def list_birthday_templates(self, guild_id: int, event_type: str) -> list[dict[str, Any]]:
+        normalized = self._validate_birthday_event_type(event_type)
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT id, guild_id, event_type, template_text, enabled, created_at, updated_at
+                FROM birthday_message_templates
+                WHERE guild_id = ? AND event_type = ?
+                ORDER BY id ASC
+                """,
+                (guild_id, normalized),
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def delete_birthday_template(self, guild_id: int, event_type: str, template_id: int) -> bool:
+        normalized = self._validate_birthday_event_type(event_type)
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                """
+                DELETE FROM birthday_message_templates
+                WHERE guild_id = ? AND event_type = ? AND id = ?
+                """,
+                (guild_id, normalized, template_id),
+            )
+            await conn.commit()
+            return bool(cursor.rowcount)
+
+    async def was_birthday_event_dispatched(
+        self,
+        guild_id: int,
+        event_type: str,
+        user_id: int | None,
+        event_date: str,
+    ) -> bool:
+        normalized = self._validate_birthday_event_type(event_type)
+        async with self._connect() as conn:
+            if user_id is None:
+                cursor = await conn.execute(
+                    """
+                    SELECT 1 FROM birthday_dispatch_log
+                    WHERE guild_id = ? AND event_type = ? AND user_id IS NULL AND event_date = ?
+                    LIMIT 1
+                    """,
+                    (guild_id, normalized, event_date),
+                )
+            else:
+                cursor = await conn.execute(
+                    """
+                    SELECT 1 FROM birthday_dispatch_log
+                    WHERE guild_id = ? AND event_type = ? AND user_id = ? AND event_date = ?
+                    LIMIT 1
+                    """,
+                    (guild_id, normalized, user_id, event_date),
+                )
+            row = await cursor.fetchone()
+            return row is not None
+
+    async def mark_birthday_event_dispatched(
+        self,
+        guild_id: int,
+        event_type: str,
+        user_id: int | None,
+        event_date: str,
+    ) -> None:
+        normalized = self._validate_birthday_event_type(event_type)
+        async with self._connect() as conn:
+            await conn.execute(
+                """
+                INSERT OR IGNORE INTO birthday_dispatch_log
+                (guild_id, event_type, user_id, event_date, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (guild_id, normalized, user_id, event_date, self._now_iso()),
+            )
+            await conn.commit()
+
+    async def add_birthday_blacklist_user(self, guild_id: int, user_id: int) -> None:
+        async with self._connect() as conn:
+            await conn.execute(
+                """
+                INSERT OR IGNORE INTO birthday_blacklist_users (guild_id, user_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (guild_id, user_id, self._now_iso()),
+            )
+            await conn.commit()
+
+    async def remove_birthday_blacklist_user(self, guild_id: int, user_id: int) -> bool:
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                "DELETE FROM birthday_blacklist_users WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
+            await conn.commit()
+            return bool(cursor.rowcount)
+
+    async def list_birthday_blacklist_users(self, guild_id: int) -> list[int]:
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT user_id FROM birthday_blacklist_users
+                WHERE guild_id = ?
+                ORDER BY user_id ASC
+                """,
+                (guild_id,),
+            )
+            rows = await cursor.fetchall()
+            return [int(row["user_id"]) for row in rows]
+
+    async def add_birthday_blacklist_role(self, guild_id: int, role_id: int) -> None:
+        async with self._connect() as conn:
+            await conn.execute(
+                """
+                INSERT OR IGNORE INTO birthday_blacklist_roles (guild_id, role_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (guild_id, role_id, self._now_iso()),
+            )
+            await conn.commit()
+
+    async def remove_birthday_blacklist_role(self, guild_id: int, role_id: int) -> bool:
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                "DELETE FROM birthday_blacklist_roles WHERE guild_id = ? AND role_id = ?",
+                (guild_id, role_id),
+            )
+            await conn.commit()
+            return bool(cursor.rowcount)
+
+    async def list_birthday_blacklist_roles(self, guild_id: int) -> list[int]:
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT role_id FROM birthday_blacklist_roles
+                WHERE guild_id = ?
+                ORDER BY role_id ASC
+                """,
+                (guild_id,),
+            )
+            rows = await cursor.fetchall()
+            return [int(row["role_id"]) for row in rows]
 
     @staticmethod
     def _validate_announcement_kind(kind: str) -> str:

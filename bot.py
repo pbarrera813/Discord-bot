@@ -81,8 +81,8 @@ class DiscordModBot(commands.Bot):
         cog_name: str | None = None,
         module_name: str | None = None,
     ) -> bool:
-        allowed_cogs = {"NinjasCog", "FootballCog", "CodeRunnerCog"}
-        allowed_modules = ("cogs.ninjas", "cogs.football", "cogs.code_runner")
+        allowed_cogs = {"NinjasCog", "FootballCog", "CodeRunnerCog", "BirthdaysCog"}
+        allowed_modules = ("cogs.ninjas", "cogs.football", "cogs.code_runner", "cogs.birthdays")
         if cog_name in allowed_cogs:
             return True
         if isinstance(module_name, str) and module_name.startswith(allowed_modules):
@@ -99,6 +99,7 @@ class DiscordModBot(commands.Bot):
             "football",
             "ligamx",
             "run",
+            "birthday",
         )
         return normalized.startswith(allowed_prefixes)
 
@@ -195,6 +196,7 @@ class DiscordModBot(commands.Bot):
         for extension in (
             "cogs.admin",
             "cogs.announcements",
+            "cogs.birthdays",
             "cogs.moderation",
             "cogs.minecraft",
             "cogs.filters",
