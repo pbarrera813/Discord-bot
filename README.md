@@ -255,6 +255,6 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-## Git Safety
+## Git Safety (in case you decide to host it yourself)
 - Do not commit `.env` (scan bots can steal exposed API keys quickly).
 - Keep tokens and secrets out of repository history (even if you later rotate keys).
