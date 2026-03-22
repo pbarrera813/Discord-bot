@@ -940,7 +940,7 @@ class BirthdaysCog(commands.Cog):
             tr(
                 lang,
                 f"Age visibility is now {'enabled' if enabled else 'disabled'}.",
-                f"La visibilidad de edad ahora esta {'activada' if enabled else 'desactivada'}.",
+                f"La visibilidad de edad ahora está {'activada' if enabled else 'desactivada'}.",
             )
         )
 
@@ -988,7 +988,7 @@ class BirthdaysCog(commands.Cog):
             )
             return
         if not target_event_type:
-            await ctx.send(tr(lang, "Invalid event type.", "Tipo de evento invalido."))
+            await ctx.send(tr(lang, "Invalid event type.", "Tipo de evento inválido."))
             return
 
         normalized_color = self._normalize_hex_color(color)
@@ -1027,7 +1027,7 @@ class BirthdaysCog(commands.Cog):
                 **update_kwargs,
             )
         except ValueError:
-            await ctx.send(tr(lang, "Invalid event type.", "Tipo de evento invalido."))
+            await ctx.send(tr(lang, "Invalid event type.", "Tipo de evento inválido."))
             return
 
         embed = discord.Embed(
@@ -1047,9 +1047,9 @@ class BirthdaysCog(commands.Cog):
             ),
             inline=True,
         )
-        embed.add_field(name=tr(lang, "Ping", "Mencion"), value=f"`{cfg.get('ping_setting', 'none')}`", inline=False)
+        embed.add_field(name=tr(lang, "Ping", "Mención"), value=f"`{cfg.get('ping_setting', 'none')}`", inline=False)
         embed.add_field(name=tr(lang, "Message mode", "Modo de mensaje"), value=f"`{cfg.get('message_mode', 'embed')}`", inline=True)
-        embed.add_field(name=tr(lang, "Embed title", "Titulo del embed"), value=f"`{cfg.get('embed_title', '') or '-'}`", inline=True)
+        embed.add_field(name=tr(lang, "Embed title", "Título del embed"), value=f"`{cfg.get('embed_title', '') or '-'}`", inline=True)
         embed.add_field(name=tr(lang, "Embed color", "Color del embed"), value=f"`{cfg.get('embed_color', '') or '-'}`", inline=True)
         embed.add_field(name=tr(lang, "Embed image", "Imagen del embed"), value=f"`{cfg.get('embed_image_url', '') or '-'}`", inline=False)
         if target_event_type == "birthday":
@@ -1130,7 +1130,7 @@ class BirthdaysCog(commands.Cog):
                 preview_year_value = 1
 
         if not target_event_type:
-            await ctx.send(tr(lang, "Invalid preview type.", "Tipo de vista previa invalido."))
+            await ctx.send(tr(lang, "Invalid preview type.", "Tipo de vista previa inválido."))
             return
 
         event_settings = await self.bot.db.get_or_create_birthday_event_settings(ctx.guild.id, target_event_type)
@@ -1163,7 +1163,7 @@ class BirthdaysCog(commands.Cog):
         try:
             current = await self.bot.db.count_birthday_templates(ctx.guild.id, event_type)
         except ValueError:
-            await ctx.send(tr(lang, "Invalid event type.", "Tipo de evento invalido."))
+            await ctx.send(tr(lang, "Invalid event type.", "Tipo de evento inválido."))
             return
         if current >= 100:
             await ctx.send(tr(lang, "Template limit reached (100).", "Limite de plantillas alcanzado (100)."))
@@ -1190,7 +1190,7 @@ class BirthdaysCog(commands.Cog):
         try:
             templates = await self.bot.db.list_birthday_templates(ctx.guild.id, event_type)
         except ValueError:
-            await ctx.send(tr(lang, "Invalid event type.", "Tipo de evento invalido."))
+            await ctx.send(tr(lang, "Invalid event type.", "Tipo de evento inválido."))
             return
         if not templates:
             await ctx.send(tr(lang, "No templates configured for this event.", "No hay plantillas configuradas para este evento."))
@@ -1220,7 +1220,7 @@ class BirthdaysCog(commands.Cog):
         try:
             removed = await self.bot.db.delete_birthday_template(ctx.guild.id, event_type, template_id)
         except ValueError:
-            await ctx.send(tr(lang, "Invalid event type.", "Tipo de evento invalido."))
+            await ctx.send(tr(lang, "Invalid event type.", "Tipo de evento inválido."))
             return
         if removed:
             await ctx.send(tr(lang, "Template removed.", "Plantilla eliminada."))
@@ -1327,7 +1327,7 @@ class BirthdaysCog(commands.Cog):
             )
             return
         if isinstance(error, commands.BadArgument):
-            await ctx.send(tr(lang, "Invalid argument provided.", "Se proporciono un argumento invalido."))
+            await ctx.send(tr(lang, "Invalid argument provided.", "Se proporcionó un argumento inválido."))
             return
         await ctx.send(
             tr(

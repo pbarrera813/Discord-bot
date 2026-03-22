@@ -694,14 +694,14 @@ Ejemplos:
 `/birthday templateadd|templatelist|templateremove` - Manage custom templates.
 `/birthday blacklistuser|blacklistrole <target> <true|false>` - Exclude users/roles.
 `/birthday trusted [role] [prevent_message] [prevent_role] [prevent_list]` - Trusted-role restrictions."""
-        birthday_admin_es = """`/birthday setup [canal] [rol]` - Configuracion rapida del modulo.
+        birthday_admin_es = """`/birthday setup [canal] [rol]` - Configuración rápida del módulo.
 `/birthday channel [#canal]` - Define/limpia el canal de anuncios.
-`/birthday role [@rol]` - Define/limpia el rol de cumpleanos.
+`/birthday role [@rol]` - Define/limpia el rol de cumpleaños.
 `/birthday timezone <zona_iana>` - Define zona horaria del servidor.
-`/birthday mode <user|server>` - Modo de zona horaria para cumpleanos.
+`/birthday mode <user|server>` - Modo de zona horaria para cumpleaños.
 `/birthday ages <true|false>` - Muestra u oculta edades.
 `/birthday event <default|year|join|server|disable> [color] [image] [message]` - Configura/desactiva mensajes del evento.
-`/birthday preview <default|year|server|user>` - Vista previa de como se publica cada evento.
+`/birthday preview <default|year|server|user>` - Vista previa de cómo se publica cada evento.
 `/birthday templateadd|templatelist|templateremove` - Gestiona plantillas personalizadas.
 `/birthday blacklistuser|blacklistrole <objetivo> <true|false>` - Excluye usuarios/roles.
 `/birthday trusted [rol] [prevent_message] [prevent_role] [prevent_list]` - Restricciones por rol confiable."""
@@ -725,8 +725,8 @@ Archivos: `.c`, `.cpp`, `.cs`, `.java`, `.js`, `.py`, `.rs`"""
 Leagues: `ligamx`, `premier`, `laliga`, `concacaf`."""
         sports_es = """`/football live <liga>` - Partidos en vivo ahora mismo.
 `/football today <liga>` - Partidos programados para hoy.
-`/football next <liga> [cantidad|equipo]` - Proximos partidos (global o por equipo).
-`/football last <liga> <equipo>` - Ultimo resultado de un equipo.
+`/football next <liga> [cantidad|equipo]` - Próximos partidos (global o por equipo).
+`/football last <liga> <equipo>` - Último resultado de un equipo.
 `/football table <liga>` - Tabla de posiciones actual.
 `/football team <liga> <equipo>` - Datos del equipo y forma reciente.
 `/football scorers <liga>` - Tabla de goleadores.
@@ -993,7 +993,7 @@ Variables de cumpleaños:
 
         if is_admin:
             page_admin = discord.Embed(title=tr(lang, "Admin Commands", "Comandos de Admin"), color=discord.Color.red())
-            page_admin.add_field(name=tr(lang, "Server Configuration", "Configuracion del servidor"), value=tr(lang, admin_en, admin_es), inline=False)
+            page_admin.add_field(name=tr(lang, "Server Configuration", "Configuración del servidor"), value=tr(lang, admin_en, admin_es), inline=False)
             page_admin.add_field(name=tr(lang, "AI Channel Restrictions", "Canales de IA"), value=tr(lang, ai_channels_en, ai_channels_es), inline=False)
             pages.append(page_admin)
 
