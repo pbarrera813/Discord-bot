@@ -261,9 +261,15 @@ class Database:
                     guild_id INTEGER NOT NULL,
                     event_type TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1,
-                    message_hour INTEGER NOT NULL DEFAULT 9,
+                    message_hour INTEGER NOT NULL DEFAULT 0,
                     ping_setting TEXT NOT NULL DEFAULT 'none',
                     image_format TEXT NOT NULL DEFAULT 'none',
+                    message_mode TEXT NOT NULL DEFAULT 'embed',
+                    embed_title TEXT NOT NULL DEFAULT '',
+                    embed_color TEXT NOT NULL DEFAULT '',
+                    embed_image_url TEXT NOT NULL DEFAULT '',
+                    birthday_message_no_year TEXT NOT NULL DEFAULT '',
+                    birthday_message_with_age TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(guild_id, event_type)
@@ -320,6 +326,20 @@ class Database:
                 )
                 """
             )
+
+            # Backward-compatible migration for existing databases.
+            for alter_sql in (
+                "ALTER TABLE birthday_event_settings ADD COLUMN message_mode TEXT NOT NULL DEFAULT 'embed'",
+                "ALTER TABLE birthday_event_settings ADD COLUMN embed_title TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE birthday_event_settings ADD COLUMN embed_color TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE birthday_event_settings ADD COLUMN embed_image_url TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE birthday_event_settings ADD COLUMN birthday_message_no_year TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE birthday_event_settings ADD COLUMN birthday_message_with_age TEXT NOT NULL DEFAULT ''",
+            ):
+                try:
+                    await conn.execute(alter_sql)
+                except aiosqlite.OperationalError:
+                    pass
 
             await conn.commit()
 
@@ -555,15 +575,19 @@ class Database:
             await conn.execute(
                 """
                 INSERT OR IGNORE INTO birthday_event_settings
-                (guild_id, event_type, enabled, message_hour, ping_setting, image_format, created_at, updated_at)
-                VALUES (?, ?, 1, 9, 'none', 'none', ?, ?)
+                (guild_id, event_type, enabled, message_hour, ping_setting, image_format, message_mode,
+                 embed_title, embed_color, embed_image_url, birthday_message_no_year,
+                 birthday_message_with_age, created_at, updated_at)
+                VALUES (?, ?, 1, 0, 'none', 'none', 'embed', '', '', '', '', '', ?, ?)
                 """,
                 (guild_id, normalized, now, now),
             )
             await conn.commit()
             cursor = await conn.execute(
                 """
-                SELECT guild_id, event_type, enabled, message_hour, ping_setting, image_format
+                SELECT guild_id, event_type, enabled, message_hour, ping_setting, image_format,
+                       message_mode, embed_title, embed_color, embed_image_url,
+                       birthday_message_no_year, birthday_message_with_age
                 FROM birthday_event_settings
                 WHERE guild_id = ? AND event_type = ?
                 """,
@@ -581,6 +605,12 @@ class Database:
         message_hour: int | None = None,
         ping_setting: str | None = None,
         image_format: str | None = None,
+        message_mode: str | None = None,
+        embed_title: str | None = None,
+        embed_color: str | None = None,
+        embed_image_url: str | None = None,
+        birthday_message_no_year: str | None = None,
+        birthday_message_with_age: str | None = None,
     ) -> dict[str, Any]:
         normalized = self._validate_birthday_event_type(event_type)
         await self.get_or_create_birthday_event_settings(guild_id, normalized)
@@ -598,6 +628,24 @@ class Database:
         if image_format is not None:
             updates.append("image_format = ?")
             values.append(image_format.strip().lower())
+        if message_mode is not None:
+            updates.append("message_mode = ?")
+            values.append(message_mode.strip().lower())
+        if embed_title is not None:
+            updates.append("embed_title = ?")
+            values.append(embed_title.strip())
+        if embed_color is not None:
+            updates.append("embed_color = ?")
+            values.append(embed_color.strip())
+        if embed_image_url is not None:
+            updates.append("embed_image_url = ?")
+            values.append(embed_image_url.strip())
+        if birthday_message_no_year is not None:
+            updates.append("birthday_message_no_year = ?")
+            values.append(birthday_message_no_year.strip())
+        if birthday_message_with_age is not None:
+            updates.append("birthday_message_with_age = ?")
+            values.append(birthday_message_with_age.strip())
 
         if updates:
             updates.append("updated_at = ?")
@@ -617,7 +665,9 @@ class Database:
         async with self._connect() as conn:
             cursor = await conn.execute(
                 """
-                SELECT guild_id, event_type, enabled, message_hour, ping_setting, image_format
+                SELECT guild_id, event_type, enabled, message_hour, ping_setting, image_format,
+                       message_mode, embed_title, embed_color, embed_image_url,
+                       birthday_message_no_year, birthday_message_with_age
                 FROM birthday_event_settings
                 WHERE guild_id = ?
                 ORDER BY event_type ASC

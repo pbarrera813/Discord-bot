@@ -167,18 +167,21 @@ Reminder units:
 
 ### Birthdays / Anniversaries
 Community commands:
-- `/birthday set <MM-DD|DD/MM> [birth_year] [timezone]`
+- `/birthday set <MM-DD|DD/MM> [birth_year]`
 - `/birthday remove`
 - `/birthday next [count]`
 
+Schedule note:
+- Birthday/member/server anniversary announcement events are posted at `12:00 AM` bot local time.
+
 Admin commands (slash-visible for admins only):
-- `/birthday setup [channel] [role] [timezone]`
+- `/birthday setup [channel] [role]`
 - `/birthday channel [#channel]`
 - `/birthday role [@role]`
 - `/birthday timezone <iana_tz>`
 - `/birthday mode <user|server>`
 - `/birthday ages <true|false>`
-- `/birthday event <event_type> [enabled] [message_hour] [ping_setting]`
+- `/birthday event <default|year|join|server|disable> [color] [image] [message]`
 - `/birthday templateadd <event_type> <template_text>`
 - `/birthday templatelist <event_type>`
 - `/birthday templateremove <event_type> <template_id>`
