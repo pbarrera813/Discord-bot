@@ -343,6 +343,7 @@ class FunCog(commands.Cog):
         name="remindme",
         description="Set a reminder with m, h, d, w, mo or y.",
     )
+    @discord.app_commands.rename(reminder_message="message")
     async def remindme(self, ctx: commands.Context, duration: str, *, reminder_message: str) -> None:
         lang = await self._lang(ctx.guild)
         if ctx.guild is None or not isinstance(ctx.channel, discord.TextChannel):

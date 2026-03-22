@@ -302,6 +302,7 @@ class CodeRunnerCog(commands.Cog):
             app_commands.Choice(name="rust", value="rust"),
         ]
     )
+    @app_commands.rename(source_file="file")
     async def code_cmd(
         self,
         ctx: commands.Context,

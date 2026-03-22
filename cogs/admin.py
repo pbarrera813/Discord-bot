@@ -246,6 +246,7 @@ class AdminCog(commands.Cog):
         description="Set bot language for command responses. Allowed: en, es.",
     )
     @commands.has_permissions(manage_guild=True)
+    @discord.app_commands.rename(language_code="language")
     async def language(self, ctx: commands.Context, language_code: str) -> None:
         guild = ctx.guild
         if guild is None:
@@ -668,37 +669,39 @@ Example: `/roast @User`"""
 Unidades de tiempo: `m`, `h`, `d`, `w`, `mo`, `y`
 Ejemplo: `/roast @User`"""
 
-        birthday_en = """`/birthday set <MM-DD|DD/MM> [birth_year] [timezone]` - Save your birthday.
+        birthday_en = """`/birthday set <MM-DD|DD/MM> [birth_year]` - Save your birthday.
 `/birthday remove` - Remove your birthday data from this server.
 `/birthday next [count]` - Show upcoming birthdays in this server.
 Examples:
 `/birthday set 07-14`
-`/birthday set 14/07 2001 America/Mexico_City`
+`/birthday set 14/07 2001`
 `/birthday remove`"""
-        birthday_es = """`/birthday set <MM-DD|DD/MM> [año_nacimiento] [zona_horaria]` - Guarda tu cumpleaños.
+        birthday_es = """`/birthday set <MM-DD|DD/MM> [año_nacimiento]` - Guarda tu cumpleaños.
 `/birthday remove` - Elimina tus datos de cumpleaños de este servidor.
 `/birthday next [cantidad]` - Muestra los próximos cumpleaños del servidor.
 Ejemplos:
 `/birthday set 07-14`
-`/birthday set 14/07 2001 America/Mexico_City`
+`/birthday set 14/07 2001`
 `/birthday remove`"""
-        birthday_admin_en = """`/birthday setup [channel] [role] [timezone]` - Quick server birthday setup.
+        birthday_admin_en = """`/birthday setup [channel] [role]` - Quick server birthday setup.
 `/birthday channel [#channel]` - Set/clear announcement channel.
 `/birthday role [@role]` - Set/clear birthday role.
 `/birthday timezone <iana_tz>` - Set server timezone.
 `/birthday mode <user|server>` - Choose timezone mode for birthdays.
 `/birthday ages <true|false>` - Show or hide ages.
-`/birthday event <type> [enabled] [hour] [ping]` - Configure event behavior.
+`/birthday event <default|year|join|server|disable> [color] [image] [message]` - Configure/disable event messages.
+`/birthday preview <default|year|server|user>` - Preview how each event will be posted.
 `/birthday templateadd|templatelist|templateremove` - Manage custom templates.
 `/birthday blacklistuser|blacklistrole <target> <true|false>` - Exclude users/roles.
 `/birthday trusted [role] [prevent_message] [prevent_role] [prevent_list]` - Trusted-role restrictions."""
-        birthday_admin_es = """`/birthday setup [canal] [rol] [zona_horaria]` - Configuracion rapida del modulo.
+        birthday_admin_es = """`/birthday setup [canal] [rol]` - Configuracion rapida del modulo.
 `/birthday channel [#canal]` - Define/limpia el canal de anuncios.
 `/birthday role [@rol]` - Define/limpia el rol de cumpleanos.
 `/birthday timezone <zona_iana>` - Define zona horaria del servidor.
 `/birthday mode <user|server>` - Modo de zona horaria para cumpleanos.
 `/birthday ages <true|false>` - Muestra u oculta edades.
-`/birthday event <tipo> [activo] [hora] [ping]` - Configura el comportamiento del evento.
+`/birthday event <default|year|join|server|disable> [color] [image] [message]` - Configura/desactiva mensajes del evento.
+`/birthday preview <default|year|server|user>` - Vista previa de como se publica cada evento.
 `/birthday templateadd|templatelist|templateremove` - Gestiona plantillas personalizadas.
 `/birthday blacklistuser|blacklistrole <objetivo> <true|false>` - Excluye usuarios/roles.
 `/birthday trusted [rol] [prevent_message] [prevent_role] [prevent_list]` - Restricciones por rol confiable."""
@@ -863,21 +866,33 @@ Ejemplo: `/welcome set mode:both message:Hola {user}, bienvenido a {server}! ima
 `/goodbye test`
 Ejemplo: `/goodbye set mode:both message:Adios {user}, gracias por estar aqui. image:https://... color:#FF4D4D`"""
 
-        variables_en = """`{user}` -> @John
+        variables_en = """Bot variables:
+`{user}` -> @John
 `{username}` -> John
-`{avatar}` -> https://imagelink.../avatar.png
+`{avatar}` -> Shows the user's avatar
 `{server}` -> Server name
-`{channel}` -> #Channel (current welcome/goodbye channel)
-`{role}` -> @Moderators (replace `role` with role name, example: `{Moderators}`)
-For channels in custom text: use `{#channel-name}` or `{123456789012345678}`."""
+`{channel}` -> Supports channel name or channel ID. Example: `{rules}` -> #rules
+`{role}` -> Role helper. Use `{role:member}` or `{role:123456789012345678}`
+`{RoleName}` -> Also works by role name. Example: `{member}` -> @Member
+`{123456789012345678}` -> Also works by ID (channel/role auto-detected)
 
-        variables_es = """`{user}` -> @John
+Birthday variables:
+`{age}` -> Shows the user's new age. Only applies when birth year is set.
+`{year}` -> Shows birth year (birthday) or years count (member/server anniversary)."""
+
+        variables_es = """Variables del bot:
+`{user}` -> @John
 `{username}` -> John
-`{avatar}` -> https://imagelink.../avatar.png
+`{avatar}` -> Muestra el avatar del usuario
 `{server}` -> Nombre de servidor
-`{channel}` -> #Canal (canal actual de welcome/goodbye)
-`{role}` -> @Moderadores (reemplaza `role` por el nombre del rol, ejemplo: `{Moderadores}`)
-Para canales en texto personalizado: usa `{#nombre-canal}` o `{123456789012345678}`."""
+`{channel}` -> Soporta nombre de canal o ID de canal. Ejemplo: `{reglas}` -> #reglas
+`{role}` -> Helper de rol. Usa `{role:miembro}` o `{role:123456789012345678}`
+`{NombreRol}` -> Tambien funciona por nombre de rol. Ejemplo: `{miembro}` -> @Miembro
+`{123456789012345678}` -> Tambien funciona por ID (deteccion automatica canal/rol)
+
+Variables de cumpleaños:
+`{age}` -> Muestra la nueva edad del usuario. Solo aplica si se define el año de nacimiento.
+`{year}` -> Muestra el año de nacimiento (cumpleaños) o los años transcurridos (aniversarios)."""
 
         ai_channels_en = """`/aichannel add <#channel>` - Allow AI in one channel.
 `/aichannel remove <#channel>` - Remove one allowed AI channel.
@@ -1040,6 +1055,3 @@ Para canales en texto personalizado: usa `{#nombre-canal}` o `{12345678901234567
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(AdminCog(bot))
-
-
-

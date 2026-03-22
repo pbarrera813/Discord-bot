@@ -185,6 +185,7 @@ class NinjasCog(commands.Cog):
         name="convert",
         description="Convert units. Example: /convert 1000 meter kilometer",
     )
+    @discord.app_commands.rename(from_unit="from", to_unit="to")
     async def convert(
         self,
         ctx: commands.Context,

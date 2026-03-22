@@ -642,6 +642,7 @@ class MemesCog(commands.Cog):
         name="create",
         description="Generate a meme with a template id.",
     )
+    @discord.app_commands.rename(top_text="top", bottom_text="bottom")
     async def meme_create(
         self,
         ctx: commands.Context,
@@ -718,6 +719,7 @@ class MemesCog(commands.Cog):
         name="random",
         description="Generate a meme using a random template.",
     )
+    @discord.app_commands.rename(top_text="top", bottom_text="bottom")
     async def memerandom(
         self,
         ctx: commands.Context,
@@ -781,6 +783,7 @@ class MemesCog(commands.Cog):
         name="custom",
         description="Generate a meme with a custom image URL or attachment.",
     )
+    @discord.app_commands.rename(top_text="top", bottom_text="bottom")
     @discord.app_commands.describe(
         source="Image URL, or top text when attaching an image.",
         top_text="Top text in URL mode. With attachment mode, this is optional bottom text.",

@@ -93,6 +93,10 @@ class AnnouncementCog(commands.Cog):
         probe = token.strip().lstrip("@")
         if not probe:
             return None
+        if probe.isdigit():
+            by_id = guild.get_role(int(probe))
+            if by_id is not None:
+                return by_id
         lowered = probe.casefold()
         roles = [role for role in guild.roles if role.name != "@everyone"]
         exact = next((role for role in roles if role.name.casefold() == lowered), None)
@@ -128,6 +132,20 @@ class AnnouncementCog(commands.Cog):
                 return guild.name
             if token == "channel":
                 return announcement_channel.mention if announcement_channel else ""
+            if token.startswith("channel:"):
+                query = raw_token.split(":", 1)[1].strip()
+                if query:
+                    channel = self._match_named_channel(guild, query)
+                    if channel is not None:
+                        return channel.mention
+                return match.group(0)
+            if token.startswith("role:"):
+                query = raw_token.split(":", 1)[1].strip()
+                if query:
+                    role = self._match_named_role(guild, query)
+                    if role is not None:
+                        return role.mention
+                return match.group(0)
 
             if raw_token.startswith("#") or raw_token.isdigit():
                 channel = self._match_named_channel(guild, raw_token)

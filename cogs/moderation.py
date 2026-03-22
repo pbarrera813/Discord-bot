@@ -1985,6 +1985,7 @@ class ModerationCog(commands.Cog):
 
     @channel.command(name="add", description="Create a new text channel.")
     @commands.has_permissions(manage_channels=True)
+    @discord.app_commands.rename(channel_name="name")
     async def channel_add(self, ctx: commands.Context, *, channel_name: str) -> None:
         await self._maybe_defer(ctx)
         await self._channel_add_impl(ctx, channel_name)
@@ -2655,6 +2656,7 @@ class ModerationCog(commands.Cog):
 
     @role.command(name="create", description="Create a role (optional hex color).")
     @commands.has_permissions(manage_roles=True)
+    @discord.app_commands.rename(role_name="name", color_hex="color")
     async def createrole(
         self,
         ctx: commands.Context,
@@ -3069,6 +3071,7 @@ class ModerationCog(commands.Cog):
         description="Add a new selectable color role.",
     )
     @commands.has_permissions(administrator=True)
+    @discord.app_commands.rename(hex_code="color")
     async def coloradd(
         self,
         ctx: commands.Context,
@@ -3192,6 +3195,7 @@ class ModerationCog(commands.Cog):
         description="Remove a selectable color role by configured color name.",
     )
     @commands.has_permissions(administrator=True)
+    @discord.app_commands.rename(color_name="name")
     async def colorremove(self, ctx: commands.Context, *, color_name: str) -> None:
         lang = await self._lang(ctx.guild)
         await self._maybe_defer(ctx)
@@ -3869,6 +3873,7 @@ class ModerationCog(commands.Cog):
         description="Remove the 1st, 2nd, or 3rd warning from a user.",
     )
     @commands.has_permissions(moderate_members=True)
+    @discord.app_commands.rename(warning_number="number")
     async def unwarn(
         self,
         ctx: commands.Context,
