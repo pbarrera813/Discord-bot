@@ -16,7 +16,7 @@ Nitori was built as a single, no-paywall Discord bot for communities that want b
 - Memes via Memegen API + local speech meme generator.
 - API Ninjas commands: joke, dadjoke, advice, whois, unit conversion.
 - Minecraft status checks (mcsrvstat.us).
-- Liga BBVA MX stats (API-Football).
+- Football stats for Liga MX, Premier League, LaLiga, and CONCACAF (API-Football).
 - Code execution (Glot API) for common languages.
 - Reminder system with DM and optional channel mention.
 - Welcome/Goodbye configurable announcement modules.
@@ -28,7 +28,7 @@ Nitori was built as a single, no-paywall Discord bot for communities that want b
 - Discord bot token
 - xAI API key (chat/translate/context)
 - API Ninjas key (joke/dadjoke/advice/whois/convert)
-- API-Football key (Liga MX)
+- API-Football key (supported football leagues)
 - Glot API token (/code)
 
 ## Environment Variables
@@ -106,9 +106,10 @@ Supported template variables for welcome/goodbye messages:
 - `{username}`
 - `{avatar}`
 - `{server}`
-- `{channel}`
-- `{#channel_name}`
-- `{role_name}`
+- `{channel}` (configured announcement channel)
+- `{channel:rules}` (or channel ID)
+- `{role:Member}` (or role ID)
+- `{rules}` / `{Member}` / `{123456789012345678}` (auto-detection fallback)
 
 ### Moderation: Message Group
 - `/message delete <amount>`
@@ -182,9 +183,10 @@ Admin commands (slash-visible for admins only):
 - `/birthday mode <user|server>`
 - `/birthday ages <true|false>`
 - `/birthday event <default|year|join|server|disable> [color] [image] [message]`
-- `/birthday templateadd <event_type> <template_text>`
-- `/birthday templatelist <event_type>`
-- `/birthday templateremove <event_type> <template_id>`
+- `/birthday preview <default|year|server|user>`
+- `/birthday templateadd <type> <template>`
+- `/birthday templatelist <type>`
+- `/birthday templateremove <type> <id>`
 - `/birthday blacklistuser <user> <true|false>`
 - `/birthday blacklistrole <role> <true|false>`
 - `/birthday trusted [role] [prevent_message] [prevent_role] [prevent_list]`
@@ -225,9 +227,10 @@ Supported leagues:
 - `/speech <user>`
 
 ### Code Runner
-- `/code code:<code> language:<language> [source_file]`
+- `/code code:<code> language:<language> [file]`
 - `<prefix>code <language> <code>`
 - `/codelangs`
+- Supports Discord fenced blocks (example: ```python ...```) with language auto-detection.
 
 Supported code languages:
 - `c`, `c#`, `cpp`, `python`, `java`, `javascript`, `rust`
