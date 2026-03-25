@@ -144,6 +144,9 @@ class AIChatCog(commands.Cog):
             lambda: deque(maxlen=120)
         )
         self._history_entry_max_chars = 900
+        self._chat_response_id_limit = 600
+        self._chat_response_ids: deque[int] = deque(maxlen=self._chat_response_id_limit)
+        self._chat_response_id_set: set[int] = set()
 
     async def _is_ai_allowed_in_channel(
         self,
@@ -1194,7 +1197,12 @@ class AIChatCog(commands.Cog):
         ref_msg = replied_message
         if ref_msg is None:
             ref_msg = await self._get_replied_message(message)
-        return bool(ref_msg and self.bot.user and ref_msg.author.id == self.bot.user.id)
+        return bool(
+            ref_msg
+            and self.bot.user
+            and ref_msg.author.id == self.bot.user.id
+            and self._is_chat_response_message(ref_msg.id)
+        )
 
     def _extract_chat_prompt(self, message: discord.Message) -> str:
         if self.bot.user and self.bot.user in message.mentions:
@@ -1342,9 +1350,23 @@ class AIChatCog(commands.Cog):
         parts = self._split_for_discord(text, limit=1900)
         if not parts:
             return
-        await trigger_message.reply(parts[0], mention_author=mention_author)
+        first = await trigger_message.reply(parts[0], mention_author=mention_author)
+        self._remember_chat_response_message(first.id)
         for part in parts[1:]:
-            await trigger_message.channel.send(part)
+            extra = await trigger_message.channel.send(part)
+            self._remember_chat_response_message(extra.id)
+
+    def _is_chat_response_message(self, message_id: int) -> bool:
+        return message_id in self._chat_response_id_set
+
+    def _remember_chat_response_message(self, message_id: int) -> None:
+        if message_id in self._chat_response_id_set:
+            return
+        if len(self._chat_response_ids) >= self._chat_response_id_limit:
+            oldest = self._chat_response_ids.popleft()
+            self._chat_response_id_set.discard(oldest)
+        self._chat_response_ids.append(message_id)
+        self._chat_response_id_set.add(message_id)
 
     def _strip_bot_speaker_prefix(self, text: str) -> str:
         cleaned = text.strip().strip("`")
