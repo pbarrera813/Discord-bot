@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import random
 import re
 from datetime import datetime, timezone
@@ -433,13 +434,17 @@ class BirthdaysCog(commands.Cog):
 
     async def _run_dispatch_cycle(self) -> None:
         now_utc = datetime.now(timezone.utc)
-        bot_now = datetime.now().astimezone()
-        bot_tz = bot_now.tzinfo or timezone.utc
         for guild in self.bot.guilds:
             lang = await self._lang(guild)
             settings = await self.bot.db.get_or_create_birthday_guild_settings(guild.id)
             if int(settings.get("enabled", 0)) != 1:
                 continue
+            tz_name = str(settings.get("server_timezone", "UTC") or "UTC")
+            try:
+                server_tz = ZoneInfo(tz_name)
+            except ZoneInfoNotFoundError:
+                server_tz = timezone.utc
+            server_now = now_utc.astimezone(server_tz)
             channel_id = settings.get("channel_id")
             if not isinstance(channel_id, int):
                 continue
@@ -476,15 +481,15 @@ class BirthdaysCog(commands.Cog):
 
                 month = int(profile["month"])
                 day = int(profile["day"])
-                if bot_now.month == month and bot_now.day == day:
+                if server_now.month == month and server_now.day == day:
                     active_birthday_members.add(member.id)
 
                 birthday_cfg = event_settings["birthday"]
                 if int(birthday_cfg.get("enabled", 0)) != 1:
                     continue
-                if bot_now.month != month or bot_now.day != day or bot_now.hour != 0:
+                if server_now.month != month or server_now.day != day:
                     continue
-                event_date = bot_now.date().isoformat()
+                event_date = server_now.date().isoformat()
                 if await self.bot.db.was_birthday_event_dispatched(guild.id, "birthday", member.id, event_date):
                     continue
                 if not await self._is_trusted_allowed(guild=guild, member=member, settings=settings, check_kind="message"):
@@ -494,7 +499,7 @@ class BirthdaysCog(commands.Cog):
                 birth_year_int = int(birth_year) if isinstance(birth_year, int) else None
                 age = None
                 if birth_year_int and int(settings.get("disable_ages", 0)) != 1:
-                    diff = bot_now.year - birth_year_int
+                    diff = server_now.year - birth_year_int
                     if diff > 0:
                         age = diff
 
@@ -533,7 +538,7 @@ class BirthdaysCog(commands.Cog):
                             continue
 
             member_cfg = event_settings["member_anniversary"]
-            if int(member_cfg.get("enabled", 0)) == 1 and bot_now.hour == 0:
+            if int(member_cfg.get("enabled", 0)) == 1:
                 for member in guild.members:
                     if member.bot or member.joined_at is None:
                         continue
@@ -546,13 +551,13 @@ class BirthdaysCog(commands.Cog):
                         continue
                     if not await self._is_trusted_allowed(guild=guild, member=member, settings=settings, check_kind="message"):
                         continue
-                    joined_local = member.joined_at.astimezone(bot_tz)
-                    if joined_local.month != bot_now.month or joined_local.day != bot_now.day:
+                    joined_local = member.joined_at.astimezone(server_tz)
+                    if joined_local.month != server_now.month or joined_local.day != server_now.day:
                         continue
-                    years = bot_now.year - joined_local.year
+                    years = server_now.year - joined_local.year
                     if years <= 0:
                         continue
-                    event_date = bot_now.date().isoformat()
+                    event_date = server_now.date().isoformat()
                     if await self.bot.db.was_birthday_event_dispatched(guild.id, "member_anniversary", member.id, event_date):
                         continue
                     await self._send_event_announcement(
@@ -570,12 +575,12 @@ class BirthdaysCog(commands.Cog):
                     )
 
             server_cfg = event_settings["server_anniversary"]
-            if int(server_cfg.get("enabled", 0)) == 1 and bot_now.hour == 0:
-                created_local = guild.created_at.astimezone(bot_tz)
-                if created_local.month == bot_now.month and created_local.day == bot_now.day:
-                    years = bot_now.year - created_local.year
+            if int(server_cfg.get("enabled", 0)) == 1:
+                created_local = guild.created_at.astimezone(server_tz)
+                if created_local.month == server_now.month and created_local.day == server_now.day:
+                    years = server_now.year - created_local.year
                     if years > 0:
-                        event_date = bot_now.date().isoformat()
+                        event_date = server_now.date().isoformat()
                         if not await self.bot.db.was_birthday_event_dispatched(
                             guild.id, "server_anniversary", None, event_date
                         ):
@@ -598,7 +603,7 @@ class BirthdaysCog(commands.Cog):
         try:
             await self._run_dispatch_cycle()
         except Exception:
-            return
+            logging.exception("Unhandled exception in birthday worker")
 
     @birthday_worker.before_loop
     async def _before_birthday_worker(self) -> None:
