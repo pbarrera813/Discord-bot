@@ -17,6 +17,10 @@ LEAGUE_CHOICES: Final[list[app_commands.Choice[str]]] = [
     app_commands.Choice(name="laliga", value="laliga"),
     app_commands.Choice(name="concacaf", value="concacaf"),
 ]
+LEAGUE_CODES: Final[tuple[str, ...]] = tuple(choice.value for choice in LEAGUE_CHOICES)
+LEAGUE_HELP_TEXT: Final[str] = f"League: {', '.join(LEAGUE_CODES)}"
+LEAGUE_INVALID_TEXT_EN: Final[str] = f"Invalid league. Use one of: {', '.join(LEAGUE_CODES)}."
+LEAGUE_INVALID_TEXT_ES: Final[str] = f"Liga inválida. Usa una de estas: {', '.join(LEAGUE_CODES)}."
 
 
 class FootballCog(commands.Cog):
@@ -89,13 +93,12 @@ class FootballCog(commands.Cog):
             await ctx.send(
                 tr(
                     lang,
-                    "Invalid league. Use one of: ligamx, premier, laliga, concacaf.",
-                    "Liga invalida. Usa una de estas: ligamx, premier, laliga, concacaf.",
+                    LEAGUE_INVALID_TEXT_EN,
+                    LEAGUE_INVALID_TEXT_ES,
                 )
             )
             return None
-        preferred_ligamx = self.bot.settings.ligamx_league_id if league_key == "ligamx" else None
-        league_id = await client.resolve_league_id(league_key, preferred_ligamx_id=preferred_ligamx)
+        league_id = await client.resolve_league_id(league_key)
         season = await client.get_current_season(league_id)
         return league_key, league_id, season
 
@@ -251,9 +254,9 @@ class FootballCog(commands.Cog):
         fallback="live",
         invoke_without_command=True,
     )
-    @app_commands.describe(league="League: ligamx, premier, laliga, concacaf")
+    @app_commands.describe(league=LEAGUE_HELP_TEXT)
     @app_commands.choices(league=LEAGUE_CHOICES)
-    async def football(self, ctx: commands.Context, league: str = "ligamx") -> None:
+    async def football(self, ctx: commands.Context, league: str) -> None:
         await self._run_football_live(ctx, league)
 
     async def _run_football_live(self, ctx: commands.Context, raw_league: str) -> None:
@@ -328,7 +331,7 @@ class FootballCog(commands.Cog):
         name="today",
         description="Get today's fixtures for a selected league.",
     )
-    @app_commands.describe(league="League: ligamx, premier, laliga, concacaf")
+    @app_commands.describe(league=LEAGUE_HELP_TEXT)
     @app_commands.choices(league=LEAGUE_CHOICES)
     async def football_today(self, ctx: commands.Context, league: str) -> None:
         lang = await self._lang(ctx.guild)
@@ -397,7 +400,7 @@ class FootballCog(commands.Cog):
         description="Get next fixtures (or next match for a team) in a selected league.",
     )
     @app_commands.describe(
-        league="League: ligamx, premier, laliga, concacaf",
+        league=LEAGUE_HELP_TEXT,
         target="Optional: number of matches (1-10) or a team name",
     )
     @app_commands.choices(league=LEAGUE_CHOICES)
@@ -610,7 +613,7 @@ class FootballCog(commands.Cog):
         description="Get the last played match for a team in a selected league.",
     )
     @app_commands.describe(
-        league="League: ligamx, premier, laliga, concacaf",
+        league=LEAGUE_HELP_TEXT,
         team="Team name",
     )
     @app_commands.choices(league=LEAGUE_CHOICES)
@@ -747,7 +750,7 @@ class FootballCog(commands.Cog):
         name="table",
         description="Get standings for a selected league.",
     )
-    @app_commands.describe(league="League: ligamx, premier, laliga, concacaf")
+    @app_commands.describe(league=LEAGUE_HELP_TEXT)
     @app_commands.choices(league=LEAGUE_CHOICES)
     async def football_table(self, ctx: commands.Context, league: str) -> None:
         lang = await self._lang(ctx.guild)
@@ -811,7 +814,7 @@ class FootballCog(commands.Cog):
         description="Get a team snapshot in a selected league.",
     )
     @app_commands.describe(
-        league="League: ligamx, premier, laliga, concacaf",
+        league=LEAGUE_HELP_TEXT,
         team="Team name",
     )
     @app_commands.choices(league=LEAGUE_CHOICES)
@@ -939,7 +942,7 @@ class FootballCog(commands.Cog):
         name="scorers",
         description="Get top scorers for a selected league.",
     )
-    @app_commands.describe(league="League: ligamx, premier, laliga, concacaf")
+    @app_commands.describe(league=LEAGUE_HELP_TEXT)
     @app_commands.choices(league=LEAGUE_CHOICES)
     async def football_scorers(self, ctx: commands.Context, league: str) -> None:
         lang = await self._lang(ctx.guild)

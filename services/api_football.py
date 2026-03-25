@@ -117,12 +117,8 @@ class ApiFootballClient:
     async def resolve_league_id(
         self,
         league_key: str,
-        *,
-        preferred_ligamx_id: int | None = None,
     ) -> int:
         key = str(league_key or "").strip().casefold()
-        if key == "ligamx" and preferred_ligamx_id and preferred_ligamx_id > 0:
-            return preferred_ligamx_id
 
         now = time.monotonic()
         cached = self._league_id_cache.get(key)
@@ -136,9 +132,6 @@ class ApiFootballClient:
             raise RuntimeError(f"Unsupported league key: {league_key}")
         self._league_id_cache[key] = (now, selected)
         return selected
-
-    async def resolve_ligamx_league_id(self, preferred_id: int | None) -> int:
-        return await self.resolve_league_id("ligamx", preferred_ligamx_id=preferred_id)
 
     async def _resolve_league_id_from_api(self, league_key: str) -> int | None:
         profiles = self._LEAGUE_SEARCH_PROFILES.get(league_key, [])
@@ -173,10 +166,6 @@ class ApiFootballClient:
             if isinstance(league_id, int):
                 return league_id
         return None
-
-    @staticmethod
-    def _pick_ligamx_league_id(leagues: list[dict[str, Any]]) -> int | None:
-        return ApiFootballClient._pick_league_id(leagues, "ligamx")
 
     async def get_current_season(self, league_id: int) -> int:
         now = time.monotonic()
