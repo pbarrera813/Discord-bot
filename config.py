@@ -17,7 +17,6 @@ class Settings:
     xai_model: str
     db_path: str
     default_prefix: str
-    ligamx_league_id: int
 
 
 def load_settings() -> Settings:
@@ -37,12 +36,6 @@ def load_settings() -> Settings:
     xai_model = os.getenv("XAI_MODEL", "grok-4-1-fast-reasoning").strip()
     db_path = os.getenv("DB_PATH", "data/bot.db").strip()
     default_prefix = os.getenv("DEFAULT_PREFIX", "!").strip() or "!"
-    ligamx_league_raw = os.getenv("LIGAMX_LEAGUE_ID", "262").strip()
-    try:
-        ligamx_league_id = int(ligamx_league_raw)
-    except ValueError:
-        ligamx_league_id = 262
-
     if not discord_token:
         raise ValueError("Missing DISCORD_TOKEN in environment")
     if not xai_api_key:
@@ -60,5 +53,4 @@ def load_settings() -> Settings:
         xai_model=xai_model,
         db_path=db_path,
         default_prefix=default_prefix,
-        ligamx_league_id=ligamx_league_id,
     )
