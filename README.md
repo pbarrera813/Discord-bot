@@ -48,7 +48,6 @@ Common optional settings:
 - `GLOT_BASE_URL`
 - `GLOT_API_MODE`
 - `API_FOOTBALL_BASE_URL`
-- `LIGAMX_LEAGUE_ID`
 
 ## Local Run
 ```bash
@@ -69,7 +68,7 @@ python bot.py
 - `/help [section]`
 - `/setup`
 - `/translate <language> [text]`
-- Mention bot + message, or reply to bot message, to chat
+- Mention bot + message, or reply to a previous AI chat message from the bot, to chat
 - `/setservercontext <#channel>` (admin/manage guild)
 - `/roast <user>`
 - `/roastme`
@@ -173,7 +172,8 @@ Community commands:
 - `/birthday next [count]`
 
 Schedule note:
-- Birthday/member/server anniversary announcement events are posted at `12:00 AM` bot local time.
+- Birthday/member/server anniversary events are targeted for `12:00 AM` in the configured server timezone.
+- If midnight is missed (restart/outage), the bot retries later the same day until the event is successfully dispatched once.
 
 Admin commands (slash-visible for admins only):
 - `/birthday setup [channel] [role]`
