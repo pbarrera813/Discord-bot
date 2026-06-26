@@ -11,7 +11,7 @@ Nitori was built as a single, no-paywall Discord bot for communities that want b
 
 ## Main Features
 - Moderation toolkit (message, user, channel, role, and color-role panel management).
-- AI conversation with mention/reply triggers, context memory, and server context summaries.
+- More natural AI conversation with context memory, server context summaries, image understanding, timed follow-up chat, and relevant emoji reactions.
 - Translation command with multiple target languages.
 - Memes via Memegen API + local speech meme generator.
 - API Ninjas commands: joke, dadjoke, advice, whois, unit conversion.
@@ -43,6 +43,7 @@ Required for full feature set:
 
 Common optional settings:
 - `XAI_MODEL` (default model)
+- `XAI_VISION_MODEL` (optional image-capable model for AI chat attachments; defaults to `XAI_MODEL`)
 - `DB_PATH`
 - `DEFAULT_PREFIX`
 - `GLOT_BASE_URL`
@@ -68,8 +69,10 @@ python bot.py
 - `/help [section]`
 - `/setup`
 - `/translate <language> [text]`
-- Mention bot + message, or reply to a previous AI chat message from the bot, to chat
+- Mention the bot, reply to one of its AI messages, or keep talking in an active AI chat. Nitori can follow up naturally for a short timeout, read attached images, and react with relevant emoji when it fits.
 - `/setservercontext <#channel>` (admin/manage guild)
+- `/resetservercontext` (admin/manage guild)
+- `/viewservercontext` (admin/manage guild)
 - `/roast <user>`
 - `/roastme`
 
@@ -208,6 +211,7 @@ Supported leagues:
 - `premier`
 - `laliga`
 - `concacaf`
+- `worldcup`
 
 ### Fun APIs (API Ninjas)
 - `/joke`
