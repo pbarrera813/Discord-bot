@@ -12,6 +12,7 @@ from discord.ext import commands, tasks
 
 from services.database import BIRTHDAY_EVENT_TYPES
 from utils.i18n import tr
+from utils.permissions import owner_or_has_permissions
 
 
 EVENT_CHOICES: list[app_commands.Choice[str]] = [
@@ -230,6 +231,7 @@ class BirthdaysCog(commands.Cog):
         member: discord.Member | None,
         age: int | None,
         year_value: int | None,
+        mention_user: bool = True,
     ) -> str:
         def match_named_role(token: str) -> discord.Role | None:
             probe = token.strip().lstrip("@")
@@ -253,7 +255,9 @@ class BirthdaysCog(commands.Cog):
             raw_token = match.group(1).strip()
             token = raw_token.casefold()
             if token == "user":
-                return member.mention if member is not None else ""
+                if member is None:
+                    return ""
+                return member.mention if mention_user else member.display_name
             if token == "username":
                 if member is None:
                     return ""
@@ -330,12 +334,15 @@ class BirthdaysCog(commands.Cog):
             member=member,
             age=age,
             year_value=year_value,
+            mention_user=True,
         )
         ping_prefix = self._resolve_ping(
             guild=guild,
             member=member,
             ping_setting=str(event_settings.get("ping_setting", "none")),
         )
+        if event_type != "birthday":
+            ping_prefix = ""
         message_mode = str(event_settings.get("message_mode", "embed") or "embed").strip().lower()
         if message_mode not in {"text", "embed", "both"}:
             message_mode = "embed"
@@ -371,7 +378,13 @@ class BirthdaysCog(commands.Cog):
         if ping_prefix:
             content_text = f"{ping_prefix}\n{text}" if text else ping_prefix
 
-        mentions = allowed_mentions or discord.AllowedMentions(users=True, roles=True, everyone=True)
+        if allowed_mentions is not None:
+            mentions = allowed_mentions
+        elif event_type == "birthday":
+            mentions = discord.AllowedMentions(users=True, roles=True, everyone=True)
+        else:
+            # For anniversary events, never ping users/roles/everyone automatically.
+            mentions = discord.AllowedMentions(users=False, roles=False, everyone=False)
 
         if message_mode == "text":
             await channel.send(
@@ -637,7 +650,7 @@ class BirthdaysCog(commands.Cog):
 
     @birthday.command(name="setup", description="Configure birthday channel/role quickly.")
     @app_commands.default_permissions(administrator=True)
-    @commands.has_permissions(administrator=True)
+    @owner_or_has_permissions(administrator=True)
     async def birthday_setup(
         self,
         ctx: commands.Context,
@@ -863,7 +876,7 @@ class BirthdaysCog(commands.Cog):
 
     @birthday.command(name="channel", description="Set or clear the birthday announcement channel.")
     @app_commands.default_permissions(administrator=True)
-    @commands.has_permissions(administrator=True)
+    @owner_or_has_permissions(administrator=True)
     async def birthday_channel(self, ctx: commands.Context, channel: discord.TextChannel | None = None) -> None:
         lang = await self._lang(ctx.guild)
         if ctx.guild is None:
@@ -883,7 +896,7 @@ class BirthdaysCog(commands.Cog):
 
     @birthday.command(name="role", description="Set or clear the birthday role.")
     @app_commands.default_permissions(administrator=True)
-    @commands.has_permissions(administrator=True)
+    @owner_or_has_permissions(administrator=True)
     async def birthday_role(self, ctx: commands.Context, role: discord.Role | None = None) -> None:
         lang = await self._lang(ctx.guild)
         if ctx.guild is None:
@@ -903,7 +916,7 @@ class BirthdaysCog(commands.Cog):
 
     @birthday.command(name="timezone", description="Set server timezone for anniversary/birthday server mode.")
     @app_commands.default_permissions(administrator=True)
-    @commands.has_permissions(administrator=True)
+    @owner_or_has_permissions(administrator=True)
     @app_commands.rename(timezone_name="timezone")
     async def birthday_timezone(self, ctx: commands.Context, timezone_name: str) -> None:
         lang = await self._lang(ctx.guild)
@@ -919,7 +932,7 @@ class BirthdaysCog(commands.Cog):
 
     @birthday.command(name="mode", description="Set birthday mode: user or server timezone.")
     @app_commands.default_permissions(administrator=True)
-    @commands.has_permissions(administrator=True)
+    @owner_or_has_permissions(administrator=True)
     async def birthday_mode(self, ctx: commands.Context, mode: str) -> None:
         lang = await self._lang(ctx.guild)
         normalized = mode.strip().lower()
@@ -934,7 +947,7 @@ class BirthdaysCog(commands.Cog):
 
     @birthday.command(name="ages", description="Enable or disable age visibility in birthday messages.")
     @app_commands.default_permissions(administrator=True)
-    @commands.has_permissions(administrator=True)
+    @owner_or_has_permissions(administrator=True)
     async def birthday_ages(self, ctx: commands.Context, enabled: bool) -> None:
         lang = await self._lang(ctx.guild)
         if ctx.guild is None:
@@ -951,7 +964,7 @@ class BirthdaysCog(commands.Cog):
 
     @birthday.command(name="event", description="Configure birthday/anniversary event settings.")
     @app_commands.default_permissions(administrator=True)
-    @commands.has_permissions(administrator=True)
+    @owner_or_has_permissions(administrator=True)
     @app_commands.rename(event_type="type")
     @app_commands.choices(event_type=EVENT_CONFIG_CHOICES)
     async def birthday_event(
@@ -1074,7 +1087,7 @@ class BirthdaysCog(commands.Cog):
 
     @birthday.command(name="preview", description="Preview birthday/anniversary event output.")
     @app_commands.default_permissions(administrator=True)
-    @commands.has_permissions(administrator=True)
+    @owner_or_has_permissions(administrator=True)
     @app_commands.rename(preview_type="type")
     @app_commands.choices(preview_type=EVENT_PREVIEW_CHOICES)
     async def birthday_preview(self, ctx: commands.Context, preview_type: str) -> None:
@@ -1153,7 +1166,7 @@ class BirthdaysCog(commands.Cog):
 
     @birthday.command(name="templateadd", description="Add a custom template for an event type (max 100).")
     @app_commands.default_permissions(administrator=True)
-    @commands.has_permissions(administrator=True)
+    @owner_or_has_permissions(administrator=True)
     @app_commands.rename(event_type="type", template_text="template")
     @app_commands.choices(event_type=EVENT_CHOICES)
     async def birthday_template_add(self, ctx: commands.Context, event_type: str, *, template_text: str) -> None:
@@ -1184,7 +1197,7 @@ class BirthdaysCog(commands.Cog):
 
     @birthday.command(name="templatelist", description="List custom templates for an event type.")
     @app_commands.default_permissions(administrator=True)
-    @commands.has_permissions(administrator=True)
+    @owner_or_has_permissions(administrator=True)
     @app_commands.rename(event_type="type")
     @app_commands.choices(event_type=EVENT_CHOICES)
     async def birthday_template_list(self, ctx: commands.Context, event_type: str) -> None:
@@ -1214,7 +1227,7 @@ class BirthdaysCog(commands.Cog):
 
     @birthday.command(name="templateremove", description="Remove template by template ID.")
     @app_commands.default_permissions(administrator=True)
-    @commands.has_permissions(administrator=True)
+    @owner_or_has_permissions(administrator=True)
     @app_commands.rename(event_type="type", template_id="id")
     @app_commands.choices(event_type=EVENT_CHOICES)
     async def birthday_template_remove(self, ctx: commands.Context, event_type: str, template_id: int) -> None:
@@ -1234,7 +1247,7 @@ class BirthdaysCog(commands.Cog):
 
     @birthday.command(name="blacklistuser", description="Add or remove a user from birthday celebrations.")
     @app_commands.default_permissions(administrator=True)
-    @commands.has_permissions(administrator=True)
+    @owner_or_has_permissions(administrator=True)
     async def birthday_blacklist_user(self, ctx: commands.Context, user: discord.Member, blocked: bool) -> None:
         lang = await self._lang(ctx.guild)
         if ctx.guild is None:
@@ -1249,7 +1262,7 @@ class BirthdaysCog(commands.Cog):
 
     @birthday.command(name="blacklistrole", description="Add or remove a role from birthday celebrations.")
     @app_commands.default_permissions(administrator=True)
-    @commands.has_permissions(administrator=True)
+    @owner_or_has_permissions(administrator=True)
     async def birthday_blacklist_role(self, ctx: commands.Context, role: discord.Role, blocked: bool) -> None:
         lang = await self._lang(ctx.guild)
         if ctx.guild is None:
@@ -1264,7 +1277,7 @@ class BirthdaysCog(commands.Cog):
 
     @birthday.command(name="trusted", description="Set trusted role behavior for birthday system.")
     @app_commands.default_permissions(administrator=True)
-    @commands.has_permissions(administrator=True)
+    @owner_or_has_permissions(administrator=True)
     @app_commands.rename(
         prevent_message="blockmessage",
         prevent_role="blockrole",

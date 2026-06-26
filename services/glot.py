@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 from urllib.parse import urlparse
 
@@ -67,8 +68,27 @@ class GlotClient:
                     )
                 else:
                     message = str(data)
-                raise GlotRequestError(status=resp.status, message=message, path=path)
+                raise GlotRequestError(
+                    status=resp.status,
+                    message=self._sanitize_error_message(message),
+                    path=path,
+                )
             return data
+
+    @staticmethod
+    def _sanitize_error_message(message: str) -> str:
+        if not message:
+            return "Unknown error"
+        # Drop HTML tags/scripts if provider returns full HTML error pages.
+        cleaned = message.replace("\r", " ").replace("\n", " ")
+        cleaned = cleaned.strip()
+        cleaned = cleaned.replace("<script", " <script")
+        cleaned = cleaned.split("<script", 1)[0]
+        cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+        cleaned = " ".join(cleaned.split())
+        if len(cleaned) > 220:
+            return f"{cleaned[:217]}..."
+        return cleaned or "Unknown error"
 
     def _effective_mode(self) -> str:
         mode = self.mode

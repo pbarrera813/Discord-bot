@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import logging
 import re
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
+from services.database import AI_INTERACTIONS_CONTEXT_CHANNEL_ID
 from utils.i18n import normalize_language, tr
+from utils.permissions import owner_or_has_permissions
 
 HELP_SECTION_ALIASES: dict[str, str] = {
     "basic": "basic",
@@ -165,6 +168,10 @@ class HelpPaginatorView(discord.ui.View):
 class AdminCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self.server_context_refresh_worker.start()
+
+    def cog_unload(self) -> None:
+        self.server_context_refresh_worker.cancel()
 
     async def _lang(self, guild: discord.Guild | None) -> str:
         if guild is None:
@@ -208,6 +215,8 @@ class AdminCog(commands.Cog):
                     continue
 
             content = " ".join(content.split())
+            if self._is_context_line_suspicious(content):
+                continue
             if len(content) > 260:
                 content = f"{content[:257]}..."
 
@@ -217,8 +226,182 @@ class AdminCog(commands.Cog):
 
         return lines
 
+    async def _summarize_channel_context(
+        self,
+        *,
+        channel: discord.TextChannel,
+        lang: str,
+    ) -> str | None:
+        lines = await self._collect_channel_messages(channel, lang)
+        if not lines:
+            return None
+
+        transcript = "\n".join(lines)
+        if len(transcript) > 22000:
+            transcript = transcript[:22000]
+
+        return await self.bot.llm_client.summarize_server_context(
+            channel_name=channel.name,
+            messages_transcript=transcript,
+            language=lang,
+        )
+
+    @staticmethod
+    def _is_context_entry_stale(entry: dict[str, object]) -> bool:
+        raw = str(entry.get("updated_at", "")).strip()
+        if not raw:
+            return True
+        try:
+            updated_at = datetime.fromisoformat(raw)
+        except ValueError:
+            return True
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - updated_at >= timedelta(days=7)
+
+    @staticmethod
+    def _has_enough_interaction_context(rows: list[dict[str, object]]) -> bool:
+        if len(rows) < 20:
+            return False
+
+        user_rows = [
+            row for row in rows if str(row.get("role", "")).strip().lower() == "user"
+        ]
+        if len(user_rows) < 8:
+            return False
+
+        speakers = {
+            str(row.get("speaker", "")).strip().casefold()
+            for row in user_rows
+            if str(row.get("speaker", "")).strip()
+        }
+        if len(speakers) < 2:
+            return False
+
+        total_chars = sum(
+            len(str(row.get("content", "")).strip())
+            for row in rows
+        )
+        return total_chars >= 500
+
+    @staticmethod
+    def _interaction_rows_to_transcript(rows: list[dict[str, object]]) -> str:
+        lines: list[str] = []
+        for row in rows:
+            speaker = str(row.get("speaker", "")).strip() or "User"
+            content = " ".join(str(row.get("content", "")).strip().split())
+            if not content:
+                continue
+            if not content.casefold().startswith(f"{speaker.casefold()}:"):
+                content = f"{speaker}: {content}"
+            if len(content) > 260:
+                content = f"{content[:257]}..."
+            lines.append(content)
+            if len(lines) >= 400:
+                break
+        return "\n".join(lines)
+
+    @tasks.loop(hours=24)
+    async def server_context_refresh_worker(self) -> None:
+        for guild in list(self.bot.guilds):
+            try:
+                await self._refresh_guild_server_context(guild)
+            except Exception:
+                logging.exception("AI server context refresh failed in guild=%s", guild.id)
+
+    @server_context_refresh_worker.before_loop
+    async def before_server_context_refresh_worker(self) -> None:
+        await self.bot.wait_until_ready()
+
+    async def _refresh_guild_server_context(self, guild: discord.Guild) -> None:
+        entries = await self.bot.db.get_server_context_entries(guild.id)
+        real_entries = [
+            entry for entry in entries if int(entry.get("channel_id", 0)) > 0
+        ]
+        lang = await self._lang(guild)
+
+        if real_entries:
+            for entry in real_entries:
+                if not self._is_context_entry_stale(entry):
+                    continue
+                channel_id = int(entry["channel_id"])
+                channel = guild.get_channel(channel_id)
+                if not isinstance(channel, discord.TextChannel):
+                    continue
+                try:
+                    summary = await self._summarize_channel_context(
+                        channel=channel,
+                        lang=lang,
+                    )
+                except (discord.Forbidden, discord.HTTPException):
+                    logging.exception(
+                        "Failed to refresh AI channel context guild=%s channel=%s",
+                        guild.id,
+                        channel_id,
+                    )
+                    continue
+                if not summary:
+                    continue
+                await self.bot.db.upsert_server_context_entry(
+                    guild_id=guild.id,
+                    channel_id=channel.id,
+                    channel_name=channel.name,
+                    summary=summary,
+                    max_entries=2,
+                )
+            return
+
+        sentinel_entry = next(
+            (
+                entry
+                for entry in entries
+                if int(entry.get("channel_id", 0)) == AI_INTERACTIONS_CONTEXT_CHANNEL_ID
+            ),
+            None,
+        )
+        if sentinel_entry is not None and not self._is_context_entry_stale(sentinel_entry):
+            return
+
+        since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        rows = await self.bot.db.get_recent_ai_conversation_turns(guild.id, since)
+        if not self._has_enough_interaction_context(rows):
+            return
+
+        transcript = self._interaction_rows_to_transcript(rows)
+        if not transcript:
+            return
+        summary = await self.bot.llm_client.summarize_server_context(
+            channel_name="ai-interactions",
+            messages_transcript=transcript,
+            language=lang,
+        )
+        await self.bot.db.upsert_server_context_entry(
+            guild_id=guild.id,
+            channel_id=AI_INTERACTIONS_CONTEXT_CHANNEL_ID,
+            channel_name="ai-interactions",
+            summary=summary,
+            max_entries=2,
+        )
+
+    @staticmethod
+    def _is_context_line_suspicious(content: str) -> bool:
+        lowered = content.casefold()
+        markers = (
+            "ignore previous instructions",
+            "ignore all instructions",
+            "disregard previous instructions",
+            "you are now system",
+            "act as system",
+            "developer prompt",
+            "system prompt",
+            "reveal prompt",
+            "jailbreak",
+            "prompt injection",
+        )
+        return any(marker in lowered for marker in markers)
+
     @commands.hybrid_command(name="setmodlog", description="Set the moderation log channel.")
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     async def set_modlog(
         self, ctx: commands.Context, channel: discord.TextChannel | None = None
     ) -> None:
@@ -237,7 +420,7 @@ class AdminCog(commands.Cog):
     @commands.hybrid_command(
         name="setprefix", description="Set the text command prefix for this server."
     )
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     async def set_prefix(self, ctx: commands.Context, prefix: str) -> None:
         await self._update_prefix(ctx, prefix)
 
@@ -245,7 +428,7 @@ class AdminCog(commands.Cog):
         name="language",
         description="Set bot language for command responses. Allowed: en, es.",
     )
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     @discord.app_commands.rename(language_code="language")
     async def language(self, ctx: commands.Context, language_code: str) -> None:
         guild = ctx.guild
@@ -273,7 +456,7 @@ class AdminCog(commands.Cog):
         name="setservercontext",
         description="Analyze one text channel (last 7 days) and update AI server context.",
     )
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     async def set_server_context(
         self, ctx: commands.Context, channel: discord.TextChannel
     ) -> None:
@@ -288,7 +471,10 @@ class AdminCog(commands.Cog):
             await ctx.defer()
 
         try:
-            lines = await self._collect_channel_messages(channel, lang)
+            summary = await self._summarize_channel_context(
+                channel=channel,
+                lang=lang,
+            )
         except discord.Forbidden:
             await ctx.send(
                 tr(
@@ -298,17 +484,28 @@ class AdminCog(commands.Cog):
                 )
             )
             return
-        except discord.HTTPException as exc:
+        except discord.HTTPException:
+            logging.exception("Failed to read channel history for context in guild=%s", guild.id)
             await ctx.send(
                 tr(
                     lang,
-                    f"Failed to read channel history: {exc}",
-                    f"No se pudo leer el historial del canal: {exc}",
+                    "Failed to read channel history.",
+                    "No se pudo leer el historial del canal.",
+                )
+            )
+            return
+        except Exception:
+            logging.exception("Failed to summarize server context in guild=%s", guild.id)
+            await ctx.send(
+                tr(
+                    lang,
+                    "Failed to analyze channel context right now. Try again in a moment.",
+                    "No se pudo analizar el contexto del canal en este momento. Intenta de nuevo en un momento.",
                 )
             )
             return
 
-        if not lines:
+        if not summary:
             await ctx.send(
                 tr(
                     lang,
@@ -320,26 +517,6 @@ class AdminCog(commands.Cog):
             )
             return
 
-        transcript = "\n".join(lines)
-        if len(transcript) > 22000:
-            transcript = transcript[:22000]
-
-        try:
-            summary = await self.bot.llm_client.summarize_server_context(
-                channel_name=channel.name,
-                messages_transcript=transcript,
-                language=lang,
-            )
-        except Exception as exc:
-            await ctx.send(
-                tr(
-                    lang,
-                    f"Failed to analyze channel context: {exc}",
-                    f"No se pudo analizar el contexto del canal: {exc}",
-                )
-            )
-            return
-
         await self.bot.db.upsert_server_context_entry(
             guild_id=guild.id,
             channel_id=channel.id,
@@ -347,6 +524,7 @@ class AdminCog(commands.Cog):
             summary=summary,
             max_entries=2,
         )
+
         await ctx.send(
             tr(
                 lang,
@@ -354,6 +532,102 @@ class AdminCog(commands.Cog):
                 "Ahora entiendo cómo se comporta la gente en el servidor, ¡hablaré como ustedes de ahora en adelante!",
             )
         )
+
+    @commands.hybrid_command(
+        name="resetservercontext",
+        description="Reset AI server context and stored AI conversation memory.",
+    )
+    @owner_or_has_permissions(manage_guild=True)
+    async def reset_server_context(self, ctx: commands.Context) -> None:
+        guild = ctx.guild
+        if guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+
+        lang = await self._lang(guild)
+        await self.bot.db.reset_ai_server_context(guild.id)
+        ai_cog = self.bot.get_cog("AIChatCog")
+        if ai_cog is not None and hasattr(ai_cog, "clear_guild_history"):
+            ai_cog.clear_guild_history(guild.id)
+        await ctx.send(
+            tr(
+                lang,
+                "AI server context reset. I will rebuild it from future chats or new `/setservercontext` channels.",
+                "Contexto de IA reiniciado. Lo reconstruire con chats futuros o nuevos canales de `/setservercontext`.",
+            )
+        )
+
+    @commands.hybrid_command(
+        name="viewservercontext",
+        description="View the stored AI server context for this server.",
+    )
+    @owner_or_has_permissions(manage_guild=True)
+    async def view_server_context(self, ctx: commands.Context) -> None:
+        guild = ctx.guild
+        if guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+
+        settings = await self.bot.db.get_guild_settings(guild.id)
+        entries = await self.bot.db.get_server_context_entries(guild.id)
+        output = self._format_server_context_view(settings.server_context, entries)
+        await self._send_server_context_view(ctx, output)
+
+    @staticmethod
+    def _format_server_context_view(
+        server_context: str | None,
+        entries: list[dict[str, object]],
+    ) -> str:
+        context = (server_context or "").strip()
+        if not context and not entries:
+            return "No AI server context is currently stored."
+
+        lines = ["AI server context currently stored:"]
+        if entries:
+            lines.append("")
+            lines.append("Sources:")
+            for entry in entries:
+                channel_id = int(entry.get("channel_id", 0))
+                channel_name = str(entry.get("channel_name", "")).strip() or "unknown"
+                updated_at = str(entry.get("updated_at", "")).strip() or "unknown time"
+                if channel_id == AI_INTERACTIONS_CONTEXT_CHANNEL_ID:
+                    label = f"AI interactions ({channel_id})"
+                else:
+                    label = f"#{channel_name} ({channel_id})"
+                lines.append(f"- {label}, updated {updated_at}")
+
+        if context:
+            lines.append("")
+            lines.append("Context:")
+            lines.append(context)
+        else:
+            lines.append("")
+            lines.append("No combined context text is currently stored.")
+        return "\n".join(lines)
+
+    async def _send_server_context_view(self, ctx: commands.Context, output: str) -> None:
+        chunks = self._split_context_view_output(output)
+        ephemeral = bool(ctx.interaction)
+        for chunk in chunks:
+            if ephemeral:
+                await ctx.send(chunk, ephemeral=True)
+            else:
+                await ctx.send(chunk)
+
+    @staticmethod
+    def _split_context_view_output(output: str, limit: int = 1900) -> list[str]:
+        text = output.strip() or "No AI server context is currently stored."
+        chunks: list[str] = []
+        remaining = text
+        while len(remaining) > limit:
+            split_at = remaining.rfind("\n", 0, limit)
+            if split_at <= 0:
+                split_at = limit
+            chunks.append(remaining[:split_at].strip())
+            remaining = remaining[split_at:].strip()
+        if remaining:
+            chunks.append(remaining)
+        return chunks or ["No AI server context is currently stored."]
 
     @commands.hybrid_command(name="setup", description="Show bot setup and capabilities.")
     async def setup_help(self, ctx: commands.Context) -> None:
@@ -375,7 +649,7 @@ class AdminCog(commands.Cog):
     @commands.hybrid_command(
         name="antispam", description="Enable or disable the basic anti-spam filter."
     )
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     async def antispam(self, ctx: commands.Context, enabled: bool) -> None:
         if ctx.guild is None:
             await ctx.send("This command can only be used in a server.")
@@ -386,7 +660,7 @@ class AdminCog(commands.Cog):
     @commands.hybrid_command(
         name="antilink", description="Enable or disable the basic anti-link filter."
     )
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     async def antilink(self, ctx: commands.Context, enabled: bool) -> None:
         if ctx.guild is None:
             await ctx.send("This command can only be used in a server.")
@@ -399,7 +673,7 @@ class AdminCog(commands.Cog):
         description="Manage AI-allowed channels.",
         invoke_without_command=True,
     )
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     async def aichannel(self, ctx: commands.Context) -> None:
         await self.aichannellist(ctx)
 
@@ -407,7 +681,7 @@ class AdminCog(commands.Cog):
         name="add",
         description="Allow AI chat/translation in a specific channel.",
     )
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     async def aichanneladd(
         self, ctx: commands.Context, channel: discord.TextChannel
     ) -> None:
@@ -421,7 +695,7 @@ class AdminCog(commands.Cog):
         name="remove",
         description="Remove a channel from the AI-allowed channel list.",
     )
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     async def aichannelremove(
         self, ctx: commands.Context, channel: discord.TextChannel
     ) -> None:
@@ -454,7 +728,7 @@ class AdminCog(commands.Cog):
         name="list",
         description="List channels where AI chat/translation is currently allowed.",
     )
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     async def aichannellist(self, ctx: commands.Context) -> None:
         if ctx.guild is None:
             await ctx.send("This command can only be used in a server.")
@@ -482,7 +756,7 @@ class AdminCog(commands.Cog):
         name="clear",
         description="Clear AI channel restrictions (AI allowed in all channels).",
     )
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     async def aichannelclear(self, ctx: commands.Context) -> None:
         if ctx.guild is None:
             await ctx.send("This command can only be used in a server.")
@@ -820,7 +1094,9 @@ Ligas: `ligamx`, `premier`, `laliga`, `concacaf`."""
         admin_en = """`/config modlog [#channel]` - Set moderation log channel.
 `/config prefix <new_prefix>` - Change server prefix.
 `/config language <en|es>` - Set response language.
-`/config servercontext <#channel>` - Add/update AI context channel.
+`/setservercontext <#channel>` - Add/update AI context channel.
+`/resetservercontext` - Clear AI context and rebuild from future chats or channels.
+`/viewservercontext` - View current stored AI context.
 `/config antispam <true|false>` - Toggle anti-spam filter.
 `/config antilink <true|false>` - Toggle anti-link filter.
 `/color setup` - Create default color roles.
@@ -832,7 +1108,9 @@ Ligas: `ligamx`, `premier`, `laliga`, `concacaf`."""
         admin_es = """`/config modlog [#canal]` - Define canal de logs de moderacion.
 `/config prefix <nuevo_prefijo>` - Cambia el prefijo del servidor.
 `/config language <en|es>` - Define idioma de respuestas.
-`/config servercontext <#canal>` - Agrega/actualiza canal de contexto IA.
+`/setservercontext <#canal>` - Agrega/actualiza canal de contexto IA.
+`/resetservercontext` - Reinicia contexto IA y lo reconstruye con chats o canales futuros.
+`/viewservercontext` - Muestra el contexto IA almacenado.
 `/config antispam <true|false>` - Activa/desactiva filtro anti-spam.
 `/config antilink <true|false>` - Activa/desactiva filtro anti-links.
 `/color setup` - Crea roles de color por defecto.
@@ -1037,6 +1315,8 @@ Variables de cumpleaños:
     @set_prefix.error
     @language.error
     @set_server_context.error
+    @reset_server_context.error
+    @view_server_context.error
     @setup_help.error
     @antispam.error
     @antilink.error
@@ -1051,7 +1331,8 @@ Variables de cumpleaños:
         if isinstance(error, commands.MissingPermissions):
             await ctx.send("You do not have permission to use this command.")
             return
-        await ctx.send(f"Command failed: {error}")
+        logging.exception("Admin command failed", exc_info=error)
+        await ctx.send("Command failed due to an internal error. Please try again.")
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(AdminCog(bot))

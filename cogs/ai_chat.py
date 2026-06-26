@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from dataclasses import dataclass
 import difflib
 import logging
 import re
@@ -13,6 +14,14 @@ from discord.ext import commands
 
 from utils.discord_helpers import parse_user_id_from_text
 from utils.i18n import tr
+
+
+@dataclass(frozen=True)
+class ChatImageContext:
+    urls: list[str]
+    from_replied_message: bool
+    reaction_target: object
+    prompt_note: str = ""
 
 
 SUPPORTED_TRANSLATE_LANGUAGES: Final[tuple[str, ...]] = (
@@ -57,6 +66,8 @@ COMMAND_HINTS: Final[dict[str, str]] = {
     "help": "help",
     "setup": "setup",
     "setservercontext": "setservercontext",
+    "resetservercontext": "resetservercontext",
+    "viewservercontext": "viewservercontext",
     "setprefix": "setprefix",
     "prefix": "setprefix",
     "language": "language",
@@ -140,6 +151,10 @@ class AIChatCog(commands.Cog):
         self.bot = bot
         self._cooldowns: dict[tuple[int, int], float] = {}
         self._cooldown_seconds = 4.0
+        self._active_chat_timeout_seconds = 120.0
+        self._active_chats: dict[tuple[int, int], float] = {}
+        self._reaction_cooldown_seconds = 45.0
+        self._reaction_cooldowns: dict[tuple[int, int], float] = {}
         self._conversation_history: dict[tuple[int, int], deque[dict[str, str]]] = defaultdict(
             lambda: deque(maxlen=120)
         )
@@ -183,7 +198,15 @@ class AIChatCog(commands.Cog):
 
         replied_message = await self._get_replied_message(message)
 
-        if not await self._is_chat_trigger(message, replied_message):
+        is_direct_trigger = await self._is_chat_trigger(message, replied_message)
+        is_active_followup = False
+        if not is_direct_trigger:
+            is_active_followup = await self._is_active_chat_followup(
+                message,
+                prefix=prefix,
+                settings=settings,
+            )
+        if not is_direct_trigger and not is_active_followup:
             return
         if not self._allowed_by_cooldown(message):
             return
@@ -203,7 +226,23 @@ class AIChatCog(commands.Cog):
                     mention_author=True,
                 )
                 return
+        image_context = self._build_chat_image_context(message, replied_message)
+        image_urls = image_context.urls
+        if image_urls:
+            hinted_command = self._detect_command_hint(user_prompt)
+            if hinted_command and hinted_command.startswith("meme"):
+                await message.reply(
+                    tr(
+                        lang,
+                        f"Hey, there is a command for this! Use: `/{hinted_command}` or `{prefix}{hinted_command}`",
+                        f"Oye, hay un comando para esto. Usa: `/{hinted_command}` o `{prefix}{hinted_command}`",
+                    ),
+                    mention_author=True,
+                )
+                return
 
+        llm_prompt = self._apply_image_context_note(user_prompt, image_context)
+        available_emojis = self._serialize_custom_emojis(message.guild)
         convo_key = self._conversation_key(message.guild.id, message.channel.id)
         await self._ensure_history_loaded(convo_key, message.guild.id, message.channel.id)
         if (
@@ -233,20 +272,27 @@ class AIChatCog(commands.Cog):
             prompt=user_prompt,
             lang=lang,
         )
+        conversation_mode = self._conversation_mode_for_trigger(
+            replied_message,
+            is_active_followup=is_active_followup,
+        )
 
         await message.channel.typing()
         try:
             reply = await self.bot.llm_client.chat(
                 server_context=settings.server_context,
-                user_message=user_prompt,
+                user_message=llm_prompt,
                 author_name=message.author.display_name,
                 channel_name=getattr(message.channel, "name", "unknown"),
                 channel_reference=self._channel_reference(message.channel),
                 available_channels=self._serialize_text_channels(message.guild),
-                available_emojis=self._serialize_custom_emojis(message.guild),
+                available_emojis=available_emojis,
                 conversation_history=self._build_conversation_history(convo_key),
                 mention_hints=self._build_mention_hints(relay_context),
                 relay_instruction=self._build_relay_instruction(relay_context, lang),
+                is_owner=self.bot.is_owner_user(message.author),
+                conversation_mode=conversation_mode,
+                image_urls=image_urls,
             )
         except Exception as exc:
             logging.exception("AI chat failure in guild=%s channel=%s", message.guild.id, message.channel.id)
@@ -268,6 +314,15 @@ class AIChatCog(commands.Cog):
                     ),
                     mention_author=True,
                 )
+            elif image_urls and self._is_ai_image_access_error(exc):
+                await message.reply(
+                    tr(
+                        lang,
+                        "I can see you attached an image, but this xAI model/API access is not enabled for image understanding. Ask an admin to set `XAI_VISION_MODEL` to a vision-capable model and confirm image input access.",
+                        "Veo que adjuntaste una imagen, pero este modelo/acceso de xAI no esta habilitado para entender imagenes. Pide a un admin configurar `XAI_VISION_MODEL` con un modelo con vision y revisar el acceso a imagenes.",
+                    ),
+                    mention_author=True,
+                )
             else:
                 await message.reply(
                     tr(
@@ -281,7 +336,8 @@ class AIChatCog(commands.Cog):
 
         reply = await self._normalize_discord_references(reply, message.guild)
         reply = self._apply_relay_postprocess(reply, relay_context)
-        reply = self._strip_bot_speaker_prefix(reply)
+        reply = self._sanitize_visible_ai_output(reply)
+        reply = self._dearm_mass_mentions(reply)
         prefixed_user = self._append_conversation_turn(
             convo_key,
             role="user",
@@ -311,7 +367,17 @@ class AIChatCog(commands.Cog):
                 speaker=bot_speaker,
                 content=prefixed_bot,
             )
-        await self._send_long_reply(message, reply, mention_author=True)
+        await self._send_long_reply(message, reply, mention_author=not is_active_followup)
+        self._activate_active_chat(message)
+        await self._maybe_add_ai_reaction(
+            target=image_context.reaction_target,
+            reaction_key=convo_key,
+            user_prompt=user_prompt,
+            assistant_reply=reply,
+            channel_name=getattr(message.channel, "name", "unknown"),
+            available_emojis=available_emojis,
+            conversation_mode=conversation_mode,
+        )
 
     @commands.hybrid_command(
         name="roast",
@@ -449,6 +515,8 @@ class AIChatCog(commands.Cog):
                 available_channels=self._serialize_text_channels(guild),
                 available_emojis=self._serialize_custom_emojis(guild),
                 conversation_history=self._build_conversation_history(convo_key),
+                is_owner=self.bot.is_owner_user(ctx.author),
+                conversation_mode="command",
             )
         except Exception as exc:
             if guild is not None:
@@ -480,6 +548,8 @@ class AIChatCog(commands.Cog):
             return
 
         reply = await self._normalize_discord_references(reply, guild)
+        reply = self._sanitize_visible_ai_output(reply)
+        reply = self._dearm_mass_mentions(reply)
         reply = self._format_roast_reply(reply, mention)
         prefixed_user = self._append_conversation_turn(
             convo_key,
@@ -512,7 +582,7 @@ class AIChatCog(commands.Cog):
             )
         await ctx.send(
             reply[:1900],
-            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
         )
 
     async def _build_roast_target_profile(
@@ -1180,6 +1250,8 @@ class AIChatCog(commands.Cog):
             return
 
         translated = await self._normalize_discord_references(translated, trigger_message.guild)
+        translated = self._sanitize_visible_ai_output(translated)
+        translated = self._dearm_mass_mentions(translated)
         await trigger_message.reply(translated[:1900], mention_author=True)
 
     async def _is_chat_trigger(
@@ -1204,10 +1276,231 @@ class AIChatCog(commands.Cog):
             and self._is_chat_response_message(ref_msg.id)
         )
 
+    def _activate_active_chat(self, message: discord.Message) -> None:
+        self._active_chats[self._message_channel_key(message)] = (
+            time.monotonic() + self._active_chat_timeout_seconds
+        )
+
+    def _is_active_chat(self, message: discord.Message) -> bool:
+        key = self._message_channel_key(message)
+        active_until = self._active_chats.get(key, 0.0)
+        if active_until <= time.monotonic():
+            self._active_chats.pop(key, None)
+            return False
+        return True
+
+    async def _is_active_chat_followup(
+        self,
+        message: discord.Message,
+        *,
+        prefix: str,
+        settings: object,
+    ) -> bool:
+        if not self._is_active_chat(message):
+            return False
+        if getattr(message, "webhook_id", None) is not None:
+            return False
+        content = message.content.strip()
+        if not content or content.startswith(prefix):
+            return False
+        if self._is_noise_only_followup(content):
+            return False
+        return not await self._is_passive_ai_blocked_channel(message.guild, message.channel, settings)
+
+    async def _is_passive_ai_blocked_channel(
+        self,
+        guild: discord.Guild,
+        channel: discord.abc.GuildChannel | discord.Thread,
+        settings: object,
+    ) -> bool:
+        channel_ids = {getattr(channel, "id", None)}
+        parent_id = getattr(channel, "parent_id", None)
+        if parent_id is not None:
+            channel_ids.add(parent_id)
+
+        blocked_ids: set[int] = set()
+        modlog_channel_id = getattr(settings, "modlog_channel_id", None)
+        if isinstance(modlog_channel_id, int):
+            blocked_ids.add(modlog_channel_id)
+
+        try:
+            birthday_settings = await self.bot.db.get_or_create_birthday_guild_settings(guild.id)
+            birthday_channel_id = birthday_settings.get("channel_id")
+            if isinstance(birthday_channel_id, int):
+                blocked_ids.add(birthday_channel_id)
+        except Exception:
+            logging.exception("Failed to read birthday channel for passive AI block")
+
+        for kind in ("welcome", "goodbye"):
+            try:
+                announcement_settings = await self.bot.db.get_announcement_settings(guild.id, kind)
+                announcement_channel_id = getattr(announcement_settings, "channel_id", None)
+                if isinstance(announcement_channel_id, int):
+                    blocked_ids.add(announcement_channel_id)
+            except Exception:
+                logging.exception("Failed to read %s channel for passive AI block", kind)
+
+        return any(channel_id in blocked_ids for channel_id in channel_ids if channel_id is not None)
+
+    @staticmethod
+    def _is_noise_only_followup(content: str) -> bool:
+        normalized = content.strip().casefold()
+        normalized = re.sub(r"[\s\W_]+", "", normalized, flags=re.UNICODE)
+        if not normalized:
+            return True
+        if normalized in {
+            "ok",
+            "okay",
+            "k",
+            "kk",
+            "va",
+            "si",
+            "sí",
+            "yes",
+            "no",
+            "nah",
+            "aja",
+            "lol",
+            "lmao",
+            "xd",
+            "haha",
+            "jaja",
+            "jeje",
+            "hmm",
+            "mmm",
+        }:
+            return True
+        return len(normalized) <= 2
+
+    def _conversation_mode_for_trigger(
+        self,
+        replied_message: discord.Message | None,
+        *,
+        is_active_followup: bool,
+    ) -> str:
+        if is_active_followup:
+            return "active"
+        if (
+            replied_message is not None
+            and self.bot.user is not None
+            and replied_message.author.id == self.bot.user.id
+            and self._is_chat_response_message(replied_message.id)
+        ):
+            return "reply"
+        return "mention"
+
     def _extract_chat_prompt(self, message: discord.Message) -> str:
         if self.bot.user and self.bot.user in message.mentions:
             return self._remove_bot_mentions(message.content, self.bot.user.id)
         return message.content.strip()
+
+    @staticmethod
+    def _extract_supported_image_urls(attachments: list[discord.Attachment]) -> list[str]:
+        urls: list[str] = []
+        for attachment in attachments:
+            content_type = (getattr(attachment, "content_type", "") or "").casefold()
+            filename = (getattr(attachment, "filename", "") or "").casefold()
+            url = str(getattr(attachment, "url", "") or "").strip()
+            if not url:
+                continue
+            if content_type in {"image/jpeg", "image/jpg", "image/png"} or filename.endswith(
+                (".jpg", ".jpeg", ".png")
+            ):
+                urls.append(url)
+            if len(urls) >= 4:
+                break
+        return urls
+
+    @classmethod
+    def _build_chat_image_context(
+        cls,
+        message: discord.Message,
+        replied_message: discord.Message | None,
+    ) -> ChatImageContext:
+        current_urls = cls._extract_supported_image_urls(message.attachments)
+        replied_urls = (
+            cls._extract_supported_image_urls(replied_message.attachments)
+            if replied_message is not None
+            else []
+        )
+
+        urls: list[str] = []
+        seen: set[str] = set()
+        for url in current_urls + replied_urls:
+            if url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+            if len(urls) >= 4:
+                break
+
+        from_replied = bool(replied_urls)
+        target = replied_message if from_replied and replied_message is not None else message
+        prompt_note = ""
+        if from_replied and replied_message is not None:
+            author_name = getattr(getattr(replied_message, "author", None), "display_name", "another user")
+            prompt_note = (
+                "Image context: the user is asking about image attachment(s) "
+                f"from a replied-to message sent by {author_name}."
+            )
+        return ChatImageContext(
+            urls=urls,
+            from_replied_message=from_replied,
+            reaction_target=target,
+            prompt_note=prompt_note,
+        )
+
+    @staticmethod
+    def _apply_image_context_note(prompt: str, image_context: ChatImageContext) -> str:
+        if not image_context.prompt_note:
+            return prompt
+        return f"{prompt}\n\n[{image_context.prompt_note}]"
+
+    async def _maybe_add_ai_reaction(
+        self,
+        *,
+        target: object,
+        reaction_key: tuple[int, int],
+        user_prompt: str,
+        assistant_reply: str,
+        channel_name: str,
+        available_emojis: list[str],
+        conversation_mode: str,
+    ) -> None:
+        if not hasattr(target, "add_reaction"):
+            return
+        if not self._consume_reaction_cooldown(reaction_key):
+            return
+        try:
+            reaction = await self.bot.llm_client.suggest_reaction(
+                user_message=user_prompt,
+                assistant_reply=assistant_reply,
+                channel_name=channel_name,
+                available_emojis=available_emojis,
+                conversation_mode=conversation_mode,
+            )
+            if not reaction:
+                return
+            emoji: str | discord.PartialEmoji = reaction
+            if reaction.startswith("<") and reaction.endswith(">"):
+                emoji = discord.PartialEmoji.from_str(reaction)
+            await target.add_reaction(emoji)
+        except (discord.Forbidden, discord.HTTPException):
+            logging.exception("Failed to add AI reaction")
+        except Exception:
+            logging.exception("AI reaction suggestion failed")
+
+    def _consume_reaction_cooldown(self, key: tuple[int, int]) -> bool:
+        now = time.monotonic()
+        next_allowed = self._reaction_cooldowns.get(key, 0.0)
+        if next_allowed > now:
+            return False
+        self._reaction_cooldowns[key] = now + self._reaction_cooldown_seconds
+        return True
+
+    @staticmethod
+    def _message_channel_key(message: discord.Message) -> tuple[int, int]:
+        return (int(message.guild.id), int(message.channel.id))  # type: ignore[union-attr]
 
     @staticmethod
     def _remove_bot_mentions(text: str, bot_id: int) -> str:
@@ -1350,10 +1643,17 @@ class AIChatCog(commands.Cog):
         parts = self._split_for_discord(text, limit=1900)
         if not parts:
             return
-        first = await trigger_message.reply(parts[0], mention_author=mention_author)
+        first = await trigger_message.reply(
+            parts[0],
+            mention_author=mention_author,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
+        )
         self._remember_chat_response_message(first.id)
         for part in parts[1:]:
-            extra = await trigger_message.channel.send(part)
+            extra = await trigger_message.channel.send(
+                part,
+                allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
+            )
             self._remember_chat_response_message(extra.id)
 
     def _is_chat_response_message(self, message_id: int) -> bool:
@@ -1367,6 +1667,37 @@ class AIChatCog(commands.Cog):
             self._chat_response_id_set.discard(oldest)
         self._chat_response_ids.append(message_id)
         self._chat_response_id_set.add(message_id)
+
+    def clear_guild_history(self, guild_id: int) -> None:
+        for key in list(self._conversation_history.keys()):
+            if key[0] == guild_id:
+                del self._conversation_history[key]
+
+    def _sanitize_visible_ai_output(self, text: str) -> str:
+        cleaned = text.strip()
+        if not cleaned:
+            return cleaned
+
+        cleaned = re.sub(
+            r"\[\s*UNTRUSTED[^\]]*\]\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"(?im)^\s*UNTRUSTED[_\s-]*(?:USER|ASSISTANT|TRANSLATION|MENTION|RELAY)[^\n]*\n?",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(
+            r"\bUNTRUSTED_(?:USER|ASSISTANT|TRANSLATION|MENTION|RELAY)[A-Z_]*(?:\s+FROM\s+\S+)?\b\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+        cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
+        return self._strip_bot_speaker_prefix(cleaned)
 
     def _strip_bot_speaker_prefix(self, text: str) -> str:
         cleaned = text.strip().strip("`")
@@ -1446,6 +1777,14 @@ class AIChatCog(commands.Cog):
         return chunks
 
     @staticmethod
+    def _dearm_mass_mentions(text: str) -> str:
+        if not text:
+            return text
+        updated = re.sub(r"@(?=everyone\b)", "@\u200beveryone", text, flags=re.IGNORECASE)
+        updated = re.sub(r"@(?=here\b)", "@\u200bhere", updated, flags=re.IGNORECASE)
+        return updated
+
+    @staticmethod
     async def _get_replied_message(message: discord.Message) -> discord.Message | None:
         ref = message.reference
         if ref is None or ref.message_id is None:
@@ -1493,6 +1832,21 @@ class AIChatCog(commands.Cog):
     @staticmethod
     def _is_empty_completion_error(error: Exception) -> bool:
         return "empty completion" in str(error).lower()
+
+    @staticmethod
+    def _is_ai_image_access_error(error: Exception) -> bool:
+        message = str(error).casefold()
+        markers = (
+            "image",
+            "vision",
+            "input_image",
+            "unsupported",
+            "model",
+            "permission",
+            "access",
+            "endpoint",
+        )
+        return any(marker in message for marker in markers)
 
     async def _normalize_discord_references(
         self, text: str, guild: discord.Guild | None

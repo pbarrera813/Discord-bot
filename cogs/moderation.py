@@ -20,6 +20,7 @@ from utils.discord_helpers import (
 )
 from utils.duration import DurationParseError, parse_duration
 from utils.i18n import tr
+from utils.permissions import owner_or_has_permissions
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -262,7 +263,11 @@ class ModerationCog(commands.Cog):
                 "You cannot moderate the server owner.",
                 "No puedes moderar al propietario del servidor.",
             )
-        if actor.id != guild.owner_id and actor.top_role <= target.top_role:
+        if (
+            actor.id != guild.owner_id
+            and not self.bot.is_owner_user(actor)
+            and actor.top_role <= target.top_role
+        ):
             return False, tr(
                 lang,
                 "Your highest role must be above the target's highest role.",
@@ -580,7 +585,11 @@ class ModerationCog(commands.Cog):
                 "I cannot manage that role due to role hierarchy.",
                 "No puedo gestionar ese rol por la jerarquía de roles.",
             )
-        if actor.id != guild.owner_id and role >= actor.top_role:
+        if (
+            actor.id != guild.owner_id
+            and not self.bot.is_owner_user(actor)
+            and role >= actor.top_role
+        ):
             return False, tr(
                 lang,
                 "You cannot manage a role equal to or higher than your top role.",
@@ -1501,7 +1510,7 @@ class ModerationCog(commands.Cog):
         )
 
     @message.command(name="delete", description="Delete the last N messages.")
-    @commands.has_permissions(manage_messages=True)
+    @owner_or_has_permissions(manage_messages=True)
     async def delete(self, ctx: commands.Context, amount: int) -> None:
         lang = await self._lang(ctx.guild)
         await self._maybe_defer(ctx)
@@ -1760,7 +1769,7 @@ class ModerationCog(commands.Cog):
         name="channel",
         description="Channel management commands.",
     )
-    @commands.has_permissions(manage_channels=True)
+    @owner_or_has_permissions(manage_channels=True)
     async def channel(self, ctx: commands.Context) -> None:
         if ctx.invoked_subcommand is not None:
             return
@@ -1778,7 +1787,7 @@ class ModerationCog(commands.Cog):
         name="clear",
         description="Clear all messages in a channel without recreating it.",
     )
-    @commands.has_permissions(manage_channels=True)
+    @owner_or_has_permissions(manage_channels=True)
     @discord.app_commands.describe(
         channel="Channel to clear. Leave empty to clear the current channel.",
     )
@@ -1883,7 +1892,7 @@ class ModerationCog(commands.Cog):
         name="clear",
         description="Clear all messages in a channel without recreating it.",
     )
-    @commands.has_permissions(manage_channels=True)
+    @owner_or_has_permissions(manage_channels=True)
     @discord.app_commands.describe(
         channel="Channel to clear. Leave empty to clear the current channel.",
     )
@@ -1898,7 +1907,7 @@ class ModerationCog(commands.Cog):
         name="clone",
         description="Clone a text channel.",
     )
-    @commands.has_permissions(manage_channels=True)
+    @owner_or_has_permissions(manage_channels=True)
     @discord.app_commands.describe(
         channel="Channel to clone. Leave empty to clone the current channel.",
     )
@@ -1984,14 +1993,14 @@ class ModerationCog(commands.Cog):
         )
 
     @channel.command(name="add", description="Create a new text channel.")
-    @commands.has_permissions(manage_channels=True)
+    @owner_or_has_permissions(manage_channels=True)
     @discord.app_commands.rename(channel_name="name")
     async def channel_add(self, ctx: commands.Context, *, channel_name: str) -> None:
         await self._maybe_defer(ctx)
         await self._channel_add_impl(ctx, channel_name)
 
     @channel.command(name="delete", description="Delete a text channel.")
-    @commands.has_permissions(manage_channels=True)
+    @owner_or_has_permissions(manage_channels=True)
     async def channel_delete(self, ctx: commands.Context, channel: discord.TextChannel) -> None:
         await self._maybe_defer(ctx)
         await self._channel_delete_impl(ctx, channel)
@@ -2000,7 +2009,7 @@ class ModerationCog(commands.Cog):
         name="setnick",
         description="Set a user's server nickname.",
     )
-    @commands.has_permissions(manage_nicknames=True)
+    @owner_or_has_permissions(manage_nicknames=True)
     @discord.app_commands.describe(
         user="User whose nickname you want to change.",
         nickname="New nickname (1 to 32 characters).",
@@ -2096,7 +2105,7 @@ class ModerationCog(commands.Cog):
         )
 
     @channel.command(name="lock", description="Lock a text channel.")
-    @commands.has_permissions(manage_channels=True)
+    @owner_or_has_permissions(manage_channels=True)
     async def lock(
         self,
         ctx: commands.Context,
@@ -2184,7 +2193,7 @@ class ModerationCog(commands.Cog):
         )
 
     @channel.command(name="unlock", description="Unlock a text channel.")
-    @commands.has_permissions(manage_channels=True)
+    @owner_or_has_permissions(manage_channels=True)
     async def unlock(
         self,
         ctx: commands.Context,
@@ -2272,7 +2281,7 @@ class ModerationCog(commands.Cog):
         )
 
     @channel.command(name="slowmode", description="Set/disable slowmode on a channel.")
-    @commands.has_permissions(manage_channels=True)
+    @owner_or_has_permissions(manage_channels=True)
     @discord.app_commands.describe(
         channel="Target text channel.",
         limit="Slowmode limit in seconds, or 'disable'.",
@@ -2372,7 +2381,7 @@ class ModerationCog(commands.Cog):
         )
 
     @message.command(name="purgeuser", description="Delete messages from one user in this channel.")
-    @commands.has_permissions(manage_messages=True)
+    @owner_or_has_permissions(manage_messages=True)
     async def purgeuser(
         self,
         ctx: commands.Context,
@@ -2487,7 +2496,7 @@ class ModerationCog(commands.Cog):
         )
 
     @role.command(name="add", description="Add a role to a user.")
-    @commands.has_permissions(manage_roles=True)
+    @owner_or_has_permissions(manage_roles=True)
     async def roleadd(
         self,
         ctx: commands.Context,
@@ -2571,7 +2580,7 @@ class ModerationCog(commands.Cog):
         )
 
     @role.command(name="remove", description="Remove a role from a user.")
-    @commands.has_permissions(manage_roles=True)
+    @owner_or_has_permissions(manage_roles=True)
     async def roleremove(
         self,
         ctx: commands.Context,
@@ -2655,7 +2664,7 @@ class ModerationCog(commands.Cog):
         )
 
     @role.command(name="create", description="Create a role (optional hex color).")
-    @commands.has_permissions(manage_roles=True)
+    @owner_or_has_permissions(manage_roles=True)
     @discord.app_commands.rename(role_name="name", color_hex="color")
     async def createrole(
         self,
@@ -2780,7 +2789,7 @@ class ModerationCog(commands.Cog):
         name="setup",
         description="Create the default server color roles list.",
     )
-    @commands.has_permissions(administrator=True)
+    @owner_or_has_permissions(administrator=True)
     async def colorsetup(self, ctx: commands.Context) -> None:
         lang = await self._lang(ctx.guild)
         await self._maybe_defer(ctx)
@@ -2901,7 +2910,7 @@ class ModerationCog(commands.Cog):
         name="list",
         description="Show the configured color roles list.",
     )
-    @commands.has_permissions(administrator=True)
+    @owner_or_has_permissions(administrator=True)
     async def colors(self, ctx: commands.Context) -> None:
         lang = await self._lang(ctx.guild)
         await self._maybe_defer(ctx)
@@ -2938,7 +2947,7 @@ class ModerationCog(commands.Cog):
         name="channel",
         description="Set channel and publish the numbered color selector panel.",
     )
-    @commands.has_permissions(administrator=True)
+    @owner_or_has_permissions(administrator=True)
     async def colorchannel(self, ctx: commands.Context, channel: discord.TextChannel) -> None:
         lang = await self._lang(ctx.guild)
         await self._maybe_defer(ctx)
@@ -2997,7 +3006,7 @@ class ModerationCog(commands.Cog):
         name="reload",
         description="Reload and republish the color selector panel in the configured channel.",
     )
-    @commands.has_permissions(administrator=True)
+    @owner_or_has_permissions(administrator=True)
     async def colorreload(self, ctx: commands.Context) -> None:
         lang = await self._lang(ctx.guild)
         await self._maybe_defer(ctx)
@@ -3070,7 +3079,7 @@ class ModerationCog(commands.Cog):
         name="add",
         description="Add a new selectable color role.",
     )
-    @commands.has_permissions(administrator=True)
+    @owner_or_has_permissions(administrator=True)
     @discord.app_commands.rename(hex_code="color")
     async def coloradd(
         self,
@@ -3194,7 +3203,7 @@ class ModerationCog(commands.Cog):
         name="remove",
         description="Remove a selectable color role by configured color name.",
     )
-    @commands.has_permissions(administrator=True)
+    @owner_or_has_permissions(administrator=True)
     @discord.app_commands.rename(color_name="name")
     async def colorremove(self, ctx: commands.Context, *, color_name: str) -> None:
         lang = await self._lang(ctx.guild)
@@ -3267,7 +3276,7 @@ class ModerationCog(commands.Cog):
         )
 
     @user.command(name="info", description="Show user info in this server.")
-    @commands.has_permissions(moderate_members=True)
+    @owner_or_has_permissions(moderate_members=True)
     async def userinfo(self, ctx: commands.Context, user: discord.Member) -> None:
         lang = await self._lang(ctx.guild)
         await self._maybe_defer(ctx)
@@ -3335,7 +3344,7 @@ class ModerationCog(commands.Cog):
         )
 
     @user.command(name="mute", description="Mute a user by assigning the Muted role.")
-    @commands.has_permissions(moderate_members=True)
+    @owner_or_has_permissions(moderate_members=True)
     async def mute(
         self,
         ctx: commands.Context,
@@ -3408,7 +3417,7 @@ class ModerationCog(commands.Cog):
         )
 
     @user.command(name="unmute", description="Remove Muted role from a user.")
-    @commands.has_permissions(moderate_members=True)
+    @owner_or_has_permissions(moderate_members=True)
     async def unmute(
         self,
         ctx: commands.Context,
@@ -3476,7 +3485,7 @@ class ModerationCog(commands.Cog):
         )
 
     @user.command(name="kick", description="Kick a member from the server.")
-    @commands.has_permissions(kick_members=True)
+    @owner_or_has_permissions(kick_members=True)
     async def kick(
         self,
         ctx: commands.Context,
@@ -3524,7 +3533,7 @@ class ModerationCog(commands.Cog):
         )
 
     @user.command(name="ban", description="Ban a member from the server.")
-    @commands.has_permissions(ban_members=True)
+    @owner_or_has_permissions(ban_members=True)
     async def ban(
         self,
         ctx: commands.Context,
@@ -3574,7 +3583,7 @@ class ModerationCog(commands.Cog):
     @user.command(
         name="unban", description="Unban a user by ID or mention format."
     )
-    @commands.has_permissions(ban_members=True)
+    @owner_or_has_permissions(ban_members=True)
     async def unban(
         self,
         ctx: commands.Context,
@@ -3638,7 +3647,7 @@ class ModerationCog(commands.Cog):
         )
 
     @user.command(name="tempmute", description="Temporarily mute a user.")
-    @commands.has_permissions(moderate_members=True)
+    @owner_or_has_permissions(moderate_members=True)
     async def tempmute(
         self,
         ctx: commands.Context,
@@ -3727,7 +3736,7 @@ class ModerationCog(commands.Cog):
         )
 
     @user.command(name="tempban", description="Temporarily ban a user.")
-    @commands.has_permissions(ban_members=True)
+    @owner_or_has_permissions(ban_members=True)
     async def tempban(
         self,
         ctx: commands.Context,
@@ -3803,7 +3812,7 @@ class ModerationCog(commands.Cog):
         )
 
     @user.command(name="warn", description="Warn a user.")
-    @commands.has_permissions(moderate_members=True)
+    @owner_or_has_permissions(moderate_members=True)
     async def warn(
         self,
         ctx: commands.Context,
@@ -3872,7 +3881,7 @@ class ModerationCog(commands.Cog):
         name="unwarn",
         description="Remove the 1st, 2nd, or 3rd warning from a user.",
     )
-    @commands.has_permissions(moderate_members=True)
+    @owner_or_has_permissions(moderate_members=True)
     @discord.app_commands.rename(warning_number="number")
     async def unwarn(
         self,
@@ -3969,7 +3978,7 @@ class ModerationCog(commands.Cog):
         )
 
     @user.command(name="warnings", description="List warnings for a user.")
-    @commands.has_permissions(moderate_members=True)
+    @owner_or_has_permissions(moderate_members=True)
     async def warnings(self, ctx: commands.Context, user: discord.Member) -> None:
         lang = await self._lang(ctx.guild)
         await self._maybe_defer(ctx)
@@ -4016,7 +4025,7 @@ class ModerationCog(commands.Cog):
         )
 
     @user.command(name="clearwarnings", description="Clear all warnings for a user.")
-    @commands.has_permissions(moderate_members=True)
+    @owner_or_has_permissions(moderate_members=True)
     async def clearwarnings(
         self,
         ctx: commands.Context,
@@ -4168,12 +4177,11 @@ class ModerationCog(commands.Cog):
             ctx,
             tr(
                 lang,
-                f"Command failed: {error}",
-                f"El comando falló: {error}",
+                "Command failed due to an internal error. Please try again.",
+                "El comando fallo por un error interno. Intenta de nuevo.",
             )
         )
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(ModerationCog(bot))
-
 

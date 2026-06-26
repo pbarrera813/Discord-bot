@@ -10,6 +10,7 @@ import aiosqlite
 
 AI_CHANNEL_ALL_MARKER = 0
 AI_CHANNEL_NONE_MARKER = -1
+AI_INTERACTIONS_CONTEXT_CHANNEL_ID = -2
 BIRTHDAY_EVENT_TYPES = {"birthday", "member_anniversary", "server_anniversary"}
 
 
@@ -978,6 +979,23 @@ class Database:
             )
             await conn.commit()
 
+    async def reset_ai_server_context(self, guild_id: int) -> None:
+        await self.get_or_create_guild_settings(guild_id)
+        async with self._connect() as conn:
+            await conn.execute(
+                "UPDATE guild_settings SET server_context = '' WHERE guild_id = ?",
+                (guild_id,),
+            )
+            await conn.execute(
+                "DELETE FROM server_context_entries WHERE guild_id = ?",
+                (guild_id,),
+            )
+            await conn.execute(
+                "DELETE FROM ai_conversation_turns WHERE guild_id = ?",
+                (guild_id,),
+            )
+            await conn.commit()
+
     async def get_server_context_entries(self, guild_id: int) -> list[dict[str, Any]]:
         async with self._connect() as conn:
             cursor = await conn.execute(
@@ -1038,6 +1056,15 @@ class Database:
                 ),
             )
 
+            if channel_id > 0:
+                await conn.execute(
+                    """
+                    DELETE FROM server_context_entries
+                    WHERE guild_id = ? AND channel_id = ?
+                    """,
+                    (guild_id, AI_INTERACTIONS_CONTEXT_CHANNEL_ID),
+                )
+
             cursor = await conn.execute(
                 """
                 SELECT guild_id, channel_id, channel_name, summary, created_at, updated_at
@@ -1049,8 +1076,32 @@ class Database:
             )
             rows = await cursor.fetchall()
             all_entries = [dict(row) for row in rows]
+            positive_entries = [
+                entry for entry in all_entries if int(entry["channel_id"]) > 0
+            ]
+            has_real_context = bool(positive_entries)
 
-            removed = all_entries[max_entries:] if len(all_entries) > max_entries else []
+            if channel_id == AI_INTERACTIONS_CONTEXT_CHANNEL_ID and has_real_context:
+                await conn.execute(
+                    """
+                    DELETE FROM server_context_entries
+                    WHERE guild_id = ? AND channel_id = ?
+                    """,
+                    (guild_id, AI_INTERACTIONS_CONTEXT_CHANNEL_ID),
+                )
+                all_entries = positive_entries
+
+            if has_real_context:
+                removed = (
+                    positive_entries[max_entries:]
+                    if len(positive_entries) > max_entries
+                    else []
+                )
+                final_entries = positive_entries[:max_entries]
+            else:
+                removed = []
+                final_entries = all_entries[:1]
+
             if removed:
                 placeholders = ",".join("?" for _ in removed)
                 values: list[Any] = [guild_id]
@@ -1064,7 +1115,6 @@ class Database:
                     tuple(values),
                 )
 
-            final_entries = all_entries[:max_entries]
             combined_context = self._compose_server_context(final_entries)
             await conn.execute(
                 "UPDATE guild_settings SET server_context = ? WHERE guild_id = ?",
@@ -1834,6 +1884,38 @@ class Database:
                     "role": str(row["role"]),
                     "speaker": str(row["speaker"]),
                     "content": str(row["content"]),
+                }
+                for row in rows
+            ]
+
+    async def get_recent_ai_conversation_turns(
+        self,
+        guild_id: int,
+        since_iso: str,
+        *,
+        limit: int = 400,
+    ) -> list[dict[str, str]]:
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT guild_id, channel_id, role, speaker, content, created_at
+                FROM ai_conversation_turns
+                WHERE guild_id = ? AND created_at >= ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (guild_id, since_iso, limit),
+            )
+            rows = await cursor.fetchall()
+            rows = list(reversed(rows))
+            return [
+                {
+                    "guild_id": str(row["guild_id"]),
+                    "channel_id": str(row["channel_id"]),
+                    "role": str(row["role"]),
+                    "speaker": str(row["speaker"]),
+                    "content": str(row["content"]),
+                    "created_at": str(row["created_at"]),
                 }
                 for row in rows
             ]

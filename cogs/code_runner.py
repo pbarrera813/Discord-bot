@@ -566,8 +566,8 @@ class CodeRunnerCog(commands.Cog):
         await ctx.send(
             tr(
                 lang,
-                f"Command failed: {error}",
-                f"El comando fallo: {error}",
+                "Command failed due to an internal error. Please try again.",
+                "El comando fallo por un error interno. Intenta de nuevo.",
             )
         )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -48,7 +49,11 @@ class DiscordModBot(commands.Bot):
         )
         self.settings = settings
         self.db = Database(db_path=settings.db_path, default_prefix=settings.default_prefix)
-        self.llm_client = XAIClient(settings.xai_api_key, settings.xai_model)
+        self.llm_client = XAIClient(
+            settings.xai_api_key,
+            settings.xai_model,
+            vision_model=settings.xai_vision_model,
+        )
         self.mc_client = McSrvStatClient()
         self.ninjas_client = (
             ApiNinjasClient(settings.api_ninjas_key)
@@ -73,6 +78,34 @@ class DiscordModBot(commands.Bot):
             else None
         )
         self.memegen_client = MemeGenClient()
+
+    def _owner_user_ids(self) -> set[int]:
+        configured = getattr(self.settings, "bot_owner_ids", None)
+        if isinstance(configured, (tuple, list, set)):
+            parsed: set[int] = set()
+            for value in configured:
+                try:
+                    parsed.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+            if parsed:
+                return parsed
+        env_value = os.getenv("BOT_OWNER_IDS", "").strip()
+        fallback: set[int] = set()
+        if env_value:
+            for token in env_value.split(","):
+                item = token.strip()
+                if item.isdigit():
+                    fallback.add(int(item))
+        return fallback
+
+    def is_owner_user_id(self, user_id: int) -> bool:
+        return user_id in self._owner_user_ids()
+
+    def is_owner_user(self, user: discord.abc.User | discord.Member | None) -> bool:
+        if user is None:
+            return False
+        return self.is_owner_user_id(int(user.id))
 
     @staticmethod
     def _is_in_global_command_audit_scope(
@@ -330,7 +363,8 @@ class DiscordModBot(commands.Bot):
         if isinstance(error, commands.BadArgument):
             await safe_send("Invalid argument provided.")
             return
-        await safe_send(f"Command error: {error}")
+        logging.exception("Unhandled command error", exc_info=error)
+        await safe_send("Command failed due to an internal error. Please try again.")
 
 
 def main() -> None:

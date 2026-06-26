@@ -557,8 +557,8 @@ class FunCog(commands.Cog):
         else:
             msg = tr(
                 lang,
-                f"Command failed: {error}",
-                f"El comando fallo: {error}",
+                "Command failed due to an internal error. Please try again.",
+                "El comando fallo por un error interno. Intenta de nuevo.",
             )
 
         interaction = getattr(ctx, "interaction", None)

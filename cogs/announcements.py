@@ -6,6 +6,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from utils.i18n import tr
+from utils.permissions import owner_or_has_permissions
 
 
 ANNOUNCEMENT_MODES = {"text", "embed", "both"}
@@ -435,7 +436,7 @@ class AnnouncementCog(commands.Cog):
         fallback="show",
     )
     @commands.check(_slash_only_invocation)
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     async def welcome_group(self, ctx: commands.Context) -> None:
         await self._show_config(ctx, "welcome")
 
@@ -446,12 +447,12 @@ class AnnouncementCog(commands.Cog):
         fallback="show",
     )
     @commands.check(_slash_only_invocation)
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     async def goodbye_group(self, ctx: commands.Context) -> None:
         await self._show_config(ctx, "goodbye")
 
     @welcome_group.command(name="set", description="Set welcome settings in one command.")
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     @app_commands.describe(
         channel="Announcement channel",
         mode="text, embed, or both",
@@ -487,7 +488,7 @@ class AnnouncementCog(commands.Cog):
         )
 
     @goodbye_group.command(name="set", description="Set goodbye settings in one command.")
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     @app_commands.describe(
         channel="Announcement channel",
         mode="text, embed, or both",
@@ -526,7 +527,7 @@ class AnnouncementCog(commands.Cog):
         name="edit",
         description="Edit one welcome option directly (message, color, mode, image, channel).",
     )
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     @app_commands.describe(
         message="New welcome message template",
         color="Hex color (e.g. #00FFAA)",
@@ -564,7 +565,7 @@ class AnnouncementCog(commands.Cog):
         name="edit",
         description="Edit one goodbye option directly (message, color, mode, image, channel).",
     )
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     @app_commands.describe(
         message="New goodbye message template",
         color="Hex color (e.g. #00FFAA)",
@@ -599,7 +600,7 @@ class AnnouncementCog(commands.Cog):
         )
 
     @welcome_group.command(name="test", description="Preview the current welcome output.")
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     async def welcome_test(self, ctx: commands.Context) -> None:
         if ctx.guild is None:
             await ctx.send("This command can only be used in a server.")
@@ -616,7 +617,7 @@ class AnnouncementCog(commands.Cog):
         await ctx.send(f"Preview failed: {status}")
 
     @goodbye_group.command(name="test", description="Preview the current goodbye output.")
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     async def goodbye_test(self, ctx: commands.Context) -> None:
         if ctx.guild is None:
             await ctx.send("This command can only be used in a server.")
@@ -633,12 +634,12 @@ class AnnouncementCog(commands.Cog):
         await ctx.send(f"Preview failed: {status}")
 
     @welcome_group.command(name="preview", description="Alias for /welcome test.")
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     async def welcome_preview(self, ctx: commands.Context) -> None:
         await self.welcome_test(ctx)
 
     @goodbye_group.command(name="preview", description="Alias for /goodbye test.")
-    @commands.has_permissions(manage_guild=True)
+    @owner_or_has_permissions(manage_guild=True)
     async def goodbye_preview(self, ctx: commands.Context) -> None:
         await self.goodbye_test(ctx)
 
@@ -675,7 +676,7 @@ class AnnouncementCog(commands.Cog):
         if isinstance(error, commands.CheckFailure):
             await ctx.send("This module is slash-only now. Use `/welcome ...` or `/goodbye ...`.")
             return
-        await ctx.send(f"Command failed: {error}")
+        await ctx.send("Command failed due to an internal error. Please try again.")
 
 
 async def setup(bot: commands.Bot) -> None:
