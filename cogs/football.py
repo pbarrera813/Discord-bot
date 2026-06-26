@@ -16,6 +16,7 @@ LEAGUE_CHOICES: Final[list[app_commands.Choice[str]]] = [
     app_commands.Choice(name="premier", value="premier"),
     app_commands.Choice(name="laliga", value="laliga"),
     app_commands.Choice(name="concacaf", value="concacaf"),
+    app_commands.Choice(name="worldcup", value="worldcup"),
 ]
 LEAGUE_CODES: Final[tuple[str, ...]] = tuple(choice.value for choice in LEAGUE_CHOICES)
 LEAGUE_HELP_TEXT: Final[str] = f"League: {', '.join(LEAGUE_CODES)}"
@@ -36,6 +37,8 @@ class FootballCog(commands.Cog):
         "concacafchampions": "concacaf",
         "concacafchampionscup": "concacaf",
         "concacafchampionsleague": "concacaf",
+        "worldcup": "worldcup",
+        "fifaworldcup": "worldcup",
     }
 
     _LEAGUE_LABELS: Final[dict[str, tuple[str, str]]] = {
@@ -43,6 +46,7 @@ class FootballCog(commands.Cog):
         "premier": ("Premier League", "Premier League"),
         "laliga": ("LaLiga", "LaLiga"),
         "concacaf": ("CONCACAF Champions Cup", "Copa de Campeones CONCACAF"),
+        "worldcup": ("FIFA World Cup", "Copa Mundial FIFA"),
     }
 
     def __init__(self, bot: commands.Bot) -> None:
@@ -1024,7 +1028,11 @@ class FootballCog(commands.Cog):
             return []
 
         if isinstance(standings[0], list):
-            return [row for row in standings[0] if isinstance(row, dict)]
+            rows: list[dict[str, Any]] = []
+            for group in standings:
+                if isinstance(group, list):
+                    rows.extend(row for row in group if isinstance(row, dict))
+            return rows
         return [row for row in standings if isinstance(row, dict)]
 
     @staticmethod

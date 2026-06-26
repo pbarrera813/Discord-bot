@@ -996,7 +996,7 @@ Archivos: `.c`, `.cpp`, `.cs`, `.java`, `.js`, `.py`, `.rs`"""
 `/football table <league>` - Current league standings table.
 `/football team <league> <team>` - Team details and recent form.
 `/football scorers <league>` - Top scorers leaderboard.
-Leagues: `ligamx`, `premier`, `laliga`, `concacaf`."""
+Leagues: `ligamx`, `premier`, `laliga`, `concacaf`, `worldcup`."""
         sports_es = """`/football live <liga>` - Partidos en vivo ahora mismo.
 `/football today <liga>` - Partidos programados para hoy.
 `/football next <liga> [cantidad|equipo]` - Próximos partidos (global o por equipo).
@@ -1004,7 +1004,7 @@ Leagues: `ligamx`, `premier`, `laliga`, `concacaf`."""
 `/football table <liga>` - Tabla de posiciones actual.
 `/football team <liga> <equipo>` - Datos del equipo y forma reciente.
 `/football scorers <liga>` - Tabla de goleadores.
-Ligas: `ligamx`, `premier`, `laliga`, `concacaf`."""
+Ligas: `ligamx`, `premier`, `laliga`, `concacaf`, `worldcup`."""
 
         fun_en = """`/joke` - Random joke.
 `/dadjoke` - Random dad joke.

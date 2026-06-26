@@ -12,6 +12,7 @@ class ApiFootballClient:
         "ligamx": 262,
         "premier": 39,
         "laliga": 140,
+        "worldcup": 1,
     }
     _LEAGUE_SEARCH_PROFILES: dict[str, list[dict[str, Any]]] = {
         "ligamx": [
@@ -33,12 +34,17 @@ class ApiFootballClient:
             {"search": "CONCACAF Champions"},
             {"search": "Champions Cup"},
         ],
+        "worldcup": [
+            {"country": "World", "name": "World Cup"},
+            {"search": "World Cup"},
+        ],
     }
     _LEAGUE_NAME_HINTS: dict[str, tuple[str, ...]] = {
         "ligamx": ("liga", "mx"),
         "premier": ("premier",),
         "laliga": ("liga",),
         "concacaf": ("concacaf", "champions"),
+        "worldcup": ("world", "cup"),
     }
 
     def __init__(self, *, api_key: str, base_url: str) -> None:
@@ -166,6 +172,10 @@ class ApiFootballClient:
             if isinstance(league_id, int):
                 return league_id
         return None
+
+    @classmethod
+    def _pick_ligamx_league_id(cls, leagues: list[dict[str, Any]]) -> int | None:
+        return cls._pick_league_id(leagues, "ligamx")
 
     async def get_current_season(self, league_id: int) -> int:
         now = time.monotonic()

@@ -43,6 +43,18 @@ class ApiFootballClientTests(unittest.TestCase):
         picked = ApiFootballClient._pick_league_id(leagues, "concacaf")
         self.assertEqual(picked, 16)
 
+    def test_pick_league_id_worldcup(self) -> None:
+        leagues = [
+            {
+                "league": {"id": 1, "name": "World Cup", "type": "Cup"},
+            }
+        ]
+        picked = ApiFootballClient._pick_league_id(leagues, "worldcup")
+        self.assertEqual(picked, 1)
+
+    def test_worldcup_default_id(self) -> None:
+        self.assertEqual(ApiFootballClient._LEAGUE_DEFAULT_IDS["worldcup"], 1)
+
     def test_extract_current_season(self) -> None:
         rows = [
             {
