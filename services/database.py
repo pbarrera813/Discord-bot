@@ -128,10 +128,12 @@ class Database:
                     role TEXT NOT NULL,
                     speaker TEXT NOT NULL,
                     content TEXT NOT NULL,
+                    message_id INTEGER,
                     created_at TEXT NOT NULL
                 )
                 """
             )
+            await self._ensure_ai_conversation_columns(conn)
 
             await conn.execute(
                 """
@@ -1833,15 +1835,16 @@ class Database:
         role: str,
         speaker: str,
         content: str,
+        message_id: int | None = None,
     ) -> None:
         async with self._connect() as conn:
             await conn.execute(
                 """
                 INSERT INTO ai_conversation_turns
-                (guild_id, channel_id, role, speaker, content, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (guild_id, channel_id, role, speaker, content, message_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (guild_id, channel_id, role, speaker, content, self._now_iso()),
+                (guild_id, channel_id, role, speaker, content, message_id, self._now_iso()),
             )
             # Keep a rolling window per channel to avoid unbounded growth.
             await conn.execute(
@@ -1858,6 +1861,27 @@ class Database:
                 (guild_id, channel_id, guild_id, channel_id),
             )
             await conn.commit()
+
+    async def is_ai_assistant_message(
+        self,
+        guild_id: int,
+        channel_id: int,
+        message_id: int,
+    ) -> bool:
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT 1
+                FROM ai_conversation_turns
+                WHERE guild_id = ?
+                  AND channel_id = ?
+                  AND message_id = ?
+                  AND role = 'assistant'
+                LIMIT 1
+                """,
+                (guild_id, channel_id, message_id),
+            )
+            return await cursor.fetchone() is not None
 
     async def get_ai_conversation_history(
         self,
@@ -1927,5 +1951,14 @@ class Database:
         if "language_code" not in column_names:
             await conn.execute(
                 "ALTER TABLE guild_settings ADD COLUMN language_code TEXT NOT NULL DEFAULT 'en'"
+            )
+
+    async def _ensure_ai_conversation_columns(self, conn: aiosqlite.Connection) -> None:
+        cursor = await conn.execute("PRAGMA table_info(ai_conversation_turns)")
+        rows = await cursor.fetchall()
+        column_names = {str(row[1]) for row in rows}
+        if "message_id" not in column_names:
+            await conn.execute(
+                "ALTER TABLE ai_conversation_turns ADD COLUMN message_id INTEGER"
             )
 

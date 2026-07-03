@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from io import BytesIO
 import difflib
 import logging
 import re
@@ -22,6 +23,12 @@ class ChatImageContext:
     from_replied_message: bool
     reaction_target: object
     prompt_note: str = ""
+
+
+@dataclass(frozen=True)
+class RepliedMessageContext:
+    note: str = ""
+    image_urls: tuple[str, ...] = ()
 
 
 SUPPORTED_TRANSLATE_LANGUAGES: Final[tuple[str, ...]] = (
@@ -198,7 +205,15 @@ class AIChatCog(commands.Cog):
 
         replied_message = await self._get_replied_message(message)
 
-        is_direct_trigger = await self._is_chat_trigger(message, replied_message)
+        is_slash_command_response = self._is_slash_command_response_message(replied_message)
+        is_reply_to_ai = False
+        if not is_slash_command_response:
+            is_reply_to_ai = await self._is_reply_to_ai_message(message, replied_message)
+        is_direct_trigger = await self._is_chat_trigger(
+            message,
+            replied_message,
+            is_reply_to_ai=is_reply_to_ai,
+        )
         is_active_followup = False
         if not is_direct_trigger:
             is_active_followup = await self._is_active_chat_followup(
@@ -226,6 +241,19 @@ class AIChatCog(commands.Cog):
                     mention_author=True,
                 )
                 return
+        image_generation_prompt = self._image_generation_prompt_for_message(
+            message,
+            user_prompt,
+            is_active_followup=is_active_followup,
+            replied_message=replied_message,
+        )
+        if image_generation_prompt:
+            await self._handle_image_generation_request(
+                message,
+                image_generation_prompt,
+                lang=lang,
+            )
+            return
         image_context = self._build_chat_image_context(message, replied_message)
         image_urls = image_context.urls
         if image_urls:
@@ -241,30 +269,69 @@ class AIChatCog(commands.Cog):
                 )
                 return
 
-        llm_prompt = self._apply_image_context_note(user_prompt, image_context)
+        replied_context = (
+            self._build_replied_message_context(replied_message)
+            if is_direct_trigger and replied_message is not None
+            else RepliedMessageContext()
+        )
+        llm_prompt = self._apply_replied_message_context(user_prompt, replied_context)
+        llm_prompt = self._apply_image_context_note(llm_prompt, image_context)
         available_emojis = self._serialize_custom_emojis(message.guild)
         convo_key = self._conversation_key(message.guild.id, message.channel.id)
         await self._ensure_history_loaded(convo_key, message.guild.id, message.channel.id)
+        if is_active_followup:
+            bot_name = (
+                getattr(self.bot.user, "display_name", None)
+                or getattr(self.bot.user, "name", None)
+                or "Nitori"
+            )
+            is_directed_at_bot = self._contains_obvious_bot_name(message.content, str(bot_name))
+            if not is_directed_at_bot:
+                recent_history = list(self._conversation_history.get(convo_key, ()))[-2:]
+                is_directed_at_bot = any(
+                    item.get("role") == "assistant" for item in recent_history
+                )
+            if not is_directed_at_bot:
+                is_directed_at_bot = await self.bot.llm_client.classify_message_intent(
+                    bot_name=str(bot_name),
+                    author_name=message.author.display_name,
+                    current_message=message.content,
+                    recent_context=self._recent_intent_context(convo_key),
+                )
+            if not is_directed_at_bot:
+                return
         if (
             replied_message is not None
             and self.bot.user is not None
             and replied_message.author.id == self.bot.user.id
+            and is_reply_to_ai
             and replied_message.content.strip()
         ):
-            prefixed = self._append_conversation_turn(
-                convo_key,
-                role="assistant",
-                speaker=self.bot.user.display_name,
-                content=replied_message.content.strip(),
+            cleaned_replied = " ".join(replied_message.content.strip().split())
+            if len(cleaned_replied) > self._history_entry_max_chars:
+                cleaned_replied = cleaned_replied[: self._history_entry_max_chars - 3].rstrip() + "..."
+            expected_prefixed = f"{self.bot.user.display_name}: {cleaned_replied}"
+            already_in_history = any(
+                item.get("role") == "assistant"
+                and item.get("content") == expected_prefixed
+                for item in self._conversation_history[convo_key]
             )
-            if prefixed is not None:
-                await self._persist_conversation_turn(
-                    guild_id=message.guild.id,
-                    channel_id=message.channel.id,
+            if not already_in_history:
+                prefixed = self._append_conversation_turn(
+                    convo_key,
                     role="assistant",
                     speaker=self.bot.user.display_name,
-                    content=prefixed,
+                    content=replied_message.content.strip(),
                 )
+                if prefixed is not None:
+                    await self._persist_conversation_turn(
+                        guild_id=message.guild.id,
+                        channel_id=message.channel.id,
+                        role="assistant",
+                        speaker=self.bot.user.display_name,
+                        content=prefixed,
+                        message_id=replied_message.id,
+                    )
 
         relay_context = await self._resolve_relay_target_from_prompt(
             guild=message.guild,
@@ -275,9 +342,11 @@ class AIChatCog(commands.Cog):
         conversation_mode = self._conversation_mode_for_trigger(
             replied_message,
             is_active_followup=is_active_followup,
+            is_reply_to_ai=is_reply_to_ai,
         )
 
         await message.channel.typing()
+        reply_to_trigger = not is_active_followup
         try:
             reply = await self.bot.llm_client.chat(
                 server_context=settings.server_context,
@@ -297,39 +366,47 @@ class AIChatCog(commands.Cog):
         except Exception as exc:
             logging.exception("AI chat failure in guild=%s channel=%s", message.guild.id, message.channel.id)
             if self._is_ai_limit_error(exc):
-                await message.reply(
+                await self._send_long_reply(
+                    message,
                     tr(
                         lang,
                         "Wow, I think that's a lot of talking from me right now, try later!",
                         "Wow, creo que he hablado demasiado por ahora, intenta más tarde!",
                     ),
+                    reply_to_trigger=reply_to_trigger,
                     mention_author=True,
                 )
             elif self._is_empty_completion_error(exc):
-                await message.reply(
+                await self._send_long_reply(
+                    message,
                     tr(
                         lang,
                         "Oops, my brain lagged for a second. Try again!",
                         "Ups, se me fue la onda por un segundo. Intenta otra vez!",
                     ),
+                    reply_to_trigger=reply_to_trigger,
                     mention_author=True,
                 )
             elif image_urls and self._is_ai_image_access_error(exc):
-                await message.reply(
+                await self._send_long_reply(
+                    message,
                     tr(
                         lang,
                         "I can see you attached an image, but this xAI model/API access is not enabled for image understanding. Ask an admin to set `XAI_VISION_MODEL` to a vision-capable model and confirm image input access.",
                         "Veo que adjuntaste una imagen, pero este modelo/acceso de xAI no esta habilitado para entender imagenes. Pide a un admin configurar `XAI_VISION_MODEL` con un modelo con vision y revisar el acceso a imagenes.",
                     ),
+                    reply_to_trigger=reply_to_trigger,
                     mention_author=True,
                 )
             else:
-                await message.reply(
+                await self._send_long_reply(
+                    message,
                     tr(
                         lang,
                         "I hit an internal AI error. Please try again in a bit.",
                         "Tuve un error interno de IA. Intenta de nuevo en un momento.",
                     ),
+                    reply_to_trigger=reply_to_trigger,
                     mention_author=True,
                 )
             return
@@ -359,6 +436,12 @@ class AIChatCog(commands.Cog):
             speaker=bot_speaker,
             content=reply,
         )
+        sent_message_id = await self._send_long_reply(
+            message,
+            reply,
+            reply_to_trigger=reply_to_trigger,
+            mention_author=True,
+        )
         if prefixed_bot is not None:
             await self._persist_conversation_turn(
                 guild_id=message.guild.id,
@@ -366,8 +449,8 @@ class AIChatCog(commands.Cog):
                 role="assistant",
                 speaker=bot_speaker,
                 content=prefixed_bot,
+                message_id=sent_message_id,
             )
-        await self._send_long_reply(message, reply, mention_author=not is_active_followup)
         self._activate_active_chat(message)
         await self._maybe_add_ai_reaction(
             target=image_context.reaction_target,
@@ -1258,6 +1341,8 @@ class AIChatCog(commands.Cog):
         self,
         message: discord.Message,
         replied_message: discord.Message | None = None,
+        *,
+        is_reply_to_ai: bool | None = None,
     ) -> bool:
         if self.bot.user is None:
             return False
@@ -1265,16 +1350,89 @@ class AIChatCog(commands.Cog):
         if self.bot.user in message.mentions:
             stripped = self._remove_bot_mentions(message.content, self.bot.user.id)
             return bool(stripped)
+        if self._is_addressed_to_bot_by_name(message.content):
+            return True
+        bot_name = (
+            getattr(self.bot.user, "display_name", None)
+            or getattr(self.bot.user, "name", None)
+            or ""
+        )
+        if self._contains_obvious_bot_name(message.content, str(bot_name)):
+            return True
 
         ref_msg = replied_message
         if ref_msg is None:
             ref_msg = await self._get_replied_message(message)
+        if is_reply_to_ai is None:
+            is_reply_to_ai = await self._is_reply_to_ai_message(message, ref_msg)
         return bool(
             ref_msg
             and self.bot.user
             and ref_msg.author.id == self.bot.user.id
-            and self._is_chat_response_message(ref_msg.id)
+            and is_reply_to_ai
         )
+
+    def _is_slash_command_response_message(self, message: discord.Message | None) -> bool:
+        if message is None:
+            return False
+        if getattr(message, "interaction", None) or getattr(message, "interaction_metadata", None):
+            return True
+        application_id = getattr(message, "application_id", None)
+        bot_application_id = getattr(self.bot, "application_id", None)
+        if application_id is None or bot_application_id is None:
+            return False
+        try:
+            return int(application_id) == int(bot_application_id)
+        except (TypeError, ValueError):
+            return application_id == bot_application_id
+
+    async def _is_reply_to_ai_message(
+        self,
+        message: discord.Message,
+        replied_message: discord.Message | None,
+    ) -> bool:
+        if self.bot.user is None or replied_message is None:
+            return False
+        if replied_message.author.id != self.bot.user.id:
+            return False
+        if self._is_chat_response_message(replied_message.id):
+            return True
+        guild = getattr(message, "guild", None)
+        channel = getattr(message, "channel", None)
+        db = getattr(self.bot, "db", None)
+        if guild is None or channel is None or db is None:
+            return False
+        try:
+            return await db.is_ai_assistant_message(guild.id, channel.id, replied_message.id)
+        except Exception:
+            logging.exception("Failed to check persisted AI reply message")
+            return False
+
+    def _is_addressed_to_bot_by_name(self, content: str) -> bool:
+        if self.bot.user is None:
+            return False
+        text = content.strip()
+        if not text:
+            return False
+
+        names = {
+            str(getattr(self.bot.user, "name", "") or "").strip(),
+            str(getattr(self.bot.user, "display_name", "") or "").strip(),
+            str(getattr(self.bot.user, "global_name", "") or "").strip(),
+        }
+        for name in names:
+            if not name:
+                continue
+            pattern = rf"^@?{re.escape(name)}(?:\b|[\s,:;!?-])"
+            if re.match(pattern, text, flags=re.IGNORECASE):
+                return True
+        return False
+
+    def _contains_obvious_bot_name(self, content: str, bot_name: str) -> bool:
+        safe_bot_name = str(bot_name or "").strip().casefold()
+        if safe_bot_name and safe_bot_name in content.casefold():
+            return True
+        return self._is_addressed_to_bot_by_name(content)
 
     def _activate_active_chat(self, message: discord.Message) -> None:
         self._active_chats[self._message_channel_key(message)] = (
@@ -1300,8 +1458,16 @@ class AIChatCog(commands.Cog):
             return False
         if getattr(message, "webhook_id", None) is not None:
             return False
+        reference = getattr(message, "reference", None)
+        if reference is not None and getattr(reference, "message_id", None) is not None:
+            return False
+        bot_user_id = getattr(getattr(self, "bot", None).user, "id", None)
+        for mentioned in getattr(message, "mentions", []) or []:
+            mentioned_id = getattr(mentioned, "id", None)
+            if mentioned_id != bot_user_id and not getattr(mentioned, "bot", False):
+                return False
         content = message.content.strip()
-        if not content or content.startswith(prefix):
+        if not content or self._looks_like_command_message(content, configured_prefix=prefix):
             return False
         if self._is_noise_only_followup(content):
             return False
@@ -1364,28 +1530,55 @@ class AIChatCog(commands.Cog):
             "lmao",
             "xd",
             "haha",
+            "hahaha",
+            "hehe",
             "jaja",
+            "jajaja",
+            "jajajaja",
+            "jajajajaja",
             "jeje",
+            "jejeje",
+            "jejejeje",
             "hmm",
             "mmm",
+            "ayyy",
+            "ayy",
+            "nope",
+            "nop",
+            "wtf",
+            "omg",
+            "gg",
+            "wp",
         }:
             return True
         return len(normalized) <= 2
+
+    @staticmethod
+    def _looks_like_command_message(content: str, *, configured_prefix: str) -> bool:
+        stripped = content.strip()
+        if not stripped:
+            return False
+
+        prefix = (configured_prefix or "").strip()
+        if prefix and stripped.startswith(prefix):
+            return True
+
+        if len(stripped) < 2 or stripped[0] not in "/!?.$-+":
+            return False
+        if stripped[1].isspace():
+            return False
+        return bool(re.match(r"^[/!?.$+_-][A-Za-z0-9_][\w-]*\b", stripped))
 
     def _conversation_mode_for_trigger(
         self,
         replied_message: discord.Message | None,
         *,
         is_active_followup: bool,
+        is_reply_to_ai: bool = False,
     ) -> str:
         if is_active_followup:
             return "active"
-        if (
-            replied_message is not None
-            and self.bot.user is not None
-            and replied_message.author.id == self.bot.user.id
-            and self._is_chat_response_message(replied_message.id)
-        ):
+        if replied_message is not None and is_reply_to_ai:
             return "reply"
         return "mention"
 
@@ -1411,6 +1604,22 @@ class AIChatCog(commands.Cog):
                 break
         return urls
 
+    @staticmethod
+    def _extract_supported_embed_image_urls(embeds: list[discord.Embed]) -> list[str]:
+        urls: list[str] = []
+        for embed in embeds or []:
+            for attr in ("image", "thumbnail"):
+                asset = getattr(embed, attr, None)
+                url = str(getattr(asset, "url", "") or "").strip()
+                if not url:
+                    continue
+                lowered = url.casefold().split("?", 1)[0]
+                if lowered.endswith((".jpg", ".jpeg", ".png")):
+                    urls.append(url)
+                if len(urls) >= 4:
+                    return urls
+        return urls
+
     @classmethod
     def _build_chat_image_context(
         cls,
@@ -1418,11 +1627,16 @@ class AIChatCog(commands.Cog):
         replied_message: discord.Message | None,
     ) -> ChatImageContext:
         current_urls = cls._extract_supported_image_urls(message.attachments)
+        current_urls.extend(cls._extract_supported_embed_image_urls(getattr(message, "embeds", [])))
         replied_urls = (
             cls._extract_supported_image_urls(replied_message.attachments)
             if replied_message is not None
             else []
         )
+        if replied_message is not None:
+            replied_urls.extend(
+                cls._extract_supported_embed_image_urls(getattr(replied_message, "embeds", []))
+            )
 
         urls: list[str] = []
         seen: set[str] = set()
@@ -1455,6 +1669,228 @@ class AIChatCog(commands.Cog):
         if not image_context.prompt_note:
             return prompt
         return f"{prompt}\n\n[{image_context.prompt_note}]"
+
+    @classmethod
+    def _build_replied_message_context(
+        cls,
+        replied_message: discord.Message,
+    ) -> RepliedMessageContext:
+        lines: list[str] = []
+        author = getattr(getattr(replied_message, "author", None), "display_name", "unknown")
+        lines.append(f"Author: {author}")
+
+        content = " ".join(str(getattr(replied_message, "content", "") or "").split())
+        if content:
+            lines.append(f"Text: {content[:900]}")
+
+        for index, embed in enumerate(getattr(replied_message, "embeds", [])[:2], start=1):
+            title = " ".join(str(getattr(embed, "title", "") or "").split())
+            description = " ".join(str(getattr(embed, "description", "") or "").split())
+            if title:
+                lines.append(f"Embed {index} title: {title[:220]}")
+            if description:
+                lines.append(f"Embed {index} description: {description[:500]}")
+            for field in list(getattr(embed, "fields", []) or [])[:4]:
+                name = " ".join(str(getattr(field, "name", "") or "").split())
+                value = " ".join(str(getattr(field, "value", "") or "").split())
+                if name or value:
+                    lines.append(f"Embed {index} field: {name[:120]} = {value[:260]}")
+            footer = getattr(embed, "footer", None)
+            footer_text = " ".join(str(getattr(footer, "text", "") or "").split())
+            if footer_text:
+                lines.append(f"Embed {index} footer: {footer_text[:220]}")
+
+        image_urls = tuple(
+            dict.fromkeys(
+                cls._extract_supported_image_urls(getattr(replied_message, "attachments", []))
+                + cls._extract_supported_embed_image_urls(getattr(replied_message, "embeds", []))
+            )
+        )
+        if image_urls:
+            lines.append(f"Image URLs: {', '.join(image_urls[:4])}")
+        if not lines:
+            return RepliedMessageContext()
+        note = "[UNTRUSTED_REPLIED_MESSAGE_CONTEXT]\n" + "\n".join(lines[:14])
+        return RepliedMessageContext(note=note, image_urls=image_urls[:4])
+
+    @staticmethod
+    def _apply_replied_message_context(prompt: str, context: RepliedMessageContext) -> str:
+        if not context.note:
+            return prompt
+        return f"{prompt}\n\n{context.note}"
+
+    async def _handle_image_generation_request(
+        self,
+        message: discord.Message,
+        prompt: str,
+        *,
+        lang: str,
+    ) -> None:
+        await message.channel.typing()
+        try:
+            image_bytes = await self.bot.llm_client.generate_image(prompt)
+        except Exception:
+            logging.exception("AI image generation failure in guild=%s channel=%s", message.guild.id, message.channel.id)
+            await message.reply(
+                tr(
+                    lang,
+                    "I could not generate that image right now. Ask an admin to check `XAI_IMAGE_MODEL` and xAI image generation access.",
+                    "No pude generar esa imagen ahora. Pide a un admin revisar `XAI_IMAGE_MODEL` y el acceso a generacion de imagenes de xAI.",
+                ),
+                mention_author=True,
+            )
+            return
+
+        file = discord.File(BytesIO(image_bytes), filename="nitori_generated.png")
+        caption = tr(lang, "Here, I made this.", "Va, hice esto.")
+        sent = await message.reply(
+            caption,
+            file=file,
+            mention_author=True,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
+        )
+        self._remember_chat_response_message(sent.id)
+
+        convo_key = self._conversation_key(message.guild.id, message.channel.id)
+        user_turn = self._append_conversation_turn(
+            convo_key,
+            role="user",
+            speaker=message.author.display_name,
+            content=f"Generate image: {prompt}",
+        )
+        if user_turn is not None:
+            await self._persist_conversation_turn(
+                guild_id=message.guild.id,
+                channel_id=message.channel.id,
+                role="user",
+                speaker=message.author.display_name,
+                content=user_turn,
+            )
+        bot_speaker = self.bot.user.display_name if self.bot.user else "Nitori"
+        bot_turn = self._append_conversation_turn(
+            convo_key,
+            role="assistant",
+            speaker=bot_speaker,
+            content=f"Generated image: {prompt}",
+        )
+        if bot_turn is not None:
+            await self._persist_conversation_turn(
+                guild_id=message.guild.id,
+                channel_id=message.channel.id,
+                role="assistant",
+                speaker=bot_speaker,
+                content=bot_turn,
+                message_id=sent.id,
+            )
+        self._activate_active_chat(message)
+
+    def _extract_image_generation_prompt(self, prompt: str) -> str | None:
+        cleaned = self._strip_bot_name_prefix(prompt)
+        cleaned = re.sub(
+            r"^(?:hey|yo|oye|nitori)[,\s]+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+        cleaned = re.sub(
+            r"^(?:can you|could you|please|porfa|por favor|puedes|podrias|podrías|me puedes)\s+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+        patterns = (
+            r"^(?:draw|create|generate|make)\s+(?:me\s+)?(?:an?\s+)?(?:image|picture|photo|drawing|illustration|art)\s*(?:of|about|showing|with)?\s+(.+)$",
+            r"^(?:draw|create|generate|make)\s+(?:me\s+)?(.+)$",
+            r"^(?:dibuja|dibujar|dibujame|dibújame|crea|crear|creame|créame|genera|generar|generame|genérame|haz|hacer|hazme)\s+(?:me\s+)?(?:(?:un(?:a)?|el|la|los|las)\s+)?(?:imagen|foto|dibujo|ilustracion|ilustración|arte)\s*(?:de|sobre|con)?\s+(.+)$",
+            r"^(?:dibuja|dibujar|dibujame|dibújame|crea|crear|creame|créame|genera|generar|generame|genérame|haz|hacer|hazme)\s+(?:me\s+)?(.+)$",
+            r"^(?:quiero|quisiera)\s+(?:(?:un(?:a)?|el|la|los|las)\s+)?(?:imagen|foto|dibujo|ilustracion|ilustración|arte)\s*(?:de|sobre|con)?\s+(.+)$",
+        )
+        for pattern in patterns:
+            match = re.match(pattern, cleaned, flags=re.IGNORECASE)
+            if not match:
+                continue
+            candidate = " ".join(match.group(1).strip().split())
+            if candidate and len(candidate) >= 3:
+                return candidate[:900]
+        return None
+
+    def _image_generation_prompt_for_message(
+        self,
+        message: discord.Message,
+        prompt: str,
+        *,
+        is_active_followup: bool,
+        replied_message: discord.Message | None = None,
+    ) -> str | None:
+        if is_active_followup:
+            return None
+        if not (
+            self.bot.user in message.mentions
+            or self._is_addressed_to_bot_by_name(message.content)
+        ):
+            return None
+        extracted = self._extract_image_generation_prompt(prompt)
+        if not self._is_vague_image_generation_prompt(extracted):
+            return extracted
+
+        replied_content = " ".join(str(getattr(replied_message, "content", "") or "").strip().split())
+        if not replied_content:
+            return extracted
+
+        replied_prompt = self._extract_image_generation_prompt(replied_content)
+        if not self._is_vague_image_generation_prompt(replied_prompt):
+            return replied_prompt
+        if self._contains_image_generation_verb(prompt):
+            return replied_content[:900]
+        return extracted
+
+    @staticmethod
+    def _is_vague_image_generation_prompt(prompt: str | None) -> bool:
+        if prompt is None:
+            return True
+        normalized = " ".join(prompt.strip().casefold().split())
+        if len(normalized) < 12:
+            return True
+        return normalized in {
+            "la imagen",
+            "el dibujo",
+            "the image",
+            "eso",
+            "esto",
+            "that",
+            "it",
+        }
+
+    @staticmethod
+    def _contains_image_generation_verb(prompt: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(?:genera|generar|generame|genérame|haz|hacer|hazme|crea|crear|creame|créame|dibuja|dibujar|dibujame|dibújame|draw|create|generate|make)\b",
+                prompt,
+                flags=re.IGNORECASE,
+            )
+        )
+
+    def _strip_bot_name_prefix(self, text: str) -> str:
+        cleaned = text.strip()
+        if self.bot.user is None:
+            return cleaned
+        names = {
+            str(getattr(self.bot.user, "name", "") or "").strip(),
+            str(getattr(self.bot.user, "display_name", "") or "").strip(),
+            str(getattr(self.bot.user, "global_name", "") or "").strip(),
+        }
+        for name in sorted((item for item in names if item), key=len, reverse=True):
+            updated = re.sub(
+                rf"^@?{re.escape(name)}(?:\b|[\s,:;!?-])\s*",
+                "",
+                cleaned,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            if updated != cleaned:
+                return updated.strip()
+        return cleaned
 
     async def _maybe_add_ai_reaction(
         self,
@@ -1567,6 +2003,21 @@ class AIChatCog(commands.Cog):
             return []
         return list(history)
 
+    def _recent_intent_context(self, key: tuple[int, int]) -> list[dict[str, str]]:
+        rows = self._conversation_history.get(key)
+        if not rows:
+            return []
+        context: list[dict[str, str]] = []
+        for item in list(rows)[-5:]:
+            content = str(item.get("content", "")).strip()
+            if ": " in content:
+                author, text = content.split(": ", 1)
+            else:
+                author, text = "unknown", content
+            if text:
+                context.append({"author": author or "unknown", "content": text})
+        return context
+
     async def _ensure_history_loaded(
         self,
         key: tuple[int, int],
@@ -1620,6 +2071,7 @@ class AIChatCog(commands.Cog):
         role: str,
         speaker: str,
         content: str,
+        message_id: int | None = None,
     ) -> None:
         await self.bot.db.add_ai_conversation_turn(
             guild_id=guild_id,
@@ -1627,6 +2079,7 @@ class AIChatCog(commands.Cog):
             role=role,
             speaker=speaker,
             content=content,
+            message_id=message_id,
         )
 
     @staticmethod
@@ -1639,22 +2092,31 @@ class AIChatCog(commands.Cog):
         text: str,
         *,
         mention_author: bool,
-    ) -> None:
+        reply_to_trigger: bool = True,
+    ) -> int | None:
         parts = self._split_for_discord(text, limit=1900)
         if not parts:
-            return
-        first = await trigger_message.reply(
-            parts[0],
-            mention_author=mention_author,
-            allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
-        )
+            return None
+        allowed_mentions = discord.AllowedMentions(users=True, roles=True, everyone=False)
+        if reply_to_trigger:
+            first = await trigger_message.reply(
+                parts[0],
+                mention_author=mention_author,
+                allowed_mentions=allowed_mentions,
+            )
+        else:
+            first = await trigger_message.channel.send(
+                parts[0],
+                allowed_mentions=allowed_mentions,
+            )
         self._remember_chat_response_message(first.id)
         for part in parts[1:]:
             extra = await trigger_message.channel.send(
                 part,
-                allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
+                allowed_mentions=allowed_mentions,
             )
             self._remember_chat_response_message(extra.id)
+        return int(first.id)
 
     def _is_chat_response_message(self, message_id: int) -> bool:
         return message_id in self._chat_response_id_set
