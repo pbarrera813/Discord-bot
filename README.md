@@ -6,17 +6,17 @@ Nitori was built as a single, no-paywall Discord bot for communities that want b
 ## Core Idea
 - One bot, all-in-one workflow.
 - No premium feature locks inside the bot itself.
-- AI only where needed (chat and translation).
+- AI only where needed (chat, translation, image understanding/generation, and server context).
 - Moderation/API features run as native command logic (no LLM required).
 
 ## Main Features
 - Moderation toolkit (message, user, channel, role, and color-role panel management).
-- More natural AI conversation with context memory, server context summaries, image understanding, timed follow-up chat, and relevant emoji reactions.
+- More natural AI conversation with context memory, server context summaries, image understanding/generation, replied-message awareness, timed follow-up chat, and relevant emoji reactions.
 - Translation command with multiple target languages.
 - Memes via Memegen API + local speech meme generator.
 - API Ninjas commands: joke, dadjoke, advice, whois, unit conversion.
 - Minecraft status checks (mcsrvstat.us).
-- Football stats for Liga MX, Premier League, LaLiga, and CONCACAF (API-Football).
+- Football stats for Liga MX, Premier League, LaLiga, CONCACAF, and FIFA World Cup (API-Football).
 - Code execution (Glot API) for common languages.
 - Reminder system with DM and optional channel mention.
 - Welcome/Goodbye configurable announcement modules.
@@ -26,7 +26,7 @@ Nitori was built as a single, no-paywall Discord bot for communities that want b
 ## Requirements
 - Python 3.11+
 - Discord bot token
-- xAI API key (chat/translate/context)
+- xAI API key (chat/translate/context/image analysis/image generation)
 - API Ninjas key (joke/dadjoke/advice/whois/convert)
 - API-Football key (supported football leagues)
 - Glot API token (/code)
@@ -44,6 +44,7 @@ Required for full feature set:
 Common optional settings:
 - `XAI_MODEL` (default model)
 - `XAI_VISION_MODEL` (optional image-capable model for AI chat attachments; defaults to `XAI_MODEL`)
+- `XAI_IMAGE_MODEL` (optional image-generation model; defaults to `grok-imagine-image-quality`)
 - `DB_PATH`
 - `DEFAULT_PREFIX`
 - `GLOT_BASE_URL`
@@ -69,7 +70,9 @@ python bot.py
 - `/help [section]`
 - `/setup`
 - `/translate <language> [text]`
-- Mention the bot, reply to one of its AI messages, or keep talking in an active AI chat. Nitori can follow up naturally for a short timeout, read attached images, and react with relevant emoji when it fits.
+- Mention the bot, reply to one of its AI messages, or keep talking in an active AI chat. Nitori can follow up naturally for a short timeout, keep channel-specific context, and avoid passive command/noise replies.
+- Nitori can read supported image attachments (`jpg`, `jpeg`, `png`) from the current message or replied-to message, understand replied text/embed context when directly addressed, and react with a relevant emoji when it fits.
+- Ask Nitori directly to draw/create/generate an image and it will upload the generated result instead of using a separate slash command.
 - `/setservercontext <#channel>` (admin/manage guild)
 - `/resetservercontext` (admin/manage guild)
 - `/viewservercontext` (admin/manage guild)
