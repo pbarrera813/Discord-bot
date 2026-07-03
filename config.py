@@ -16,6 +16,7 @@ class Settings:
     api_football_base_url: str
     xai_model: str
     xai_vision_model: str
+    xai_image_model: str
     db_path: str
     default_prefix: str
     bot_owner_ids: tuple[int, ...]
@@ -37,6 +38,8 @@ def load_settings() -> Settings:
     ).strip() or "https://v3.football.api-sports.io"
     xai_model = os.getenv("XAI_MODEL", "grok-4-1-fast-reasoning").strip()
     xai_vision_model = os.getenv("XAI_VISION_MODEL", xai_model).strip() or xai_model
+    xai_image_model = os.getenv("XAI_IMAGE_MODEL", "grok-imagine-image-quality").strip()
+    xai_image_model = xai_image_model or "grok-imagine-image-quality"
     db_path = os.getenv("DB_PATH", "data/bot.db").strip()
     default_prefix = os.getenv("DEFAULT_PREFIX", "!").strip() or "!"
     raw_owner_ids = os.getenv("BOT_OWNER_IDS", "").strip()
@@ -64,6 +67,7 @@ def load_settings() -> Settings:
         api_football_base_url=api_football_base_url,
         xai_model=xai_model,
         xai_vision_model=xai_vision_model,
+        xai_image_model=xai_image_model,
         db_path=db_path,
         default_prefix=default_prefix,
         bot_owner_ids=tuple(owner_ids),

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import unittest
 from types import SimpleNamespace
 
@@ -38,6 +40,30 @@ class _DummyAttachment:
         self.filename = filename
 
 
+class _CaptureChannel:
+    def __init__(self) -> None:
+        self.id = 10
+        self.sent: list[str] = []
+        self._next_id = 1000
+
+    async def send(self, content: str, **_kwargs):  # noqa: ANN001, ANN202
+        self.sent.append(content)
+        self._next_id += 1
+        return SimpleNamespace(id=self._next_id)
+
+
+class _CaptureMessage:
+    def __init__(self) -> None:
+        self.channel = _CaptureChannel()
+        self.replies: list[tuple[str, bool | None]] = []
+        self._next_id = 2000
+
+    async def reply(self, content: str, **kwargs):  # noqa: ANN001, ANN202
+        self.replies.append((content, kwargs.get("mention_author")))
+        self._next_id += 1
+        return SimpleNamespace(id=self._next_id)
+
+
 class _DummyMessage:
     def __init__(
         self,
@@ -49,6 +75,8 @@ class _DummyMessage:
         channel_id: int = 10,
         mentions: list[object] | None = None,
         webhook_id: int | None = None,
+        reference: object | None = None,
+        embeds: list[object] | None = None,
     ) -> None:
         self.attachments = attachments
         self.author = SimpleNamespace(display_name=author_name)
@@ -57,6 +85,8 @@ class _DummyMessage:
         self.channel = SimpleNamespace(id=channel_id)
         self.mentions = mentions or []
         self.webhook_id = webhook_id
+        self.reference = reference
+        self.embeds = embeds or []
 
 
 class _DummyGuild:
@@ -104,6 +134,40 @@ class _DummyGuild:
         return matches
 
 
+class _FakeResponse:
+    def __init__(self, *, status: int, text: str) -> None:
+        self.status = status
+        self._text = text
+
+    async def __aenter__(self):  # noqa: ANN202
+        return self
+
+    async def __aexit__(self, *_args):  # noqa: ANN202
+        return False
+
+    async def text(self) -> str:
+        return self._text
+
+
+class _FakeSession:
+    def __init__(self, response: _FakeResponse) -> None:
+        self.response = response
+        self.calls: list[dict[str, object]] = []
+
+    def post(self, url: str, *, json: dict[str, object], headers: dict[str, str]):  # noqa: A002
+        self.calls.append({"url": url, "json": json, "headers": headers})
+        return self.response
+
+
+class _ImageXAIClient(XAIClient):
+    def __init__(self, session: _FakeSession) -> None:
+        super().__init__("key", "grok-test", image_model="grok-imagine-image-quality")
+        self.fake_session = session
+
+    async def _get_session(self):  # noqa: ANN202
+        return self.fake_session
+
+
 class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     def test_active_chat_window_opens_for_channel(self) -> None:
         cog = AIChatCog(SimpleNamespace(user=None))
@@ -121,6 +185,235 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
         replied = SimpleNamespace(id=9001, author=bot_user)
 
         self.assertTrue(await cog._is_chat_trigger(message, replied))
+
+    async def test_reply_to_persisted_ai_response_is_direct_trigger(self) -> None:
+        async def is_ai_assistant_message(guild_id: int, channel_id: int, message_id: int) -> bool:
+            return (guild_id, channel_id, message_id) == (1, 10, 9001)
+
+        bot_user = SimpleNamespace(id=42)
+        db = SimpleNamespace(is_ai_assistant_message=is_ai_assistant_message)
+        cog = AIChatCog(SimpleNamespace(user=bot_user, db=db))
+        message = _DummyMessage(
+            attachments=[],
+            content="yeah exactly",
+            reference=SimpleNamespace(message_id=9001),
+        )
+        replied = SimpleNamespace(id=9001, author=bot_user)
+
+        self.assertTrue(await cog._is_chat_trigger(message, replied))
+        self.assertEqual(
+            cog._conversation_mode_for_trigger(
+                replied,
+                is_active_followup=False,
+                is_reply_to_ai=True,
+            ),
+            "reply",
+        )
+
+    async def test_reply_to_non_ai_bot_message_is_not_direct_trigger(self) -> None:
+        bot_user = SimpleNamespace(id=42)
+        cog = AIChatCog(SimpleNamespace(user=bot_user))
+        message = _DummyMessage(
+            attachments=[],
+            content="this command result looks wrong",
+            reference=SimpleNamespace(message_id=8001),
+        )
+        replied = SimpleNamespace(id=8001, author=bot_user)
+
+        self.assertFalse(await cog._is_chat_trigger(message, replied))
+
+    async def test_slash_command_response_is_not_reply_to_ai(self) -> None:
+        bot_user = SimpleNamespace(id=42)
+        bot = SimpleNamespace(user=bot_user, application_id=1234)
+        cog = AIChatCog(bot)
+        interaction_reply = SimpleNamespace(
+            id=9001,
+            author=bot_user,
+            interaction=object(),
+            interaction_metadata=None,
+            application_id=None,
+        )
+        app_reply = SimpleNamespace(
+            id=9002,
+            author=bot_user,
+            interaction=None,
+            interaction_metadata=None,
+            application_id=1234,
+        )
+
+        self.assertTrue(cog._is_slash_command_response_message(interaction_reply))
+        self.assertTrue(cog._is_slash_command_response_message(app_reply))
+        self.assertFalse(
+            await cog._is_chat_trigger(
+                _DummyMessage(attachments=[], content="what is this?"),
+                interaction_reply,
+                is_reply_to_ai=False,
+            )
+        )
+
+    async def test_slash_command_response_with_bot_name_still_direct(self) -> None:
+        bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
+        cog = AIChatCog(SimpleNamespace(user=bot_user, application_id=1234))
+        replied = SimpleNamespace(
+            id=9001,
+            author=bot_user,
+            interaction_metadata=object(),
+            application_id=None,
+        )
+        message = _DummyMessage(attachments=[], content="Nitori what do you think?")
+
+        self.assertTrue(cog._is_slash_command_response_message(replied))
+        self.assertTrue(
+            await cog._is_chat_trigger(message, replied, is_reply_to_ai=False)
+        )
+
+    async def test_bot_name_at_start_is_direct_trigger(self) -> None:
+        bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori-Buchona")
+        cog = AIChatCog(SimpleNamespace(user=bot_user))
+        message = _DummyMessage(attachments=[], content="Nitori what do you think?")
+
+        self.assertTrue(await cog._is_chat_trigger(message, None))
+
+    def test_obvious_bot_name_skips_classifier_path(self) -> None:
+        bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori-Buchona")
+        cog = AIChatCog(SimpleNamespace(user=bot_user))
+
+        self.assertTrue(cog._contains_obvious_bot_name("oye Nitori-Buchona ven", "Nitori-Buchona"))
+        self.assertTrue(cog._contains_obvious_bot_name("Nitori que opinas?", "Nitori-Buchona"))
+        self.assertFalse(cog._contains_obvious_bot_name("que opinas?", "Nitori-Buchona"))
+
+    async def test_reply_mentioning_bot_is_direct_trigger(self) -> None:
+        bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
+        cog = AIChatCog(SimpleNamespace(user=bot_user))
+        message = _DummyMessage(
+            attachments=[],
+            content="<@42> what do you think about this?",
+            mentions=[bot_user],
+            reference=SimpleNamespace(message_id=9002),
+        )
+
+        self.assertTrue(await cog._is_chat_trigger(message, None))
+
+    async def test_reply_naming_bot_is_direct_trigger(self) -> None:
+        bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori-Buchona")
+        cog = AIChatCog(SimpleNamespace(user=bot_user))
+        message = _DummyMessage(
+            attachments=[],
+            content="Nitori what do you think about this?",
+            reference=SimpleNamespace(message_id=9003),
+        )
+
+        self.assertTrue(await cog._is_chat_trigger(message, None))
+
+    def test_replied_message_context_includes_text_embed_and_images(self) -> None:
+        embed = SimpleNamespace(
+            title="Match result",
+            description="Nitori scored twice",
+            fields=[SimpleNamespace(name="MVP", value="Nitori")],
+            footer=SimpleNamespace(text="final"),
+            image=SimpleNamespace(url="https://cdn.discordapp.com/embed.png"),
+            thumbnail=SimpleNamespace(url="https://cdn.discordapp.com/thumb.jpg"),
+        )
+        replied = _DummyMessage(
+            attachments=[
+                _DummyAttachment(
+                    url="https://cdn.discordapp.com/replied.png",
+                    content_type="image/png",
+                    filename="replied.png",
+                )
+            ],
+            author_name="Jonark",
+            content="look at this",
+            embeds=[embed],
+        )
+
+        context = AIChatCog._build_replied_message_context(replied)
+
+        self.assertIn("Jonark", context.note)
+        self.assertIn("look at this", context.note)
+        self.assertIn("Match result", context.note)
+        self.assertIn("MVP", context.note)
+        self.assertIn("https://cdn.discordapp.com/replied.png", context.note)
+        self.assertIn("https://cdn.discordapp.com/embed.png", context.image_urls)
+
+    def test_image_generation_prompt_detection_is_conservative(self) -> None:
+        bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori-Buchona")
+        cog = AIChatCog(SimpleNamespace(user=bot_user))
+
+        self.assertEqual(
+            cog._extract_image_generation_prompt("Nitori hey draw me a picture of a forest"),
+            "a forest",
+        )
+        self.assertEqual(
+            cog._extract_image_generation_prompt("please generate an image of a robot frog"),
+            "a robot frog",
+        )
+        self.assertEqual(
+            cog._extract_image_generation_prompt("puedes crear una imagen de un bosque"),
+            "un bosque",
+        )
+        self.assertEqual(
+            cog._extract_image_generation_prompt("genera una imagen de un robot"),
+            "un robot",
+        )
+        self.assertEqual(
+            cog._extract_image_generation_prompt("dibújame un bosque"),
+            "un bosque",
+        )
+        self.assertEqual(
+            cog._extract_image_generation_prompt("quiero una imagen de una rana robot"),
+            "una rana robot",
+        )
+        self.assertIsNone(cog._extract_image_generation_prompt("that image was funny"))
+
+    def test_image_generation_routes_only_when_directly_addressed(self) -> None:
+        bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori-Buchona")
+        cog = AIChatCog(SimpleNamespace(user=bot_user))
+        mentioned = _DummyMessage(
+            attachments=[],
+            content="<@42> draw me a picture of a forest",
+            mentions=[bot_user],
+        )
+        named = _DummyMessage(
+            attachments=[],
+            content="Nitori draw me a picture of a forest",
+        )
+        reply_only = _DummyMessage(
+            attachments=[],
+            content="draw me a picture of a forest",
+            reference=SimpleNamespace(message_id=9001),
+        )
+
+        self.assertEqual(
+            cog._image_generation_prompt_for_message(
+                mentioned,
+                "draw me a picture of a forest",
+                is_active_followup=False,
+            ),
+            "a forest",
+        )
+        self.assertEqual(
+            cog._image_generation_prompt_for_message(
+                named,
+                "Nitori draw me a picture of a forest",
+                is_active_followup=False,
+            ),
+            "a forest",
+        )
+        self.assertIsNone(
+            cog._image_generation_prompt_for_message(
+                reply_only,
+                "draw me a picture of a forest",
+                is_active_followup=False,
+            )
+        )
+        self.assertIsNone(
+            cog._image_generation_prompt_for_message(
+                mentioned,
+                "draw me a picture of a forest",
+                is_active_followup=True,
+            )
+        )
 
     async def test_active_followup_triggers_in_same_channel(self) -> None:
         db = SimpleNamespace(
@@ -178,6 +471,77 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await cog._is_active_chat_followup(noise, prefix="!", settings=settings))
         self.assertFalse(await cog._is_active_chat_followup(webhook, prefix="!", settings=settings))
 
+    async def test_active_followup_ignores_reply_to_another_message(self) -> None:
+        db = SimpleNamespace(
+            get_or_create_birthday_guild_settings=_async_return({}),
+            get_announcement_settings=_async_return(SimpleNamespace(channel_id=None)),
+        )
+        cog = AIChatCog(SimpleNamespace(user=None, db=db))
+        settings = SimpleNamespace(modlog_channel_id=None)
+        cog._activate_active_chat(_DummyMessage(attachments=[], guild_id=1, channel_id=10))
+        reply = _DummyMessage(
+            attachments=[],
+            guild_id=1,
+            channel_id=10,
+            content="this was for the other user",
+            reference=SimpleNamespace(message_id=7001),
+        )
+
+        self.assertFalse(await cog._is_active_chat_followup(reply, prefix="!", settings=settings))
+
+    async def test_active_followup_ignores_reply_to_non_ai_bot_command_result(self) -> None:
+        db = SimpleNamespace(
+            get_or_create_birthday_guild_settings=_async_return({}),
+            get_announcement_settings=_async_return(SimpleNamespace(channel_id=None)),
+        )
+        cog = AIChatCog(SimpleNamespace(user=None, db=db))
+        settings = SimpleNamespace(modlog_channel_id=None)
+        cog._activate_active_chat(_DummyMessage(attachments=[], guild_id=1, channel_id=10))
+        reply = _DummyMessage(
+            attachments=[],
+            guild_id=1,
+            channel_id=10,
+            content="that command result is wrong",
+            reference=SimpleNamespace(message_id=7002),
+        )
+
+        self.assertFalse(await cog._is_active_chat_followup(reply, prefix="!", settings=settings))
+
+    async def test_active_followup_ignores_common_command_prefixes(self) -> None:
+        db = SimpleNamespace(
+            get_or_create_birthday_guild_settings=_async_return({}),
+            get_announcement_settings=_async_return(SimpleNamespace(channel_id=None)),
+        )
+        cog = AIChatCog(SimpleNamespace(user=None, db=db))
+        settings = SimpleNamespace(modlog_channel_id=None)
+
+        for content in ("?help", "/football", "!meme", ".ping", "$stats", "-rank", "+role"):
+            with self.subTest(content=content):
+                cog._activate_active_chat(_DummyMessage(attachments=[], guild_id=1, channel_id=10))
+                message = _DummyMessage(
+                    attachments=[],
+                    guild_id=1,
+                    channel_id=10,
+                    content=content,
+                )
+                self.assertFalse(
+                    await cog._is_active_chat_followup(message, prefix="!", settings=settings)
+                )
+
+        cog._activate_active_chat(_DummyMessage(attachments=[], guild_id=1, channel_id=10))
+        question = _DummyMessage(
+            attachments=[],
+            guild_id=1,
+            channel_id=10,
+            content="? what do you mean",
+        )
+        self.assertTrue(await cog._is_active_chat_followup(question, prefix="!", settings=settings))
+
+    def test_command_detection_ignores_configured_prefix_even_with_space(self) -> None:
+        self.assertTrue(
+            AIChatCog._looks_like_command_message("? what do you mean", configured_prefix="?")
+        )
+
     async def test_active_followup_ignores_configured_module_channels(self) -> None:
         async def get_birthday(_guild_id: int) -> dict[str, int]:
             return {"channel_id": 11}
@@ -212,6 +576,36 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(cog._consume_reaction_cooldown(key))
         self.assertFalse(cog._consume_reaction_cooldown(key))
+
+    async def test_direct_chat_delivery_replies_and_remembers_message(self) -> None:
+        cog = AIChatCog(SimpleNamespace(user=None))
+        message = _CaptureMessage()
+
+        await cog._send_long_reply(
+            message,
+            "hello",
+            mention_author=True,
+            reply_to_trigger=True,
+        )
+
+        self.assertEqual(message.replies, [("hello", True)])
+        self.assertEqual(message.channel.sent, [])
+        self.assertTrue(cog._is_chat_response_message(2001))
+
+    async def test_active_chat_delivery_sends_channel_message_and_remembers_message(self) -> None:
+        cog = AIChatCog(SimpleNamespace(user=None))
+        message = _CaptureMessage()
+
+        await cog._send_long_reply(
+            message,
+            "hello",
+            mention_author=True,
+            reply_to_trigger=False,
+        )
+
+        self.assertEqual(message.replies, [])
+        self.assertEqual(message.channel.sent, ["hello"])
+        self.assertTrue(cog._is_chat_response_message(1001))
 
     async def test_normalizes_malformed_user_mention(self) -> None:
         cog = AIChatCog(SimpleNamespace())
@@ -255,6 +649,22 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
         )
         history = cog._build_conversation_history(key)
         self.assertEqual(len(history), 1)
+
+    async def test_recent_intent_context_splits_authors_from_history(self) -> None:
+        cog = AIChatCog(SimpleNamespace())
+        key = cog._conversation_key(1, 2)
+        cog._append_conversation_turn(key, role="user", speaker="Pablo", content="hola")
+        cog._append_conversation_turn(key, role="assistant", speaker="Nitori", content="que onda")
+        cog._conversation_history[key].append({"role": "user", "content": "sin separador"})
+
+        self.assertEqual(
+            cog._recent_intent_context(key),
+            [
+                {"author": "Pablo", "content": "hola"},
+                {"author": "Nitori", "content": "que onda"},
+                {"author": "unknown", "content": "sin separador"},
+            ],
+        )
 
     async def test_visible_ai_output_strips_untrusted_history_marker(self) -> None:
         cog = AIChatCog(SimpleNamespace(user=None))
@@ -445,6 +855,80 @@ class XAIClientMessageTests(unittest.TestCase):
         self.assertEqual(content[0]["image_url"], "https://cdn.discordapp.com/file.png")
         self.assertEqual(content[1]["type"], "input_text")
         self.assertIn("what is this?", content[1]["text"])
+
+    def test_generate_image_payload_and_base64_response(self) -> None:
+        raw = b"fake-png"
+        payload = {"data": [{"b64_json": base64.b64encode(raw).decode("ascii")}]}
+        session = _FakeSession(_FakeResponse(status=200, text=json.dumps(payload)))
+        client = _ImageXAIClient(session)
+
+        result = asyncio.run(client.generate_image("draw a forest"))
+
+        self.assertEqual(result, raw)
+        call = session.calls[0]
+        self.assertEqual(call["url"], XAIClient.IMAGE_GENERATION_URL)
+        sent = call["json"]
+        self.assertEqual(sent["model"], "grok-imagine-image-quality")
+        self.assertEqual(sent["response_format"], "b64_json")
+        self.assertEqual(sent["n"], 1)
+
+    def test_generate_image_empty_response_raises(self) -> None:
+        session = _FakeSession(_FakeResponse(status=200, text='{"data": []}'))
+        client = _ImageXAIClient(session)
+
+        with self.assertRaises(RuntimeError):
+            asyncio.run(client.generate_image("draw a forest"))
+
+    def test_classify_message_intent_accepts_bot_response(self) -> None:
+        session = _FakeSession(_FakeResponse(status=200, text='{"output_text": "BOT"}'))
+        client = _ImageXAIClient(session)
+
+        result = asyncio.run(
+            client.classify_message_intent(
+                bot_name="Nitori",
+                author_name="Pablo",
+                current_message="what do you think?",
+                recent_context=[{"author": "Sofi", "content": "ask Nitori"}],
+            )
+        )
+
+        self.assertTrue(result)
+        call = session.calls[0]
+        self.assertEqual(call["url"], XAIClient.BASE_URL)
+        sent = call["json"]
+        self.assertEqual(sent["model"], "grok-test")
+        self.assertEqual(sent["temperature"], 0)
+        self.assertEqual(sent["max_tokens"], 10)
+        self.assertIn("intent classifier", sent["input"][0]["content"])
+        self.assertIn("ambiguous or you are unsure, reply BOT", sent["input"][0]["content"])
+        self.assertIn("Sofi: ask Nitori", sent["input"][1]["content"])
+
+    def test_classify_message_intent_rejects_users_and_errors(self) -> None:
+        users_session = _FakeSession(_FakeResponse(status=200, text='{"output_text": "USERS"}'))
+        users_client = _ImageXAIClient(users_session)
+        error_session = _FakeSession(_FakeResponse(status=500, text='{"error": "nope"}'))
+        error_client = _ImageXAIClient(error_session)
+
+        self.assertFalse(
+            asyncio.run(
+                users_client.classify_message_intent(
+                    bot_name="Nitori",
+                    author_name="Pablo",
+                    current_message="yeah, I agree with you",
+                    recent_context=[],
+                )
+            )
+        )
+        self.assertFalse(
+            asyncio.run(
+                error_client.classify_message_intent(
+                    bot_name="Nitori",
+                    author_name="Pablo",
+                    current_message="Nitori?",
+                    recent_context=[],
+                )
+            )
+        )
 
     def test_channel_context_selects_matching_channel(self) -> None:
         client = XAIClient("key", "grok-test")

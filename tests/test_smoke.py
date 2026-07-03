@@ -118,6 +118,34 @@ class DatabaseSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["speaker"], "Pablo")
 
+    async def test_ai_conversation_turn_message_id_lookup(self) -> None:
+        db_path = os.path.join(tempfile.gettempdir(), "discordbot_test_ai_message_id.db")
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+        db = Database(db_path)
+        await db.init()
+        await db.add_ai_conversation_turn(
+            123,
+            456,
+            "assistant",
+            "Nitori",
+            "Nitori: hola",
+            message_id=999,
+        )
+        await db.add_ai_conversation_turn(
+            123,
+            456,
+            "user",
+            "Pablo",
+            "Pablo: hola",
+            message_id=1000,
+        )
+
+        self.assertTrue(await db.is_ai_assistant_message(123, 456, 999))
+        self.assertFalse(await db.is_ai_assistant_message(123, 456, 1000))
+        self.assertFalse(await db.is_ai_assistant_message(123, 999, 999))
+
 
 class UtilityTests(unittest.TestCase):
     def test_duration_parse(self) -> None:

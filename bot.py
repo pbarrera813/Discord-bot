@@ -53,6 +53,7 @@ class DiscordModBot(commands.Bot):
             settings.xai_api_key,
             settings.xai_model,
             vision_model=settings.xai_vision_model,
+            image_model=settings.xai_image_model,
         )
         self.mc_client = McSrvStatClient()
         self.ninjas_client = (
