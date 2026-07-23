@@ -17,6 +17,10 @@ class Settings:
     xai_model: str
     xai_vision_model: str
     xai_image_model: str
+    xai_web_search_enabled: bool
+    xai_x_search_enabled: bool
+    xai_web_search_max_sources: int
+    xai_web_search_cooldown_seconds: float
     db_path: str
     default_prefix: str
     bot_owner_ids: tuple[int, ...]
@@ -40,6 +44,14 @@ def load_settings() -> Settings:
     xai_vision_model = os.getenv("XAI_VISION_MODEL", xai_model).strip() or xai_model
     xai_image_model = os.getenv("XAI_IMAGE_MODEL", "grok-imagine-image-quality").strip()
     xai_image_model = xai_image_model or "grok-imagine-image-quality"
+    xai_web_search_enabled = _env_bool("XAI_WEB_SEARCH_ENABLED", default=False)
+    xai_x_search_enabled = _env_bool("XAI_X_SEARCH_ENABLED", default=False)
+    xai_web_search_max_sources = _env_int("XAI_WEB_SEARCH_MAX_SOURCES", default=3, minimum=1, maximum=5)
+    xai_web_search_cooldown_seconds = _env_float(
+        "XAI_WEB_SEARCH_COOLDOWN_SECONDS",
+        default=30.0,
+        minimum=0.0,
+    )
     db_path = os.getenv("DB_PATH", "data/bot.db").strip()
     default_prefix = os.getenv("DEFAULT_PREFIX", "!").strip() or "!"
     raw_owner_ids = os.getenv("BOT_OWNER_IDS", "").strip()
@@ -68,7 +80,41 @@ def load_settings() -> Settings:
         xai_model=xai_model,
         xai_vision_model=xai_vision_model,
         xai_image_model=xai_image_model,
+        xai_web_search_enabled=xai_web_search_enabled,
+        xai_x_search_enabled=xai_x_search_enabled,
+        xai_web_search_max_sources=xai_web_search_max_sources,
+        xai_web_search_cooldown_seconds=xai_web_search_cooldown_seconds,
         db_path=db_path,
         default_prefix=default_prefix,
         bot_owner_ids=tuple(owner_ids),
     )
+
+
+def _env_bool(name: str, *, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().casefold()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _env_int(name: str, *, default: int, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name, "").strip()
+    try:
+        parsed = int(raw)
+    except ValueError:
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _env_float(name: str, *, default: float, minimum: float) -> float:
+    raw = os.getenv(name, "").strip()
+    try:
+        parsed = float(raw)
+    except ValueError:
+        parsed = default
+    return max(minimum, parsed)
