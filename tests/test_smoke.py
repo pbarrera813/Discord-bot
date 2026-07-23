@@ -146,6 +146,46 @@ class DatabaseSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await db.is_ai_assistant_message(123, 456, 1000))
         self.assertFalse(await db.is_ai_assistant_message(123, 999, 999))
 
+    async def test_ai_conversation_turn_metadata_and_parent_chain(self) -> None:
+        db_path = os.path.join(tempfile.gettempdir(), "discordbot_test_ai_branch_metadata.db")
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+        db = Database(db_path)
+        await db.init()
+        await db.add_ai_conversation_turn(
+            123,
+            456,
+            "user",
+            "Pablo",
+            "Pablo: draw a forest",
+            message_id=100,
+            author_user_id=10,
+            action_type="GENERATE_IMAGE",
+            resolved_request="a forest",
+        )
+        await db.add_ai_conversation_turn(
+            123,
+            456,
+            "assistant",
+            "Nitori",
+            "Nitori: Generated image: a forest",
+            message_id=101,
+            author_user_id=20,
+            parent_message_id=100,
+            action_type="GENERATE_IMAGE",
+            resolved_request="a forest",
+        )
+
+        turn = await db.get_ai_turn_by_message_id(123, 456, 101)
+        chain = await db.get_ai_parent_chain(123, 456, 101)
+
+        self.assertEqual(turn["author_user_id"], "20")
+        self.assertEqual(turn["parent_message_id"], "100")
+        self.assertEqual(turn["action_type"], "GENERATE_IMAGE")
+        self.assertEqual(turn["resolved_request"], "a forest")
+        self.assertEqual([row["message_id"] for row in chain], ["100", "101"])
+
 
 class UtilityTests(unittest.TestCase):
     def test_duration_parse(self) -> None:

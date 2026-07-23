@@ -8,6 +8,7 @@ import discord
 from discord.ext import commands, tasks
 
 from services.database import AI_INTERACTIONS_CONTEXT_CHANNEL_ID
+from services.server_memory import ServerMemoryInput, ServerMemoryService
 from utils.i18n import normalize_language, tr
 from utils.permissions import owner_or_has_permissions
 
@@ -537,25 +538,48 @@ class AdminCog(commands.Cog):
         name="resetservercontext",
         description="Reset AI server context and stored AI conversation memory.",
     )
+    @discord.app_commands.describe(scope="What to reset: summaries, memory, ai_history, or all.")
     @owner_or_has_permissions(manage_guild=True)
-    async def reset_server_context(self, ctx: commands.Context) -> None:
+    async def reset_server_context(self, ctx: commands.Context, scope: str = "all") -> None:
         guild = ctx.guild
         if guild is None:
             await ctx.send("This command can only be used in a server.")
             return
 
         lang = await self._lang(guild)
-        await self.bot.db.reset_ai_server_context(guild.id)
-        ai_cog = self.bot.get_cog("AIChatCog")
-        if ai_cog is not None and hasattr(ai_cog, "clear_guild_history"):
-            ai_cog.clear_guild_history(guild.id)
+        scope_key = scope.strip().casefold()
+        if scope_key not in {"summaries", "memory", "ai_history", "all"}:
+            await ctx.send(
+                tr(
+                    lang,
+                    "Invalid scope. Use `summaries`, `memory`, `ai_history`, or `all`.",
+                    "Scope invalido. Usa `summaries`, `memory`, `ai_history` o `all`.",
+                )
+            )
+            return
+        await self._reset_server_context_scope(guild.id, scope_key)
         await ctx.send(
             tr(
                 lang,
-                "AI server context reset. I will rebuild it from future chats or new `/setservercontext` channels.",
-                "Contexto de IA reiniciado. Lo reconstruire con chats futuros o nuevos canales de `/setservercontext`.",
+                f"AI server context reset complete for scope `{scope_key}`.",
+                f"Reinicio de contexto IA completado para scope `{scope_key}`.",
             )
         )
+
+    async def _reset_server_context_scope(self, guild_id: int, scope: str) -> None:
+        if scope == "all":
+            await self.bot.db.reset_ai_server_context(guild_id)
+            await ServerMemoryService(self.bot.db).clear_memories(guild_id)
+        elif scope == "summaries":
+            await self.bot.db.reset_server_context_summaries(guild_id)
+        elif scope == "memory":
+            await ServerMemoryService(self.bot.db).clear_memories(guild_id)
+        elif scope == "ai_history":
+            await self.bot.db.reset_ai_conversation_turns(guild_id)
+        if scope in {"all", "ai_history"}:
+            ai_cog = self.bot.get_cog("AIChatCog")
+            if ai_cog is not None and hasattr(ai_cog, "clear_guild_history"):
+                ai_cog.clear_guild_history(guild_id)
 
     @commands.hybrid_command(
         name="viewservercontext",
@@ -570,19 +594,180 @@ class AdminCog(commands.Cog):
 
         settings = await self.bot.db.get_guild_settings(guild.id)
         entries = await self.bot.db.get_server_context_entries(guild.id)
-        output = self._format_server_context_view(settings.server_context, entries)
+        counts = await ServerMemoryService(self.bot.db).counts(guild.id)
+        output = self._format_server_context_view(settings.server_context, entries, counts)
         await self._send_server_context_view(ctx, output)
+
+    @commands.hybrid_group(
+        name="servercontext",
+        description="Manage structured AI server memory.",
+        fallback="view",
+        invoke_without_command=True,
+    )
+    @owner_or_has_permissions(manage_guild=True)
+    async def server_context_group(self, ctx: commands.Context) -> None:
+        guild = ctx.guild
+        if guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+        settings = await self.bot.db.get_guild_settings(guild.id)
+        entries = await self.bot.db.get_server_context_entries(guild.id)
+        counts = await ServerMemoryService(self.bot.db).counts(guild.id)
+        output = self._format_server_context_view(settings.server_context, entries, counts)
+        await self._send_server_context_view(ctx, output)
+
+    @server_context_group.command(name="remember", description="Store a structured server memory.")
+    @discord.app_commands.describe(
+        memory_type="Type, for example USER_NICKNAME, SERVER_RULE, CHANNEL_CONTEXT.",
+        value="Value to remember.",
+        user="Optional target user.",
+        channel="Optional target channel.",
+        key="Optional memory key.",
+    )
+    @owner_or_has_permissions(manage_guild=True)
+    async def server_context_remember(
+        self,
+        ctx: commands.Context,
+        memory_type: str,
+        value: str,
+        user: discord.Member | None = None,
+        channel: discord.TextChannel | None = None,
+        key: str = "",
+    ) -> None:
+        guild = ctx.guild
+        if guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+        lang = await self._lang(guild)
+        try:
+            normalized_type = ServerMemoryService.normalize_memory_type(memory_type)
+            memory_key = key or ("preferred_nickname" if normalized_type == "USER_NICKNAME" else normalized_type.casefold())
+            row = await ServerMemoryService(self.bot.db).create_memory(
+                ServerMemoryInput(
+                    guild_id=guild.id,
+                    memory_type=normalized_type,
+                    subject_user_id=user.id if user else None,
+                    subject_channel_id=channel.id if channel else None,
+                    key=memory_key,
+                    value=value,
+                    created_by_user_id=ctx.author.id,
+                    source_type="command",
+                    approved_by_user_id=ctx.author.id,
+                )
+            )
+        except ValueError as exc:
+            await ctx.send(str(exc))
+            return
+        await ctx.send(tr(lang, f"Saved structured memory `{row.get('id')}`.", f"Memoria estructurada guardada `{row.get('id')}`."))
+
+    @server_context_group.command(name="forget", description="Archive a structured server memory.")
+    @discord.app_commands.describe(memory_id="Memory ID from /servercontext list or view.")
+    @owner_or_has_permissions(manage_guild=True)
+    async def server_context_forget(self, ctx: commands.Context, memory_id: int) -> None:
+        guild = ctx.guild
+        if guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+        lang = await self._lang(guild)
+        ok = await ServerMemoryService(self.bot.db).archive_memory(guild.id, memory_id)
+        await ctx.send(tr(lang, "Memory archived." if ok else "Memory not found.", "Memoria archivada." if ok else "Memoria no encontrada."))
+
+    @server_context_group.command(name="list", description="List structured server memories.")
+    @discord.app_commands.describe(memory_type="Optional memory type.", status="active, pending, rejected, archived, or expired.")
+    @owner_or_has_permissions(manage_guild=True)
+    async def server_context_list(self, ctx: commands.Context, memory_type: str = "", status: str = "active") -> None:
+        guild = ctx.guild
+        if guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+        try:
+            rows = await ServerMemoryService(self.bot.db).list_memories(
+                guild.id,
+                memory_type=memory_type or None,
+                status=status or None,
+                limit=25,
+            )
+        except ValueError as exc:
+            await ctx.send(str(exc))
+            return
+        await self._send_server_context_view(ctx, self._format_server_memory_rows(rows))
+
+    @server_context_group.command(name="user", description="List structured memories about a user.")
+    @owner_or_has_permissions(manage_guild=True)
+    async def server_context_user(self, ctx: commands.Context, user: discord.Member) -> None:
+        guild = ctx.guild
+        if guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+        rows = await ServerMemoryService(self.bot.db).list_user_memories(guild.id, user.id)
+        await self._send_server_context_view(ctx, self._format_server_memory_rows(rows))
+
+    @server_context_group.command(name="approve", description="Approve a pending structured memory.")
+    @owner_or_has_permissions(manage_guild=True)
+    async def server_context_approve(self, ctx: commands.Context, memory_id: int) -> None:
+        guild = ctx.guild
+        if guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+        ok = await ServerMemoryService(self.bot.db).approve_memory(guild.id, memory_id, ctx.author.id)
+        await ctx.send("Memory approved." if ok else "Memory not found.")
+
+    @server_context_group.command(name="reject", description="Reject a pending structured memory.")
+    @owner_or_has_permissions(manage_guild=True)
+    async def server_context_reject(self, ctx: commands.Context, memory_id: int) -> None:
+        guild = ctx.guild
+        if guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+        ok = await ServerMemoryService(self.bot.db).reject_memory(guild.id, memory_id, ctx.author.id)
+        await ctx.send("Memory rejected." if ok else "Memory not found.")
+
+    @server_context_group.command(name="reset", description="Reset one server context scope.")
+    @discord.app_commands.describe(scope="summaries, memory, ai_history, or all.")
+    @owner_or_has_permissions(manage_guild=True)
+    async def server_context_reset(self, ctx: commands.Context, scope: str = "all") -> None:
+        guild = ctx.guild
+        if guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+        lang = await self._lang(guild)
+        scope_key = scope.strip().casefold()
+        if scope_key not in {"summaries", "memory", "ai_history", "all"}:
+            await ctx.send(
+                tr(
+                    lang,
+                    "Invalid scope. Use `summaries`, `memory`, `ai_history`, or `all`.",
+                    "Scope invalido. Usa `summaries`, `memory`, `ai_history` o `all`.",
+                )
+            )
+            return
+        await self._reset_server_context_scope(guild.id, scope_key)
+        await ctx.send(
+            tr(
+                lang,
+                f"AI server context reset complete for scope `{scope_key}`.",
+                f"Reinicio de contexto IA completado para scope `{scope_key}`.",
+            )
+        )
 
     @staticmethod
     def _format_server_context_view(
         server_context: str | None,
         entries: list[dict[str, object]],
+        memory_counts: list[dict[str, object]] | None = None,
     ) -> str:
         context = (server_context or "").strip()
-        if not context and not entries:
+        if not context and not entries and not memory_counts:
             return "No AI server context is currently stored."
 
         lines = ["AI server context currently stored:"]
+        if memory_counts:
+            lines.append("")
+            lines.append("Structured memory:")
+            for item in memory_counts:
+                lines.append(
+                    f"- {item.get('memory_type', 'UNKNOWN')} / {item.get('status', 'unknown')}: {item.get('count', 0)}"
+                )
         if entries:
             lines.append("")
             lines.append("Sources:")
@@ -613,6 +798,23 @@ class AdminCog(commands.Cog):
                 await ctx.send(chunk, ephemeral=True)
             else:
                 await ctx.send(chunk)
+
+    @staticmethod
+    def _format_server_memory_rows(rows: list[dict[str, object]]) -> str:
+        if not rows:
+            return "No structured server memories found."
+        lines = ["Structured server memories:"]
+        for row in rows:
+            target = ""
+            if row.get("subject_user_id"):
+                target = f" user={row.get('subject_user_id')}"
+            elif row.get("subject_channel_id"):
+                target = f" channel={row.get('subject_channel_id')}"
+            lines.append(
+                f"- `{row.get('id')}` {row.get('memory_type')} {row.get('status')}{target} "
+                f"{row.get('key')}: {row.get('value')}"
+            )
+        return "\n".join(lines)
 
     @staticmethod
     def _split_context_view_output(output: str, limit: int = 1900) -> list[str]:
@@ -996,6 +1198,17 @@ Archivos: `.c`, `.cpp`, `.cs`, `.java`, `.js`, `.py`, `.rs`"""
 `/football table <league>` - Current league standings table.
 `/football team <league> <team>` - Team details and recent form.
 `/football scorers <league>` - Top scorers leaderboard.
+`/football match <fixture|team>` - Match center by fixture ID or team.
+`/football schedule <team|league> [next|last|season]` - Fixture schedule.
+`/football player <player>` - Player profile and season stats.
+`/football lineup <fixture_id>` - Confirmed fixture lineups.
+`/football stats <fixture_id>` - Fixture statistics.
+`/football injuries <team>` - Injuries/unavailable players.
+`/football transfers <team>` - Recent transfers.
+`/football h2h <team_a> <team_b>` - Head-to-head matches.
+`/football top <scorers|assists|yellowcards|redcards>` - Leaderboards.
+`/football preview <fixture_id>` - Data-only match preview.
+`/football summary <fixture_id>` - Data-only match summary.
 Leagues: `ligamx`, `premier`, `laliga`, `concacaf`, `worldcup`."""
         sports_es = """`/football live <liga>` - Partidos en vivo ahora mismo.
 `/football today <liga>` - Partidos programados para hoy.
@@ -1004,6 +1217,17 @@ Leagues: `ligamx`, `premier`, `laliga`, `concacaf`, `worldcup`."""
 `/football table <liga>` - Tabla de posiciones actual.
 `/football team <liga> <equipo>` - Datos del equipo y forma reciente.
 `/football scorers <liga>` - Tabla de goleadores.
+`/football match <partido|equipo>` - Centro de partido por ID o equipo.
+`/football schedule <equipo|liga> [next|last|season]` - Calendario de partidos.
+`/football player <jugador>` - Perfil y estadísticas del jugador.
+`/football lineup <fixture_id>` - Alineaciones confirmadas.
+`/football stats <fixture_id>` - Estadísticas del partido.
+`/football injuries <equipo>` - Lesiones/jugadores no disponibles.
+`/football transfers <equipo>` - Transferencias recientes.
+`/football h2h <equipo_a> <equipo_b>` - Historial entre equipos.
+`/football top <scorers|assists|yellowcards|redcards>` - Tablas de líderes.
+`/football preview <fixture_id>` - Previa del partido con datos.
+`/football summary <fixture_id>` - Resumen del partido con datos.
 Ligas: `ligamx`, `premier`, `laliga`, `concacaf`, `worldcup`."""
 
         fun_en = """`/joke` - Random joke.
@@ -1095,8 +1319,9 @@ Ligas: `ligamx`, `premier`, `laliga`, `concacaf`, `worldcup`."""
 `/config prefix <new_prefix>` - Change server prefix.
 `/config language <en|es>` - Set response language.
 `/setservercontext <#channel>` - Add/update AI context channel.
-`/resetservercontext` - Clear AI context and rebuild from future chats or channels.
-`/viewservercontext` - View current stored AI context.
+`/resetservercontext [scope]` - Clear summaries, memory, AI history, or all.
+`/viewservercontext` - View summary context and structured memory counts.
+`/servercontext remember|forget|list|user|approve|reject|reset` - Manage structured AI memory.
 `/config antispam <true|false>` - Toggle anti-spam filter.
 `/config antilink <true|false>` - Toggle anti-link filter.
 `/color setup` - Create default color roles.
@@ -1109,8 +1334,9 @@ Ligas: `ligamx`, `premier`, `laliga`, `concacaf`, `worldcup`."""
 `/config prefix <nuevo_prefijo>` - Cambia el prefijo del servidor.
 `/config language <en|es>` - Define idioma de respuestas.
 `/setservercontext <#canal>` - Agrega/actualiza canal de contexto IA.
-`/resetservercontext` - Reinicia contexto IA y lo reconstruye con chats o canales futuros.
-`/viewservercontext` - Muestra el contexto IA almacenado.
+`/resetservercontext [scope]` - Limpia resumenes, memoria, historial IA o todo.
+`/viewservercontext` - Muestra contexto resumen y conteos de memoria estructurada.
+`/servercontext remember|forget|list|user|approve|reject|reset` - Gestiona memoria IA estructurada.
 `/config antispam <true|false>` - Activa/desactiva filtro anti-spam.
 `/config antilink <true|false>` - Activa/desactiva filtro anti-links.
 `/color setup` - Crea roles de color por defecto.

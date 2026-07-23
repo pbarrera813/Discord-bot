@@ -129,6 +129,10 @@ class Database:
                     speaker TEXT NOT NULL,
                     content TEXT NOT NULL,
                     message_id INTEGER,
+                    author_user_id INTEGER,
+                    parent_message_id INTEGER,
+                    action_type TEXT,
+                    resolved_request TEXT,
                     created_at TEXT NOT NULL
                 )
                 """
@@ -146,6 +150,62 @@ class Database:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(guild_id, channel_id)
                 )
+                """
+            )
+
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS server_memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    memory_type TEXT NOT NULL,
+                    subject_user_id INTEGER,
+                    subject_channel_id INTEGER,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    metadata_json TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    source_type TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    required_approver_type TEXT,
+                    created_by_user_id INTEGER NOT NULL,
+                    approved_by_user_id INTEGER,
+                    source_message_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    expires_at TEXT
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_server_memories_guild_status
+                ON server_memories(guild_id, status)
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_server_memories_subject_user
+                ON server_memories(guild_id, subject_user_id, status)
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_server_memories_subject_channel
+                ON server_memories(guild_id, subject_channel_id, status)
+                """
+            )
+            await conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_server_memories_dedupe_active
+                ON server_memories(
+                    guild_id,
+                    memory_type,
+                    IFNULL(subject_user_id, 0),
+                    IFNULL(subject_channel_id, 0),
+                    key
+                )
+                WHERE status = 'active'
                 """
             )
 
@@ -998,6 +1058,270 @@ class Database:
             )
             await conn.commit()
 
+    async def reset_server_context_summaries(self, guild_id: int) -> None:
+        await self.get_or_create_guild_settings(guild_id)
+        async with self._connect() as conn:
+            await conn.execute(
+                "UPDATE guild_settings SET server_context = '' WHERE guild_id = ?",
+                (guild_id,),
+            )
+            await conn.execute(
+                "DELETE FROM server_context_entries WHERE guild_id = ?",
+                (guild_id,),
+            )
+            await conn.commit()
+
+    async def reset_ai_conversation_turns(self, guild_id: int) -> None:
+        await self.get_or_create_guild_settings(guild_id)
+        async with self._connect() as conn:
+            await conn.execute(
+                "DELETE FROM ai_conversation_turns WHERE guild_id = ?",
+                (guild_id,),
+            )
+            await conn.commit()
+
+    async def add_server_memory(
+        self,
+        *,
+        guild_id: int,
+        memory_type: str,
+        key: str,
+        value: str,
+        source_type: str,
+        created_by_user_id: int,
+        subject_user_id: int | None = None,
+        subject_channel_id: int | None = None,
+        metadata_json: str | None = None,
+        status: str = "active",
+        confidence: float = 1.0,
+        required_approver_type: str | None = None,
+        approved_by_user_id: int | None = None,
+        source_message_id: int | None = None,
+        expires_at: str | None = None,
+    ) -> int:
+        now_iso = self._now_iso()
+        async with self._connect() as conn:
+            existing_id: int | None = None
+            if status == "active":
+                cursor = await conn.execute(
+                    """
+                    SELECT id
+                    FROM server_memories
+                    WHERE guild_id = ?
+                      AND memory_type = ?
+                      AND IFNULL(subject_user_id, 0) = IFNULL(?, 0)
+                      AND IFNULL(subject_channel_id, 0) = IFNULL(?, 0)
+                      AND key = ?
+                      AND status = 'active'
+                    """,
+                    (guild_id, memory_type, subject_user_id, subject_channel_id, key),
+                )
+                row = await cursor.fetchone()
+                existing_id = int(row["id"]) if row else None
+
+            if existing_id is not None:
+                await conn.execute(
+                    """
+                    UPDATE server_memories
+                    SET value = ?,
+                        metadata_json = ?,
+                        source_type = ?,
+                        confidence = ?,
+                        created_by_user_id = ?,
+                        approved_by_user_id = ?,
+                        source_message_id = ?,
+                        updated_at = ?,
+                        expires_at = ?
+                    WHERE id = ? AND guild_id = ?
+                    """,
+                    (
+                        value,
+                        metadata_json,
+                        source_type,
+                        confidence,
+                        created_by_user_id,
+                        approved_by_user_id,
+                        source_message_id,
+                        now_iso,
+                        expires_at,
+                        existing_id,
+                        guild_id,
+                    ),
+                )
+                await conn.commit()
+                return existing_id
+
+            cursor = await conn.execute(
+                """
+                INSERT INTO server_memories (
+                    guild_id, memory_type, subject_user_id, subject_channel_id,
+                    key, value, metadata_json, status, source_type, confidence,
+                    required_approver_type, created_by_user_id, approved_by_user_id,
+                    source_message_id, created_at, updated_at, expires_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    guild_id,
+                    memory_type,
+                    subject_user_id,
+                    subject_channel_id,
+                    key,
+                    value,
+                    metadata_json,
+                    status,
+                    source_type,
+                    confidence,
+                    required_approver_type,
+                    created_by_user_id,
+                    approved_by_user_id,
+                    source_message_id,
+                    now_iso,
+                    now_iso,
+                    expires_at,
+                ),
+            )
+            await conn.commit()
+            return int(cursor.lastrowid or 0)
+
+    async def update_server_memory_status(
+        self,
+        memory_id: int,
+        *,
+        guild_id: int,
+        status: str,
+        approved_by_user_id: int | None = None,
+    ) -> bool:
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE server_memories
+                SET status = ?, approved_by_user_id = COALESCE(?, approved_by_user_id), updated_at = ?
+                WHERE id = ? AND guild_id = ?
+                """,
+                (status, approved_by_user_id, self._now_iso(), memory_id, guild_id),
+            )
+            await conn.commit()
+            return cursor.rowcount > 0
+
+    async def update_server_memory_value(
+        self,
+        memory_id: int,
+        *,
+        guild_id: int,
+        value: str,
+        key: str | None = None,
+        metadata_json: str | None = None,
+    ) -> bool:
+        updates = ["value = ?", "updated_at = ?"]
+        values: list[Any] = [value, self._now_iso()]
+        if key is not None:
+            updates.append("key = ?")
+            values.append(key)
+        if metadata_json is not None:
+            updates.append("metadata_json = ?")
+            values.append(metadata_json)
+        values.extend([memory_id, guild_id])
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                f"UPDATE server_memories SET {', '.join(updates)} WHERE id = ? AND guild_id = ?",
+                tuple(values),
+            )
+            await conn.commit()
+            return cursor.rowcount > 0
+
+    async def get_server_memory(self, guild_id: int, memory_id: int) -> dict[str, Any] | None:
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                "SELECT * FROM server_memories WHERE guild_id = ? AND id = ?",
+                (guild_id, memory_id),
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def list_server_memories(
+        self,
+        guild_id: int,
+        *,
+        memory_type: str | None = None,
+        status: str | None = None,
+        subject_user_id: int | None = None,
+        subject_channel_id: int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses = ["guild_id = ?"]
+        values: list[Any] = [guild_id]
+        if memory_type:
+            clauses.append("memory_type = ?")
+            values.append(memory_type)
+        if status:
+            clauses.append("status = ?")
+            values.append(status)
+        if subject_user_id is not None:
+            clauses.append("subject_user_id = ?")
+            values.append(subject_user_id)
+        if subject_channel_id is not None:
+            clauses.append("subject_channel_id = ?")
+            values.append(subject_channel_id)
+        values.append(max(1, min(int(limit), 500)))
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                f"""
+                SELECT *
+                FROM server_memories
+                WHERE {' AND '.join(clauses)}
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                tuple(values),
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def expire_server_memories(self, guild_id: int, now_iso: str | None = None) -> int:
+        now_iso = now_iso or self._now_iso()
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE server_memories
+                SET status = 'expired', updated_at = ?
+                WHERE guild_id = ?
+                  AND status = 'pending'
+                  AND expires_at IS NOT NULL
+                  AND expires_at <= ?
+                """,
+                (now_iso, guild_id, now_iso),
+            )
+            await conn.commit()
+            return int(cursor.rowcount or 0)
+
+    async def clear_server_memories(self, guild_id: int) -> None:
+        async with self._connect() as conn:
+            await conn.execute(
+                """
+                UPDATE server_memories
+                SET status = 'archived', updated_at = ?
+                WHERE guild_id = ? AND status IN ('active', 'pending')
+                """,
+                (self._now_iso(), guild_id),
+            )
+            await conn.commit()
+
+    async def count_server_memories_by_status(self, guild_id: int) -> list[dict[str, Any]]:
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT memory_type, status, COUNT(*) AS count
+                FROM server_memories
+                WHERE guild_id = ?
+                GROUP BY memory_type, status
+                ORDER BY memory_type, status
+                """,
+                (guild_id,),
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
     async def get_server_context_entries(self, guild_id: int) -> list[dict[str, Any]]:
         async with self._connect() as conn:
             cursor = await conn.execute(
@@ -1836,15 +2160,35 @@ class Database:
         speaker: str,
         content: str,
         message_id: int | None = None,
+        author_user_id: int | None = None,
+        parent_message_id: int | None = None,
+        action_type: str | None = None,
+        resolved_request: str | None = None,
     ) -> None:
         async with self._connect() as conn:
             await conn.execute(
                 """
                 INSERT INTO ai_conversation_turns
-                (guild_id, channel_id, role, speaker, content, message_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (
+                    guild_id, channel_id, role, speaker, content, message_id,
+                    author_user_id, parent_message_id, action_type, resolved_request,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (guild_id, channel_id, role, speaker, content, message_id, self._now_iso()),
+                (
+                    guild_id,
+                    channel_id,
+                    role,
+                    speaker,
+                    content,
+                    message_id,
+                    author_user_id,
+                    parent_message_id,
+                    action_type,
+                    resolved_request,
+                    self._now_iso(),
+                ),
             )
             # Keep a rolling window per channel to avoid unbounded growth.
             await conn.execute(
@@ -1893,7 +2237,8 @@ class Database:
         async with self._connect() as conn:
             cursor = await conn.execute(
                 """
-                SELECT role, speaker, content
+                SELECT role, speaker, content, message_id, author_user_id,
+                       parent_message_id, action_type, resolved_request
                 FROM ai_conversation_turns
                 WHERE guild_id = ? AND channel_id = ?
                 ORDER BY id DESC
@@ -1908,6 +2253,11 @@ class Database:
                     "role": str(row["role"]),
                     "speaker": str(row["speaker"]),
                     "content": str(row["content"]),
+                    "message_id": "" if row["message_id"] is None else str(row["message_id"]),
+                    "author_user_id": "" if row["author_user_id"] is None else str(row["author_user_id"]),
+                    "parent_message_id": "" if row["parent_message_id"] is None else str(row["parent_message_id"]),
+                    "action_type": "" if row["action_type"] is None else str(row["action_type"]),
+                    "resolved_request": "" if row["resolved_request"] is None else str(row["resolved_request"]),
                 }
                 for row in rows
             ]
@@ -1944,6 +2294,54 @@ class Database:
                 for row in rows
             ]
 
+    async def get_ai_turn_by_message_id(
+        self,
+        guild_id: int,
+        channel_id: int,
+        message_id: int,
+    ) -> dict[str, str] | None:
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT id, guild_id, channel_id, role, speaker, content, message_id,
+                       author_user_id, parent_message_id, action_type, resolved_request, created_at
+                FROM ai_conversation_turns
+                WHERE guild_id = ? AND channel_id = ? AND message_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (guild_id, channel_id, message_id),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            return {key: "" if row[key] is None else str(row[key]) for key in row.keys()}
+
+    async def get_ai_parent_chain(
+        self,
+        guild_id: int,
+        channel_id: int,
+        message_id: int,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, str]]:
+        chain: list[dict[str, str]] = []
+        current_message_id: int | None = message_id
+        seen: set[int] = set()
+        while current_message_id is not None and len(chain) < limit and current_message_id not in seen:
+            seen.add(current_message_id)
+            row = await self.get_ai_turn_by_message_id(guild_id, channel_id, current_message_id)
+            if row is None:
+                break
+            chain.append(row)
+            parent = row.get("parent_message_id") or ""
+            try:
+                current_message_id = int(parent) if parent else None
+            except ValueError:
+                current_message_id = None
+        chain.reverse()
+        return chain
+
     async def _ensure_guild_settings_columns(self, conn: aiosqlite.Connection) -> None:
         cursor = await conn.execute("PRAGMA table_info(guild_settings)")
         rows = await cursor.fetchall()
@@ -1960,5 +2358,21 @@ class Database:
         if "message_id" not in column_names:
             await conn.execute(
                 "ALTER TABLE ai_conversation_turns ADD COLUMN message_id INTEGER"
+            )
+        if "author_user_id" not in column_names:
+            await conn.execute(
+                "ALTER TABLE ai_conversation_turns ADD COLUMN author_user_id INTEGER"
+            )
+        if "parent_message_id" not in column_names:
+            await conn.execute(
+                "ALTER TABLE ai_conversation_turns ADD COLUMN parent_message_id INTEGER"
+            )
+        if "action_type" not in column_names:
+            await conn.execute(
+                "ALTER TABLE ai_conversation_turns ADD COLUMN action_type TEXT"
+            )
+        if "resolved_request" not in column_names:
+            await conn.execute(
+                "ALTER TABLE ai_conversation_turns ADD COLUMN resolved_request TEXT"
             )
 
