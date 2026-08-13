@@ -11,6 +11,7 @@ from io import BytesIO
 import discord
 from discord.ext import commands, tasks
 
+from services.admin_actions import AdminActionService
 from services.modlog import send_modlog_embed
 from utils.discord_helpers import (
     WARNING_ROLE_NAMES,
@@ -49,6 +50,7 @@ DEFAULT_COLOR_ROLES: list[tuple[str, str]] = [
 class ModerationCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self.admin_actions = AdminActionService(bot)
         self.temp_action_worker.start()
 
     def cog_unload(self) -> None:
@@ -1263,6 +1265,21 @@ class ModerationCog(commands.Cog):
         guild = member.guild
         lang = await self._lang(guild)
         logged_at = datetime.now(timezone.utc)
+        try:
+            recorded = await self.bot.db.record_member_join(
+                guild.id,
+                member.id,
+                member.joined_at or logged_at,
+            )
+            logging.info(
+                "member_event_recorded guild_id=%s user_id=%s event_type=join occurred_at=%s duplicate_prevented=%s listener_source=moderation",
+                guild.id,
+                member.id,
+                (member.joined_at or logged_at).isoformat(),
+                not recorded,
+            )
+        except Exception:
+            logging.exception("Failed to record member join event guild_id=%s user_id=%s", guild.id, member.id)
         embed = discord.Embed(
             title=tr(lang, "Server join event", "Evento de ingreso al servidor"),
             color=discord.Color.green(),
@@ -1294,6 +1311,17 @@ class ModerationCog(commands.Cog):
         guild = member.guild
         lang = await self._lang(guild)
         logged_at = datetime.now(timezone.utc)
+        try:
+            recorded = await self.bot.db.record_member_leave(guild.id, member.id, logged_at)
+            logging.info(
+                "member_event_recorded guild_id=%s user_id=%s event_type=leave occurred_at=%s duplicate_prevented=%s listener_source=moderation",
+                guild.id,
+                member.id,
+                logged_at.isoformat(),
+                not recorded,
+            )
+        except Exception:
+            logging.exception("Failed to record member leave event guild_id=%s user_id=%s", guild.id, member.id)
 
         last_message = await self._find_last_member_message(guild, member.id)
         if last_message is None:
@@ -2136,6 +2164,19 @@ class ModerationCog(commands.Cog):
             )
             return
 
+        result = await self.admin_actions.set_channel_lock(
+            ctx.guild,
+            ctx.author,
+            channel,
+            locked=True,
+            lang=lang,
+        )
+        if result.success:
+            await self._send_success(ctx, result.message)
+            return
+        await self._safe_send(ctx, result.message)
+        return
+
         overwrite = channel.overwrites_for(ctx.guild.default_role)
         if overwrite.send_messages is False:
             await self._safe_send(
@@ -2223,6 +2264,19 @@ class ModerationCog(commands.Cog):
                 resolve_error or tr(lang, "Text channel not found.", "Canal de texto no encontrado."),
             )
             return
+
+        result = await self.admin_actions.set_channel_lock(
+            ctx.guild,
+            ctx.author,
+            channel,
+            locked=False,
+            lang=lang,
+        )
+        if result.success:
+            await self._send_success(ctx, result.message)
+            return
+        await self._safe_send(ctx, result.message)
+        return
 
         overwrite = channel.overwrites_for(ctx.guild.default_role)
         if overwrite.send_messages is None:
@@ -3366,6 +3420,20 @@ class ModerationCog(commands.Cog):
 
         member = user
 
+        result = await self.admin_actions.mute_member(
+            ctx.guild,
+            ctx.author,
+            member,
+            reason=reason,
+            mute_mode="role_mute",
+            lang=lang,
+        )
+        if result.success:
+            await self._send_success(ctx, result.message)
+            return
+        await self._safe_send(ctx, result.message)
+        return
+
         can, msg = self._can_moderate(ctx.guild, ctx.author, member, lang)
         if not can:
             await self._safe_send(ctx, msg)
@@ -3438,6 +3506,19 @@ class ModerationCog(commands.Cog):
             return
 
         member = user
+
+        result = await self.admin_actions.unmute_member(
+            ctx.guild,
+            ctx.author,
+            member,
+            reason=reason,
+            lang=lang,
+        )
+        if result.success:
+            await self._send_success(ctx, result.message)
+            return
+        await self._safe_send(ctx, result.message)
+        return
 
         settings = await self.bot.db.get_guild_settings(ctx.guild.id)
         muted_role = ctx.guild.get_role(settings.muted_role_id or 0)
@@ -3695,6 +3776,22 @@ class ModerationCog(commands.Cog):
                 )
             )
             return
+
+        result = await self.admin_actions.mute_member(
+            ctx.guild,
+            ctx.author,
+            member,
+            duration_seconds=duration_seconds,
+            duration_label=duration_pretty,
+            reason=reason,
+            mute_mode="auto",
+            lang=lang,
+        )
+        if result.success:
+            await self._send_success(ctx, result.message)
+            return
+        await self._safe_send(ctx, result.message)
+        return
 
         reason_text = reason or tr(lang, "No reason provided.", "Sin raz\u00f3n proporcionada.")
         muted_role = await ensure_muted_role(

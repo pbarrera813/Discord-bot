@@ -54,6 +54,8 @@ class DiscordModBot(commands.Bot):
             settings.xai_model,
             vision_model=settings.xai_vision_model,
             image_model=settings.xai_image_model,
+            tts_voice=settings.xai_tts_voice,
+            tts_language=settings.xai_tts_language,
         )
         self.mc_client = McSrvStatClient()
         self.ninjas_client = (
@@ -74,6 +76,7 @@ class DiscordModBot(commands.Bot):
             ApiFootballClient(
                 api_key=settings.api_football_key,
                 base_url=settings.api_football_base_url,
+                timezone_name=settings.api_football_timezone,
             )
             if settings.api_football_key
             else None

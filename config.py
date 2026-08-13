@@ -14,9 +14,12 @@ class Settings:
     api_ninjas_key: str
     api_football_key: str
     api_football_base_url: str
+    api_football_timezone: str
     xai_model: str
     xai_vision_model: str
     xai_image_model: str
+    xai_tts_voice: str
+    xai_tts_language: str
     xai_web_search_enabled: bool
     xai_x_search_enabled: bool
     xai_web_search_max_sources: int
@@ -40,10 +43,13 @@ def load_settings() -> Settings:
         "API_FOOTBALL_BASE_URL",
         "https://v3.football.api-sports.io",
     ).strip() or "https://v3.football.api-sports.io"
+    api_football_timezone = os.getenv("API_FOOTBALL_TIMEZONE", "America/Mexico_City").strip() or "America/Mexico_City"
     xai_model = os.getenv("XAI_MODEL", "grok-4-1-fast-reasoning").strip()
     xai_vision_model = os.getenv("XAI_VISION_MODEL", xai_model).strip() or xai_model
     xai_image_model = os.getenv("XAI_IMAGE_MODEL", "grok-imagine-image-quality").strip()
     xai_image_model = xai_image_model or "grok-imagine-image-quality"
+    xai_tts_voice = os.getenv("XAI_TTS_VOICE", "iris").strip() or "iris"
+    xai_tts_language = os.getenv("XAI_TTS_LANGUAGE", "es-MX").strip() or "es-MX"
     xai_web_search_enabled = _env_bool("XAI_WEB_SEARCH_ENABLED", default=False)
     xai_x_search_enabled = _env_bool("XAI_X_SEARCH_ENABLED", default=False)
     xai_web_search_max_sources = _env_int("XAI_WEB_SEARCH_MAX_SOURCES", default=3, minimum=1, maximum=5)
@@ -77,9 +83,12 @@ def load_settings() -> Settings:
         api_ninjas_key=api_ninjas_key,
         api_football_key=api_football_key,
         api_football_base_url=api_football_base_url,
+        api_football_timezone=api_football_timezone,
         xai_model=xai_model,
         xai_vision_model=xai_vision_model,
         xai_image_model=xai_image_model,
+        xai_tts_voice=xai_tts_voice,
+        xai_tts_language=xai_tts_language,
         xai_web_search_enabled=xai_web_search_enabled,
         xai_x_search_enabled=xai_x_search_enabled,
         xai_web_search_max_sources=xai_web_search_max_sources,

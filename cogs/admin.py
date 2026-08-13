@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import logging
 import re
@@ -9,6 +11,7 @@ from discord.ext import commands, tasks
 
 from services.database import AI_INTERACTIONS_CONTEXT_CHANNEL_ID
 from services.server_memory import ServerMemoryInput, ServerMemoryService
+from services.voice_messages import ALLOWED_TTS_TAGS
 from utils.i18n import normalize_language, tr
 from utils.permissions import owner_or_has_permissions
 
@@ -33,6 +36,9 @@ HELP_SECTION_ALIASES: dict[str, str] = {
     "ai": "general",
     "ia": "general",
     "chat": "general",
+    "voice": "voice",
+    "voz": "voice",
+    "audio": "voice",
     "coding": "coding",
     "code": "coding",
     "programming": "coding",
@@ -44,6 +50,10 @@ HELP_SECTION_ALIASES: dict[str, str] = {
     "ligamx": "sports",
     "fun": "fun",
     "diversion": "fun",
+    "utility": "utility",
+    "utilities": "utility",
+    "utilidad": "utility",
+    "utilidades": "utility",
     "moderation": "moderation",
     "mod": "moderation",
     "moderacion": "moderation",
@@ -62,10 +72,12 @@ HELP_SECTION_LABELS_EN: dict[str, str] = {
     "basic": "basic",
     "sections": "sections",
     "general": "general",
+    "voice": "voice",
     "birthday": "birthday",
     "coding": "coding",
     "sports": "sports",
     "fun": "fun",
+    "utility": "utility",
     "moderation": "moderation",
     "admin": "admin",
     "announcements": "announcements",
@@ -76,14 +88,234 @@ HELP_SECTION_LABELS_ES: dict[str, str] = {
     "basic": "basico",
     "sections": "secciones",
     "general": "general",
+    "voice": "voz",
     "birthday": "cumpleaños",
     "coding": "programacion",
     "sports": "deportes",
     "fun": "diversion",
+    "utility": "utilidad",
     "moderation": "moderacion",
     "admin": "admin",
     "announcements": "anuncios",
     "variables": "variables",
+}
+
+@dataclass(frozen=True)
+class HelpCommandSpec:
+    path: str
+    section: str
+    usage_en: str
+    usage_es: str
+    description_en: str
+    description_es: str
+    access: str = "everyone"
+    aliases: tuple[str, ...] = ()
+    material_options: tuple[str, ...] = ()
+    material_choices: tuple[str, ...] = ()
+    show_to_all: bool = False
+
+
+@dataclass(frozen=True)
+class HelpCapabilitySpec:
+    key: str
+    section: str
+    title_en: str
+    title_es: str
+    body_en: str
+    body_es: str
+    access: str = "everyone"
+
+
+HELP_ACCESS_EN: dict[str, str] = {
+    "everyone": "",
+    "manage_messages": "Requires Manage Messages.",
+    "moderator": "Requires moderator permissions.",
+    "manage_guild": "Requires Manage Server or Administrator.",
+    "administrator": "Requires Administrator.",
+}
+
+HELP_ACCESS_ES: dict[str, str] = {
+    "everyone": "",
+    "manage_messages": "Requiere Gestionar mensajes.",
+    "moderator": "Requiere permisos de moderación.",
+    "manage_guild": "Requiere Gestionar servidor o Administrador.",
+    "administrator": "Requiere Administrador.",
+}
+
+HELP_INTENTIONAL_EXCLUSIONS: dict[str, str] = {}
+
+
+HELP_COMMANDS: tuple[HelpCommandSpec, ...] = (
+    HelpCommandSpec("help", "general", "/help [section]", "/help [sección]", "Open this paginated guide.", "Abre esta guía por páginas."),
+    HelpCommandSpec("setup", "general", "/setup", "/setup", "Show setup and capability summary.", "Muestra resumen de configuración y capacidades."),
+    HelpCommandSpec("translate", "general", "/translate <language> [text]", "/translate <idioma> [texto]", "Translate provided or replied text.", "Traduce texto escrito o respondido."),
+    HelpCommandSpec("roast", "fun", "/roast <user|id|name>", "/roast <usuario|id|nombre>", "Playful AI roast using server vibe.", "Roast juguetón con la vibra del servidor."),
+    HelpCommandSpec("roastme", "fun", "/roastme", "/roastme", "Roast yourself.", "Roast para ti."),
+    HelpCommandSpec("say", "voice", "/say mensaje:<text> modo:<text|voice>", "/say mensaje:<texto> modo:<text|voice>", "Make Nitori send text or a native voice message.", "Haz que Nitori mande texto o mensaje de voz nativo.", access="manage_messages", material_options=("mensaje", "modo"), material_choices=("modo=text|voice",), show_to_all=True),
+    HelpCommandSpec("remindme", "fun", "/remindme <time> <message>", "/remindme <tiempo> <mensaje>", "Create a reminder. Units: m, h, d, w, mo, y.", "Crea un recordatorio. Unidades: m, h, d, w, mo, y."),
+    HelpCommandSpec("unremindme", "fun", "/unremindme <reminder>", "/unremindme <recordatorio>", "Remove one of your reminders.", "Elimina uno de tus recordatorios."),
+    HelpCommandSpec("srvstatus", "utility", "/srvstatus <ip-or-domain>", "/srvstatus <ip-o-dominio>", "Check Minecraft server status.", "Revisa el estado de un servidor de Minecraft."),
+    HelpCommandSpec("joke", "fun", "/joke", "/joke", "Random joke.", "Chiste aleatorio."),
+    HelpCommandSpec("dadjoke", "fun", "/dadjoke", "/dadjoke", "Random dad joke.", "Chiste de papá aleatorio."),
+    HelpCommandSpec("advice", "fun", "/advice", "/advice", "Random advice.", "Consejo aleatorio."),
+    HelpCommandSpec("whois", "utility", "/whois <domain>", "/whois <dominio>", "Domain WHOIS info.", "Información WHOIS de dominio."),
+    HelpCommandSpec("convert", "utility", "/convert <amount> <from> <to>", "/convert <cantidad> <desde> <hacia>", "Unit conversion.", "Conversión de unidades.", material_options=("from", "to")),
+    HelpCommandSpec("code", "coding", "/code code:<code> language:<language> [file]", "/code code:<código> language:<lenguaje> [file]", "Compile/run c, c#, cpp, python, java, javascript, or rust.", "Compila/ejecuta c, c#, cpp, python, java, javascript o rust.", material_options=("code", "language", "file"), material_choices=("c", "c#", "cpp", "python", "java", "javascript", "rust")),
+    HelpCommandSpec("codelangs", "coding", "/codelangs", "/codelangs", "List supported /code languages.", "Lista lenguajes soportados por /code.", aliases=("runlangs",)),
+    HelpCommandSpec("meme", "fun", "/meme", "/meme", "Show meme command prompt.", "Muestra ayuda rápida de memes."),
+    HelpCommandSpec("meme templates", "fun", "/meme templates [query]", "/meme templates [búsqueda]", "List meme templates.", "Lista plantillas de meme."),
+    HelpCommandSpec("meme help", "fun", "/meme help", "/meme help", "Detailed meme guide.", "Guía detallada de memes."),
+    HelpCommandSpec("meme create", "fun", "/meme create <template> <top> [bottom]", "/meme create <plantilla> <arriba> [abajo]", "Create a template meme.", "Crea un meme con plantilla."),
+    HelpCommandSpec("meme random", "fun", "/meme random <top> [bottom]", "/meme random <arriba> [abajo]", "Create a random-template meme.", "Crea un meme con plantilla aleatoria."),
+    HelpCommandSpec("meme custom", "fun", "/meme custom <image_url|attachment> <top> [bottom]", "/meme custom <url|adjunto> <arriba> [abajo]", "Create a meme from URL or attachment.", "Crea un meme desde URL o adjunto."),
+    HelpCommandSpec("meme fonts", "fun", "/meme fonts [query]", "/meme fonts [búsqueda]", "List meme fonts.", "Lista fuentes de meme."),
+    HelpCommandSpec("speech", "fun", "/speech <user>", "/speech <usuario>", "Speech bubble avatar meme.", "Meme de burbuja de diálogo."),
+    HelpCommandSpec("football", "sports", "/football <league>", "/football <liga>", "Live football fallback for a selected league.", "Atajo de partidos en vivo para una liga."),
+    HelpCommandSpec("football live", "sports", "/football live <league>", "/football live <liga>", "Live matches now.", "Partidos en vivo ahora."),
+    HelpCommandSpec("football today", "sports", "/football today <league>", "/football today <liga>", "Today's fixtures.", "Partidos de hoy."),
+    HelpCommandSpec("football next", "sports", "/football next <league> [count|team]", "/football next <liga> [cantidad|equipo]", "Next fixtures or next team match.", "Próximos partidos o próximo partido de equipo."),
+    HelpCommandSpec("football last", "sports", "/football last <league> <team>", "/football last <liga> <equipo>", "Last played team match.", "Último partido jugado de un equipo."),
+    HelpCommandSpec("football table", "sports", "/football table <league>", "/football table <liga>", "League standings.", "Tabla de posiciones."),
+    HelpCommandSpec("football team", "sports", "/football team <league> <team>", "/football team <liga> <equipo>", "Team snapshot and form.", "Datos del equipo y forma reciente."),
+    HelpCommandSpec("football scorers", "sports", "/football scorers <league>", "/football scorers <liga>", "Top scorers.", "Tabla de goleadores."),
+    HelpCommandSpec("football match", "sports", "/football match <fixture_id|team>", "/football match <fixture_id|equipo>", "Match center by fixture ID or team.", "Centro de partido por ID o equipo."),
+    HelpCommandSpec("football schedule", "sports", "/football schedule <team|league> [next|last|season]", "/football schedule <equipo|liga> [next|last|season]", "Fixture schedule.", "Calendario de partidos."),
+    HelpCommandSpec("football player", "sports", "/football player <player>", "/football player <jugador>", "Player profile and season stats.", "Perfil y estadísticas de jugador."),
+    HelpCommandSpec("football lineup", "sports", "/football lineup <fixture_id>", "/football lineup <fixture_id>", "Confirmed fixture lineups.", "Alineaciones confirmadas."),
+    HelpCommandSpec("football stats", "sports", "/football stats <fixture_id>", "/football stats <fixture_id>", "Fixture statistics.", "Estadísticas del partido."),
+    HelpCommandSpec("football injuries", "sports", "/football injuries <team>", "/football injuries <equipo>", "Injuries/unavailable players.", "Lesiones/jugadores no disponibles."),
+    HelpCommandSpec("football transfers", "sports", "/football transfers <team>", "/football transfers <equipo>", "Recent transfers.", "Transferencias recientes."),
+    HelpCommandSpec("football h2h", "sports", "/football h2h <team_a> <team_b>", "/football h2h <equipo_a> <equipo_b>", "Head-to-head matches.", "Historial entre equipos."),
+    HelpCommandSpec("football top", "sports", "/football top <scorers|assists|yellowcards|redcards>", "/football top <scorers|assists|yellowcards|redcards>", "Top scorers, assists, yellow cards, or red cards.", "Líderes de goles, asistencias, amarillas o rojas.", material_choices=("scorers", "assists", "yellowcards", "redcards")),
+    HelpCommandSpec("football preview", "sports", "/football preview <fixture_id>", "/football preview <fixture_id>", "Data-only match preview.", "Previa del partido con datos."),
+    HelpCommandSpec("football summary", "sports", "/football summary <fixture_id>", "/football summary <fixture_id>", "Data-only match summary.", "Resumen del partido con datos."),
+    HelpCommandSpec("birthday", "birthday", "/birthday", "/birthday", "Birthday command prompt.", "Ayuda rápida de cumpleaños."),
+    HelpCommandSpec("birthday set", "birthday", "/birthday set <MM-DD|DD/MM> [year]", "/birthday set <MM-DD|DD/MM> [año]", "Save your birthday.", "Guarda tu cumpleaños."),
+    HelpCommandSpec("birthday remove", "birthday", "/birthday remove", "/birthday remove", "Remove your birthday data.", "Elimina tus datos de cumpleaños."),
+    HelpCommandSpec("birthday cleardata", "birthday", "/birthday cleardata", "/birthday cleardata", "Alias of /birthday remove.", "Alias de /birthday remove."),
+    HelpCommandSpec("birthday view", "birthday", "/birthday view [user]", "/birthday view [usuario]", "View birthday info.", "Consulta cumpleaños."),
+    HelpCommandSpec("birthday next", "birthday", "/birthday next [count]", "/birthday next [cantidad]", "Upcoming birthdays.", "Próximos cumpleaños."),
+    HelpCommandSpec("birthday setup", "birthday", "/birthday setup [channel] [role]", "/birthday setup [canal] [rol]", "Quick server birthday setup.", "Configuración rápida de cumpleaños.", access="administrator"),
+    HelpCommandSpec("birthday channel", "birthday", "/birthday channel [#channel]", "/birthday channel [#canal]", "Set/clear birthday channel.", "Define/limpia canal de cumpleaños.", access="administrator"),
+    HelpCommandSpec("birthday role", "birthday", "/birthday role [@role]", "/birthday role [@rol]", "Set/clear birthday role.", "Define/limpia rol de cumpleaños.", access="administrator"),
+    HelpCommandSpec("birthday timezone", "birthday", "/birthday timezone <iana_tz>", "/birthday timezone <zona_iana>", "Set server birthday timezone.", "Define zona horaria de cumpleaños.", access="administrator"),
+    HelpCommandSpec("birthday mode", "birthday", "/birthday mode <user|server>", "/birthday mode <user|server>", "Choose birthday timezone mode.", "Elige modo de zona horaria.", access="administrator", material_choices=("user", "server")),
+    HelpCommandSpec("birthday ages", "birthday", "/birthday ages <true|false>", "/birthday ages <true|false>", "Show or hide ages.", "Muestra u oculta edades.", access="administrator"),
+    HelpCommandSpec("birthday event", "birthday", "/birthday event <default|year|join|server|disable> [color] [image] [message]", "/birthday event <default|year|join|server|disable> [color] [image] [message]", "Configure birthday/anniversary events.", "Configura eventos de cumpleaños/aniversario.", access="administrator"),
+    HelpCommandSpec("birthday preview", "birthday", "/birthday preview <default|year|server|user>", "/birthday preview <default|year|server|user>", "Preview birthday event output.", "Vista previa del evento.", access="administrator"),
+    HelpCommandSpec("birthday templateadd", "birthday", "/birthday templateadd <type> <template>", "/birthday templateadd <tipo> <plantilla>", "Add custom event template.", "Agrega plantilla personalizada.", access="administrator"),
+    HelpCommandSpec("birthday templatelist", "birthday", "/birthday templatelist <type>", "/birthday templatelist <tipo>", "List custom templates.", "Lista plantillas personalizadas.", access="administrator"),
+    HelpCommandSpec("birthday templateremove", "birthday", "/birthday templateremove <type> <id>", "/birthday templateremove <tipo> <id>", "Remove custom template.", "Elimina plantilla personalizada.", access="administrator"),
+    HelpCommandSpec("birthday blacklistuser", "birthday", "/birthday blacklistuser <user> <true|false>", "/birthday blacklistuser <usuario> <true|false>", "Exclude/include a user.", "Excluye/incluye usuario.", access="administrator"),
+    HelpCommandSpec("birthday blacklistrole", "birthday", "/birthday blacklistrole <role> <true|false>", "/birthday blacklistrole <rol> <true|false>", "Exclude/include a role.", "Excluye/incluye rol.", access="administrator"),
+    HelpCommandSpec("birthday trusted", "birthday", "/birthday trusted [role] [blockmessage] [blockrole] [blocklist]", "/birthday trusted [rol] [blockmessage] [blockrole] [blocklist]", "Trusted-role restrictions.", "Restricciones por rol confiable.", access="administrator"),
+    HelpCommandSpec("message", "moderation", "/message", "/message", "Message moderation prompt.", "Ayuda rápida de moderación de mensajes.", access="moderator"),
+    HelpCommandSpec("message delete", "moderation", "/message delete <amount>", "/message delete <cantidad>", "Delete recent messages.", "Borra mensajes recientes.", access="manage_messages"),
+    HelpCommandSpec("message clear", "moderation", "/message clear [#channel]", "/message clear [#canal]", "Clear messages in a channel.", "Limpia mensajes de un canal.", access="moderator"),
+    HelpCommandSpec("message purgeuser", "moderation", "/message purgeuser <user> <amount>", "/message purgeuser <usuario> <cantidad>", "Delete messages from one user.", "Borra mensajes de un usuario.", access="manage_messages"),
+    HelpCommandSpec("channel", "moderation", "/channel", "/channel", "Channel management prompt.", "Ayuda rápida de canales.", access="moderator"),
+    HelpCommandSpec("channel add", "moderation", "/channel add <name>", "/channel add <nombre>", "Create a text channel.", "Crea un canal de texto.", access="moderator"),
+    HelpCommandSpec("channel delete", "moderation", "/channel delete <#channel>", "/channel delete <#canal>", "Delete a text channel.", "Elimina un canal.", access="moderator"),
+    HelpCommandSpec("channel clear", "moderation", "/channel clear [#channel]", "/channel clear [#canal]", "Clear messages in a channel.", "Limpia mensajes de un canal.", access="moderator"),
+    HelpCommandSpec("channel clone", "moderation", "/channel clone [#channel]", "/channel clone [#canal]", "Clone channel settings.", "Clona configuración del canal.", access="moderator"),
+    HelpCommandSpec("channel lock", "moderation", "/channel lock [#channel]", "/channel lock [#canal]", "Lock posting permissions.", "Bloquea envío de mensajes.", access="moderator"),
+    HelpCommandSpec("channel unlock", "moderation", "/channel unlock [#channel]", "/channel unlock [#canal]", "Restore posting permissions.", "Restaura envío de mensajes.", access="moderator"),
+    HelpCommandSpec("channel slowmode", "moderation", "/channel slowmode <#channel> <seconds|disable>", "/channel slowmode <#canal> <segundos|disable>", "Set or disable slowmode.", "Configura o desactiva slowmode.", access="moderator"),
+    HelpCommandSpec("user", "moderation", "/user", "/user", "Member moderation prompt.", "Ayuda rápida de miembros.", access="moderator"),
+    HelpCommandSpec("user info", "moderation", "/user info <user>", "/user info <usuario>", "Show server member info.", "Muestra info del miembro.", access="moderator"),
+    HelpCommandSpec("user setnick", "moderation", "/user setnick <user> <nickname>", "/user setnick <usuario> <apodo>", "Change nickname.", "Cambia apodo.", access="moderator"),
+    HelpCommandSpec("user mute", "moderation", "/user mute <user> [reason]", "/user mute <usuario> [razón]", "Mute a member.", "Silencia a un miembro.", access="moderator"),
+    HelpCommandSpec("user unmute", "moderation", "/user unmute <user> [reason]", "/user unmute <usuario> [razón]", "Remove mute role.", "Quita silencio.", access="moderator"),
+    HelpCommandSpec("user kick", "moderation", "/user kick <user> [reason]", "/user kick <usuario> [razón]", "Kick a member.", "Expulsa a un miembro.", access="moderator"),
+    HelpCommandSpec("user ban", "moderation", "/user ban <user> [reason]", "/user ban <usuario> [razón]", "Ban a member.", "Banea a un miembro.", access="moderator"),
+    HelpCommandSpec("user unban", "moderation", "/user unban <user_id> [reason]", "/user unban <id_usuario> [razón]", "Unban by ID.", "Desbanea por ID.", access="moderator"),
+    HelpCommandSpec("user tempmute", "moderation", "/user tempmute <user> <time> [reason]", "/user tempmute <usuario> <tiempo> [razón]", "Temporary mute.", "Silencio temporal.", access="moderator"),
+    HelpCommandSpec("user tempban", "moderation", "/user tempban <user> <time> [reason]", "/user tempban <usuario> <tiempo> [razón]", "Temporary ban.", "Ban temporal.", access="moderator"),
+    HelpCommandSpec("user warn", "moderation", "/user warn <user> [reason]", "/user warn <usuario> [razón]", "Add a warning.", "Agrega advertencia.", access="moderator"),
+    HelpCommandSpec("user unwarn", "moderation", "/user unwarn <user> <1|2|3>", "/user unwarn <usuario> <1|2|3>", "Remove a warning slot.", "Quita advertencia.", access="moderator"),
+    HelpCommandSpec("user warnings", "moderation", "/user warnings <user>", "/user warnings <usuario>", "List warnings.", "Lista advertencias.", access="moderator"),
+    HelpCommandSpec("user clearwarnings", "moderation", "/user clearwarnings <user> [reason]", "/user clearwarnings <usuario> [razón]", "Clear warnings.", "Limpia advertencias.", access="moderator"),
+    HelpCommandSpec("role", "moderation", "/role", "/role", "Role moderation prompt.", "Ayuda rápida de roles.", access="moderator"),
+    HelpCommandSpec("role add", "moderation", "/role add <user> <role>", "/role add <usuario> <rol>", "Add a role.", "Agrega un rol.", access="moderator"),
+    HelpCommandSpec("role remove", "moderation", "/role remove <user> <role>", "/role remove <usuario> <rol>", "Remove a role.", "Quita un rol.", access="moderator"),
+    HelpCommandSpec("role create", "moderation", "/role create <name> [color]", "/role create <nombre> [color]", "Create a role.", "Crea un rol.", access="moderator"),
+    HelpCommandSpec("color", "admin", "/color", "/color", "Color role prompt.", "Ayuda rápida de roles de color.", access="administrator"),
+    HelpCommandSpec("color setup", "admin", "/color setup", "/color setup", "Create default color roles.", "Crea roles de color por defecto.", access="administrator"),
+    HelpCommandSpec("color list", "admin", "/color list", "/color list", "Show public color panel.", "Muestra panel público de colores.", access="administrator"),
+    HelpCommandSpec("color channel", "admin", "/color channel <#channel>", "/color channel <#canal>", "Set color panel channel.", "Define canal del panel.", access="administrator"),
+    HelpCommandSpec("color reload", "admin", "/color reload", "/color reload", "Repost/update color panel.", "Republica/actualiza panel.", access="administrator"),
+    HelpCommandSpec("color add", "admin", "/color add <color> [name]", "/color add <color> [nombre]", "Add selectable color role.", "Agrega rol de color.", access="administrator"),
+    HelpCommandSpec("color remove", "admin", "/color remove <name>", "/color remove <nombre>", "Remove selectable color role.", "Elimina rol de color.", access="administrator"),
+    HelpCommandSpec("setmodlog", "admin", "/setmodlog [#channel]", "/setmodlog [#canal]", "Set moderation log channel.", "Define canal de logs.", access="manage_guild"),
+    HelpCommandSpec("setprefix", "admin", "/setprefix <new_prefix>", "/setprefix <nuevo_prefijo>", "Change server prefix.", "Cambia prefijo del servidor.", access="manage_guild"),
+    HelpCommandSpec("language", "admin", "/language <en|es>", "/language <en|es>", "Set command response language.", "Define idioma de comandos.", access="manage_guild", material_choices=("en", "es")),
+    HelpCommandSpec("setservercontext", "admin", "/setservercontext <#channel>", "/setservercontext <#canal>", "Analyze a channel and refresh AI server context.", "Analiza un canal y actualiza contexto IA.", access="manage_guild"),
+    HelpCommandSpec("resetservercontext", "admin", "/resetservercontext [summaries|memory|ai_history|all]", "/resetservercontext [summaries|memory|ai_history|all]", "Reset AI summaries, memory, history, or all.", "Limpia resúmenes, memoria, historial IA o todo.", access="manage_guild"),
+    HelpCommandSpec("viewservercontext", "admin", "/viewservercontext", "/viewservercontext", "View AI context and memory counts.", "Muestra contexto IA y conteos.", access="manage_guild"),
+    HelpCommandSpec("servercontext", "admin", "/servercontext", "/servercontext", "View structured server memory.", "Muestra memoria estructurada.", access="manage_guild"),
+    HelpCommandSpec("servercontext view", "admin", "/servercontext view", "/servercontext view", "View structured server memory.", "Muestra memoria estructurada.", access="manage_guild"),
+    HelpCommandSpec("servercontext remember", "admin", "/servercontext remember <type> <value> [user] [channel] [key]", "/servercontext remember <tipo> <valor> [usuario] [canal] [key]", "Store structured server memory.", "Guarda memoria estructurada.", access="manage_guild"),
+    HelpCommandSpec("servercontext forget", "admin", "/servercontext forget <memory_id>", "/servercontext forget <memory_id>", "Archive a memory.", "Archiva una memoria.", access="manage_guild"),
+    HelpCommandSpec("servercontext list", "admin", "/servercontext list [type] [status]", "/servercontext list [tipo] [estado]", "List memories.", "Lista memorias.", access="manage_guild"),
+    HelpCommandSpec("servercontext user", "admin", "/servercontext user <user>", "/servercontext user <usuario>", "List user memories.", "Lista memorias de usuario.", access="manage_guild"),
+    HelpCommandSpec("servercontext approve", "admin", "/servercontext approve <memory_id>", "/servercontext approve <memory_id>", "Approve pending memory.", "Aprueba memoria pendiente.", access="manage_guild"),
+    HelpCommandSpec("servercontext reject", "admin", "/servercontext reject <memory_id>", "/servercontext reject <memory_id>", "Reject pending memory.", "Rechaza memoria pendiente.", access="manage_guild"),
+    HelpCommandSpec("servercontext reset", "admin", "/servercontext reset <summaries|memory|ai_history|all>", "/servercontext reset <summaries|memory|ai_history|all>", "Reset one context scope.", "Reinicia un scope de contexto.", access="manage_guild"),
+    HelpCommandSpec("antispam", "admin", "/antispam <true|false>", "/antispam <true|false>", "Toggle anti-spam filter.", "Activa/desactiva anti-spam.", access="manage_guild"),
+    HelpCommandSpec("antilink", "admin", "/antilink <true|false>", "/antilink <true|false>", "Toggle anti-link filter.", "Activa/desactiva anti-links.", access="manage_guild"),
+    HelpCommandSpec("aichannel", "admin", "/aichannel", "/aichannel", "Show AI channel restrictions.", "Muestra restricciones de canales IA.", access="manage_guild"),
+    HelpCommandSpec("aichannel add", "admin", "/aichannel add <#channel>", "/aichannel add <#canal>", "Allow AI in one channel.", "Permite IA en un canal.", access="manage_guild"),
+    HelpCommandSpec("aichannel remove", "admin", "/aichannel remove <#channel>", "/aichannel remove <#canal>", "Remove an allowed AI channel.", "Quita canal permitido de IA.", access="manage_guild"),
+    HelpCommandSpec("aichannel list", "admin", "/aichannel list", "/aichannel list", "List AI-allowed channels.", "Lista canales permitidos para IA.", access="manage_guild"),
+    HelpCommandSpec("aichannel clear", "admin", "/aichannel clear", "/aichannel clear", "Allow AI in all channels.", "Permite IA en todos los canales.", access="manage_guild"),
+    HelpCommandSpec("welcome", "announcements", "/welcome show", "/welcome show", "Show welcome settings.", "Muestra configuración de bienvenida.", access="manage_guild"),
+    HelpCommandSpec("welcome show", "announcements", "/welcome show", "/welcome show", "Show welcome settings.", "Muestra configuración de bienvenida.", access="manage_guild"),
+    HelpCommandSpec("welcome set", "announcements", "/welcome set [channel] [mode] [message] [image] [color]", "/welcome set [canal] [modo] [mensaje] [imagen] [color]", "Set welcome output.", "Configura bienvenida.", access="manage_guild", material_choices=("mode=text|embed|both",)),
+    HelpCommandSpec("welcome edit", "announcements", "/welcome edit [message] [color] [mode] [image] [channel]", "/welcome edit [mensaje] [color] [modo] [imagen] [canal]", "Edit welcome options.", "Edita opciones de bienvenida.", access="manage_guild", material_choices=("mode=text|embed|both",)),
+    HelpCommandSpec("welcome test", "announcements", "/welcome test", "/welcome test", "Preview welcome output.", "Vista previa de bienvenida.", access="manage_guild"),
+    HelpCommandSpec("welcome preview", "announcements", "/welcome preview", "/welcome preview", "Alias of /welcome test.", "Alias de /welcome test.", access="manage_guild"),
+    HelpCommandSpec("goodbye", "announcements", "/goodbye show", "/goodbye show", "Show goodbye settings.", "Muestra configuración de despedida.", access="manage_guild"),
+    HelpCommandSpec("goodbye show", "announcements", "/goodbye show", "/goodbye show", "Show goodbye settings.", "Muestra configuración de despedida.", access="manage_guild"),
+    HelpCommandSpec("goodbye set", "announcements", "/goodbye set [channel] [mode] [message] [image] [color]", "/goodbye set [canal] [modo] [mensaje] [imagen] [color]", "Set goodbye output.", "Configura despedida.", access="manage_guild", material_choices=("mode=text|embed|both",)),
+    HelpCommandSpec("goodbye edit", "announcements", "/goodbye edit [message] [color] [mode] [image] [channel]", "/goodbye edit [mensaje] [color] [modo] [imagen] [canal]", "Edit goodbye options.", "Edita opciones de despedida.", access="manage_guild", material_choices=("mode=text|embed|both",)),
+    HelpCommandSpec("goodbye test", "announcements", "/goodbye test", "/goodbye test", "Preview goodbye output.", "Vista previa de despedida.", access="manage_guild"),
+    HelpCommandSpec("goodbye preview", "announcements", "/goodbye preview", "/goodbye preview", "Alias of /goodbye test.", "Alias de /goodbye test.", access="manage_guild"),
+)
+
+
+HELP_CAPABILITIES: tuple[HelpCapabilitySpec, ...] = (
+    HelpCapabilitySpec("ai_conversation", "general", "AI Conversation", "Conversación IA", "Mention Nitori, address it by name, reply to one of its AI messages, or continue a fresh same-user thread. Slash-command result embeds are ignored unless you explicitly mention Nitori in the reply.", "Menciona a Nitori, háblale por nombre, responde a uno de sus mensajes IA o continúa una conversación reciente. Las respuestas a embeds de comandos se ignoran salvo que menciones a Nitori explícitamente."),
+    HelpCapabilitySpec("image_context", "general", "Images", "Imágenes", "Nitori can analyze supported current/replied images and can generate or edit images when directly asked.", "Nitori puede analizar imágenes actuales/respondidas y generar o editar imágenes cuando se lo pides directamente."),
+    HelpCapabilitySpec("web_lookup", "utility", "Current Web Lookup", "Búsqueda web actual", "When web search is enabled, direct current/freshness questions can use web lookup. Normal chat does not browse automatically.", "Cuando la búsqueda web está activada, preguntas directas sobre información actual pueden usar web. El chat normal no navega automáticamente."),
+    HelpCapabilitySpec("football_ai", "sports", "Natural Football Questions", "Preguntas naturales de fútbol", "You can ask football questions in normal language. Nitori resolves teams, players, leagues, fixtures, dates, stats, standings, events, lineups, transfers, injuries, and match-center details through API-Football.", "Puedes hacer preguntas de fútbol en lenguaje natural. Nitori resuelve equipos, jugadores, ligas, partidos, fechas, estadísticas, tablas, eventos, alineaciones, transferencias, lesiones y centros de partido con API-Football."),
+    HelpCapabilitySpec("football_watch", "sports", "Live Watch", "Seguimiento en vivo", "Ask Nitori to follow a live match for compact updates. One AI-started watch can run per channel and stops at final time or timeout.", "Pídele a Nitori seguir un partido en vivo para actualizaciones compactas. Puede haber un seguimiento IA por canal y se detiene al final o por timeout."),
+    HelpCapabilitySpec("voice_conversation", "voice", "Conversational Voice", "Voz conversacional", "Any normal user can explicitly ask for the current AI response as a native Discord voice message. Voice applies to that one response only; the next turn returns to text unless voice is requested again.", "Cualquier usuario normal puede pedir explícitamente que la respuesta IA actual se entregue como mensaje de voz nativo de Discord. La voz aplica solo a esa respuesta; el siguiente turno vuelve a texto salvo que se pida voz otra vez."),
+    HelpCapabilitySpec("voice_tts", "voice", "TTS Details", "Detalles TTS", "Voice uses the configured xAI TTS voice, currently Iris with es-MX. It sends native Discord voice messages, not Discord tts=true and not voice-channel playback.", "La voz usa la voz xAI TTS configurada, actualmente Iris con es-MX. Envía mensajes de voz nativos de Discord, no Discord tts=true ni reproducción en canal de voz."),
+    HelpCapabilitySpec("voice_tags", "voice", "Expressive Tags", "Etiquetas expresivas", "In voice delivery, supported xAI expressive tags may be used when semantically appropriate: " + ", ".join(f"`[{tag}]`" for tag in sorted(ALLOWED_TTS_TAGS)), "En respuestas de voz, se pueden usar etiquetas expresivas de xAI cuando tengan sentido: " + ", ".join(f"`[{tag}]`" for tag in sorted(ALLOWED_TTS_TAGS))),
+)
+
+
+SERVER_CONTEXT_TOPIC_TERMS: dict[str, tuple[str, ...]] = {
+    "football": (
+        "football",
+        "futbol",
+        "fútbol",
+        "soccer",
+        "partido",
+        "liga",
+        "goles",
+        "gol",
+        "fixture",
+        "api-football",
+    ),
+    "gaming": ("game", "gaming", "juego", "videojuego", "minecraft", "steam", "xbox", "playstation"),
+    "technology": ("code", "codigo", "código", "programacion", "programación", "deploy", "api", "bot", "server"),
+}
+
+SERVER_CONTEXT_STYLE_TERMS: dict[str, tuple[str, ...]] = {
+    "informal and conversational": ("wey", "we", "bro", "jaja", "lol", "no manches", "cabron", "cabrón"),
+    "polite and direct": ("please", "por favor", "gracias", "thanks"),
+    "concise replies": ("resume", "resumen", "short", "corto", "breve", "rapido", "rápido"),
 }
 
 
@@ -237,7 +469,24 @@ class AdminCog(commands.Cog):
         if not lines:
             return None
 
-        transcript = "\n".join(lines)
+        pseudo_rows = [
+            {
+                "role": "user",
+                "speaker": line.split(":", 1)[0].strip() if ":" in line else "User",
+                "content": line.split(":", 1)[1].strip() if ":" in line else line,
+                "message_id": str(index),
+                "author_user_id": line.split(":", 1)[0].strip() if ":" in line else "User",
+                "parent_message_id": str(index // 4),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            for index, line in enumerate(lines)
+        ]
+        if not self._has_enough_interaction_context(pseudo_rows):
+            return None
+
+        transcript = self._interaction_rows_to_transcript(pseudo_rows)
+        if not transcript:
+            return None
         if len(transcript) > 22000:
             transcript = transcript[:22000]
 
@@ -262,45 +511,147 @@ class AdminCog(commands.Cog):
 
     @staticmethod
     def _has_enough_interaction_context(rows: list[dict[str, object]]) -> bool:
-        if len(rows) < 20:
+        eligible = AdminCog._eligible_server_context_rows(rows)
+        if len(eligible) < 12:
             return False
-
-        user_rows = [
-            row for row in rows if str(row.get("role", "")).strip().lower() == "user"
-        ]
-        if len(user_rows) < 8:
+        branches = AdminCog._distinct_context_branches(eligible)
+        users = AdminCog._distinct_context_users(eligible)
+        days = AdminCog._distinct_context_days(eligible)
+        if len(branches) < 3:
             return False
-
-        speakers = {
-            str(row.get("speaker", "")).strip().casefold()
-            for row in user_rows
-            if str(row.get("speaker", "")).strip()
-        }
-        if len(speakers) < 2:
+        if len(users) < 2 and len(days) < 2:
             return False
-
-        total_chars = sum(
-            len(str(row.get("content", "")).strip())
-            for row in rows
-        )
-        return total_chars >= 500
+        total_chars = sum(len(str(row.get("content", "")).strip()) for row in eligible)
+        return total_chars >= 240
 
     @staticmethod
     def _interaction_rows_to_transcript(rows: list[dict[str, object]]) -> str:
-        lines: list[str] = []
-        for row in rows:
-            speaker = str(row.get("speaker", "")).strip() or "User"
-            content = " ".join(str(row.get("content", "")).strip().split())
-            if not content:
-                continue
-            if not content.casefold().startswith(f"{speaker.casefold()}:"):
-                content = f"{speaker}: {content}"
-            if len(content) > 260:
-                content = f"{content[:257]}..."
-            lines.append(content)
-            if len(lines) >= 400:
-                break
+        eligible = AdminCog._eligible_server_context_rows(rows)
+        stable = AdminCog._stable_server_context_patterns(eligible)
+        if not any(stable.values()):
+            return ""
+        lines = [
+            "Eligible stable server patterns only. Summarize only these pre-qualified patterns.",
+            "Do not add names, matches, clubs, players, files, images, events, commands, or one-off details.",
+        ]
+        for label, key in (
+            ("Tone", "tone"),
+            ("Inside jokes/memes", "inside_jokes"),
+            ("Common topics", "common_topics"),
+            ("Personality style", "personality_style"),
+            ("How the bot should reply", "reply_style"),
+        ):
+            values = stable.get(key, [])
+            if values:
+                lines.append(f"{label}: {' | '.join(values[:6])}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _eligible_server_context_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+        eligible: list[dict[str, object]] = []
+        for row in rows:
+            if str(row.get("role", "")).strip().lower() != "user":
+                continue
+            content = " ".join(str(row.get("content", "")).strip().split())
+            if len(content) < 8:
+                continue
+            if AdminCog._is_context_line_suspicious(content):
+                continue
+            copy = dict(row)
+            copy["content"] = content
+            eligible.append(copy)
+        return eligible
+
+    @staticmethod
+    def _distinct_context_users(rows: list[dict[str, object]]) -> set[str]:
+        return {
+            str(row.get("author_user_id") or row.get("speaker") or "").strip().casefold()
+            for row in rows
+            if str(row.get("author_user_id") or row.get("speaker") or "").strip()
+        }
+
+    @staticmethod
+    def _context_branch_key(row: dict[str, object], index: int) -> str:
+        parent = str(row.get("parent_message_id") or "").strip()
+        if parent:
+            return parent
+        message_id = str(row.get("message_id") or "").strip()
+        channel_id = str(row.get("channel_id") or "").strip()
+        return f"{channel_id}:{message_id or index}"
+
+    @staticmethod
+    def _distinct_context_branches(rows: list[dict[str, object]]) -> set[str]:
+        return {AdminCog._context_branch_key(row, index) for index, row in enumerate(rows)}
+
+    @staticmethod
+    def _distinct_context_days(rows: list[dict[str, object]]) -> set[str]:
+        days: set[str] = set()
+        for row in rows:
+            raw = str(row.get("created_at") or "").strip()
+            if len(raw) >= 10:
+                days.add(raw[:10])
+        return days
+
+    @staticmethod
+    def _candidate_passes_context_threshold(rows: list[dict[str, object]]) -> bool:
+        if len(rows) < 3:
+            return False
+        if len(AdminCog._distinct_context_branches(rows)) < 2:
+            return False
+        if len(AdminCog._distinct_context_users(rows)) < 2 and len(AdminCog._distinct_context_days(rows)) < 2:
+            return False
+        return True
+
+    @staticmethod
+    def _stable_server_context_patterns(rows: list[dict[str, object]]) -> dict[str, list[str]]:
+        buckets: dict[str, dict[str, list[dict[str, object]]]] = {
+            "tone": defaultdict(list),
+            "inside_jokes": defaultdict(list),
+            "common_topics": defaultdict(list),
+            "personality_style": defaultdict(list),
+            "reply_style": defaultdict(list),
+        }
+        for row in rows:
+            text = str(row.get("content") or "")
+            normalized = text.casefold()
+            for topic, terms in SERVER_CONTEXT_TOPIC_TERMS.items():
+                if any(term in normalized for term in terms):
+                    buckets["common_topics"][topic].append(row)
+            for style, terms in SERVER_CONTEXT_STYLE_TERMS.items():
+                if any(term in normalized for term in terms):
+                    if style == "concise replies":
+                        buckets["reply_style"][style].append(row)
+                    elif style == "informal and conversational":
+                        buckets["tone"][style].append(row)
+                        buckets["personality_style"]["playful conversational energy"].append(row)
+                    else:
+                        buckets["tone"][style].append(row)
+            joke = AdminCog._inside_joke_candidate(text)
+            if joke:
+                buckets["inside_jokes"][joke].append(row)
+
+        stable: dict[str, list[str]] = {key: [] for key in buckets}
+        for field, candidates in buckets.items():
+            for label, evidence in candidates.items():
+                if AdminCog._candidate_passes_context_threshold(evidence):
+                    stable[field].append(label)
+        return stable
+
+    @staticmethod
+    def _inside_joke_candidate(text: str) -> str | None:
+        normalized = " ".join(text.strip().split())
+        if not normalized:
+            return None
+        lowered = normalized.casefold()
+        if any(term in lowered for terms in SERVER_CONTEXT_TOPIC_TERMS.values() for term in terms):
+            return None
+        if len(normalized) > 80:
+            return None
+        if re.search(r"\b[A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ]+)+", normalized):
+            return None
+        if any(marker in lowered for marker in ("jaja", "lol", "meme", "chiste")):
+            return normalized
+        return None
 
     @tasks.loop(hours=24)
     async def server_context_refresh_worker(self) -> None:
@@ -936,13 +1287,17 @@ class AdminCog(commands.Cog):
             await ctx.send("This command can only be used in a server.")
             return
         scope, channel_ids = await self.bot.db.get_ai_channel_scope(ctx.guild.id)
+        embed = discord.Embed(title="AI Allowed Channels", color=discord.Color.blue())
         if scope == "all":
-            await ctx.send("AI is allowed in all channels (no channel restrictions set).")
+            embed.description = "AI is allowed in all channels (no channel restrictions set)."
+            await ctx.send(embed=embed)
             return
         if scope == "none":
-            await ctx.send(
-                "AI is currently disabled in all channels. Use `/aichannel add <#channel>` to allow specific channels."
+            embed.description = (
+                "AI is currently disabled in all channels. "
+                "Use `/aichannel add <#channel>` to allow specific channels."
             )
+            await ctx.send(embed=embed)
             return
 
         mentions = []
@@ -952,7 +1307,8 @@ class AdminCog(commands.Cog):
                 mentions.append(channel.mention)
             else:
                 mentions.append(f"`{channel_id}`")
-        await ctx.send("AI allowed channels:\n" + "\n".join(mentions))
+        embed.description = "\n".join(mentions)
+        await ctx.send(embed=embed)
 
     @aichannel.command(
         name="clear",
@@ -1045,7 +1401,7 @@ class AdminCog(commands.Cog):
     def _help_section_keys(self, member: discord.Member | None) -> list[str]:
         is_admin = self._is_admin_member(member)
         is_mod = self._is_mod_member(member)
-        keys = ["basic", "sections", "general", "birthday", "coding", "sports", "fun"]
+        keys = ["basic", "sections", "general", "voice", "sports", "fun", "utility", "coding", "birthday"]
         if is_mod:
             keys.append("moderation")
         if is_admin:
@@ -1100,431 +1456,222 @@ class AdminCog(commands.Cog):
             or perms.manage_nicknames
         )
 
+    @staticmethod
+    def documented_help_command_paths() -> set[str]:
+        return {item.path for item in HELP_COMMANDS}
+
+    @staticmethod
+    def documented_help_aliases() -> set[str]:
+        aliases: set[str] = set()
+        for item in HELP_COMMANDS:
+            aliases.update(item.aliases)
+        return aliases
+
+    @staticmethod
+    def documented_non_command_capabilities() -> set[str]:
+        return {item.key for item in HELP_CAPABILITIES}
+
+    @staticmethod
+    def intentional_help_exclusions() -> dict[str, str]:
+        return dict(HELP_INTENTIONAL_EXCLUSIONS)
+
+    @staticmethod
+    def _help_access_allowed(spec: HelpCommandSpec | HelpCapabilitySpec, *, is_admin: bool, is_mod: bool) -> bool:
+        if getattr(spec, "show_to_all", False):
+            return True
+        if spec.access == "everyone":
+            return True
+        if spec.access == "administrator":
+            return is_admin
+        if spec.access in {"manage_guild"}:
+            return is_admin
+        return is_mod
+
+    @staticmethod
+    def _help_access_label(lang: str, access: str) -> str:
+        labels = HELP_ACCESS_EN if lang == "en" else HELP_ACCESS_ES
+        return labels.get(access, "")
+
+    def _help_command_line(self, spec: HelpCommandSpec, lang: str) -> str:
+        usage = spec.usage_en if lang == "en" else spec.usage_es
+        description = spec.description_en if lang == "en" else spec.description_es
+        line = f"`{usage}` - {description}"
+        access = self._help_access_label(lang, spec.access)
+        if access:
+            line += f" {access}"
+        if spec.aliases:
+            alias_label = tr(lang, "Aliases", "Aliases")
+            rendered = ", ".join(f"`/{alias}`" for alias in spec.aliases)
+            line += f" {alias_label}: {rendered}."
+        return line
+
+    @staticmethod
+    def _help_chunks(lines: list[str], *, limit: int = 1000) -> list[str]:
+        chunks: list[str] = []
+        current = ""
+        for line in lines:
+            candidate = line if not current else f"{current}\n{line}"
+            if len(candidate) <= limit:
+                current = candidate
+                continue
+            if current:
+                chunks.append(current)
+            current = line
+        if current:
+            chunks.append(current)
+        return chunks or ["-"]
+
+    def _add_help_lines(self, embed: discord.Embed, *, name: str, lines: list[str]) -> None:
+        chunks = self._help_chunks(lines)
+        for index, chunk in enumerate(chunks, start=1):
+            field_name = name if index == 1 else f"{name} ({index})"
+            embed.add_field(name=field_name, value=chunk, inline=False)
+
+    def _command_lines_for_section(self, section: str, lang: str, *, is_admin: bool, is_mod: bool) -> list[str]:
+        return [
+            self._help_command_line(spec, lang)
+            for spec in HELP_COMMANDS
+            if spec.section == section and self._help_access_allowed(spec, is_admin=is_admin, is_mod=is_mod)
+        ]
+
+    def _capability_lines_for_section(self, section: str, lang: str, *, is_admin: bool, is_mod: bool) -> list[str]:
+        lines: list[str] = []
+        for spec in HELP_CAPABILITIES:
+            if spec.section != section:
+                continue
+            if not self._help_access_allowed(spec, is_admin=is_admin, is_mod=is_mod):
+                continue
+            title = spec.title_en if lang == "en" else spec.title_es
+            body = spec.body_en if lang == "en" else spec.body_es
+            lines.append(f"**{title}** - {body}")
+        return lines
+
+    def _add_help_section(
+        self,
+        pages: list[discord.Embed],
+        *,
+        section: str,
+        lang: str,
+        title_en: str,
+        title_es: str,
+        color: discord.Color,
+        is_admin: bool,
+        is_mod: bool,
+    ) -> None:
+        embed = discord.Embed(title=tr(lang, title_en, title_es), color=color)
+        capability_lines = self._capability_lines_for_section(section, lang, is_admin=is_admin, is_mod=is_mod)
+        command_lines = self._command_lines_for_section(section, lang, is_admin=is_admin, is_mod=is_mod)
+        if capability_lines:
+            self._add_help_lines(embed, name=tr(lang, "Capabilities", "Capacidades"), lines=capability_lines)
+        if command_lines:
+            self._add_help_lines(embed, name=tr(lang, "Commands", "Comandos"), lines=command_lines)
+        pages.append(embed)
+
+    def _build_registered_help_pages(
+        self,
+        lang: str,
+        *,
+        member: discord.Member | None = None,
+    ) -> list[discord.Embed]:
+        is_admin = self._is_admin_member(member)
+        is_mod = self._is_mod_member(member)
+
+        page1 = discord.Embed(
+            title=tr(lang, "Nitori Help", "Ayuda de Nitori"),
+            description=tr(
+                lang,
+                "Welcome. Use the buttons below to navigate Nitori's current command and capability guide.",
+                "Bienvenido. Usa los botones para navegar la guía actual de comandos y capacidades de Nitori.",
+            ),
+            color=discord.Color.blurple(),
+        )
+        quick_lines = [
+            "`/help`",
+            "`/setup`",
+            "`@Nitori <message>`",
+            "`/football live ligamx`",
+            "`/say mensaje:<text> modo:<text|voice>`",
+            "`/meme create <template> <top> [bottom]`",
+        ]
+        self._add_help_lines(page1, name=tr(lang, "Quick Start", "Inicio rápido"), lines=quick_lines)
+        page1.add_field(
+            name=tr(lang, "Notes", "Notas"),
+            value=tr(
+                lang,
+                "Most commands support prefix usage too. Permission-sensitive commands are labeled or shown only when relevant.",
+                "La mayoría de comandos también soportan prefijo. Los comandos con permisos se etiquetan o se muestran solo cuando corresponde.",
+            ),
+            inline=False,
+        )
+
+        section_items = [
+            tr(lang, "1. Basic help", "1. Ayuda básica"),
+            tr(lang, "2. Sections index", "2. Índice de secciones"),
+            tr(lang, "3. AI / Conversation", "3. IA / Conversación"),
+            tr(lang, "4. Voice", "4. Voz"),
+            tr(lang, "5. Football / Live Watch", "5. Fútbol / En vivo"),
+            tr(lang, "6. Fun", "6. Diversión"),
+            tr(lang, "7. Utility", "7. Utilidad"),
+            tr(lang, "8. Code", "8. Código"),
+            tr(lang, "9. Birthday", "9. Cumpleaños"),
+        ]
+        if is_mod:
+            section_items.append(tr(lang, "10. Moderation", "10. Moderación"))
+        if is_admin:
+            section_items.extend(
+                [
+                    tr(lang, "11. Admin / Server Context", "11. Admin / Contexto"),
+                    tr(lang, "12. Welcome / Goodbye", "12. Welcome / Goodbye"),
+                    tr(lang, "13. Variables", "13. Variables"),
+                ]
+            )
+        page2 = discord.Embed(title=tr(lang, "Help Sections", "Secciones de ayuda"), color=discord.Color.blurple())
+        self._add_help_lines(page2, name=tr(lang, "This Guide Contains", "Esta guía contiene"), lines=section_items)
+        page2.add_field(
+            name=tr(lang, "Target Formats", "Formatos de objetivo"),
+            value=tr(
+                lang,
+                "Moderation commands accept @mention, user ID, username, or display name where Discord allows it.",
+                "Los comandos de moderación aceptan @mención, ID, usuario o nombre visible cuando Discord lo permite.",
+            ),
+            inline=False,
+        )
+
+        pages = [page1, page2]
+        self._add_help_section(pages, section="general", lang=lang, title_en="AI / Conversation", title_es="IA / Conversación", color=discord.Color.green(), is_admin=is_admin, is_mod=is_mod)
+        self._add_help_section(pages, section="voice", lang=lang, title_en="Voice", title_es="Voz", color=discord.Color.blue(), is_admin=is_admin, is_mod=is_mod)
+        self._add_help_section(pages, section="sports", lang=lang, title_en="Football / Live Watch", title_es="Fútbol / En vivo", color=discord.Color.gold(), is_admin=is_admin, is_mod=is_mod)
+        self._add_help_section(pages, section="fun", lang=lang, title_en="Fun", title_es="Diversión", color=discord.Color.teal(), is_admin=is_admin, is_mod=is_mod)
+        self._add_help_section(pages, section="utility", lang=lang, title_en="Utility", title_es="Utilidad", color=discord.Color.dark_teal(), is_admin=is_admin, is_mod=is_mod)
+        self._add_help_section(pages, section="coding", lang=lang, title_en="Code Runner", title_es="Ejecución de código", color=discord.Color.dark_teal(), is_admin=is_admin, is_mod=is_mod)
+        self._add_help_section(pages, section="birthday", lang=lang, title_en="Birthday", title_es="Cumpleaños", color=discord.Color.purple(), is_admin=is_admin, is_mod=is_mod)
+        if is_mod:
+            self._add_help_section(pages, section="moderation", lang=lang, title_en="Moderation", title_es="Moderación", color=discord.Color.orange(), is_admin=is_admin, is_mod=is_mod)
+        if is_admin:
+            self._add_help_section(pages, section="admin", lang=lang, title_en="Admin / Server Context", title_es="Admin / Contexto", color=discord.Color.red(), is_admin=is_admin, is_mod=is_mod)
+            self._add_help_section(pages, section="announcements", lang=lang, title_en="Welcome / Goodbye", title_es="Welcome / Goodbye", color=discord.Color.dark_gold(), is_admin=is_admin, is_mod=is_mod)
+            variables = [
+                "`{user}` -> @John",
+                "`{username}` -> John",
+                "`{avatar}` -> " + tr(lang, "user avatar", "avatar del usuario"),
+                "`{server}` -> " + tr(lang, "server name", "nombre del servidor"),
+                "`{channel}` / `{channel:rules}` / `{123456789012345678}`",
+                "`{role}` / `{role:member}` / `{RoleName}`",
+                "`{age}` / `{year}` -> " + tr(lang, "birthday and anniversary templates", "plantillas de cumpleaños y aniversarios"),
+            ]
+            page_vars = discord.Embed(title=tr(lang, "Template Variables", "Variables de plantilla"), color=discord.Color.dark_blue())
+            self._add_help_lines(page_vars, name=tr(lang, "Variables", "Variables"), lines=variables)
+            pages.append(page_vars)
+        self._set_page_footers(pages, lang)
+        return pages
+
     def _build_help_pages(
         self,
         lang: str,
         *,
         member: discord.Member | None = None,
     ) -> list[discord.Embed]:
-        quick_en = """`/help`
-`/setup`
-`/srvstatus <ip_or_domain>`
-`/football live ligamx`
-`/meme create <template> <top_text> [bottom_text]`"""
-        quick_es = """`/help`
-`/setup`
-`/srvstatus <ip_o_dominio>`
-`/football live ligamx`
-`/meme create <plantilla> <texto_arriba> [texto_abajo]`"""
-
-        is_admin = self._is_admin_member(member)
-        is_mod = self._is_mod_member(member)
-
-        general_en = """`@Nitori <message>`
-`reply + @Nitori <language>`
-`/translate <language> [text]`
-`/roast <user|user-id|name>`
-`/roastme`
-`/remindme <time> <message>`
-`/unremindme <reminder>`
-`/help`
-`/setup`
-`/srvstatus <ip_or_domain>`
-Time units: `m`, `h`, `d`, `w`, `mo`, `y`
-Example: `/roast @User`"""
-        general_es = """`@Nitori <mensaje>`
-`responde + @Nitori <idioma>`
-`/translate <idioma> [texto]`
-`/roast <usuario|id-usuario|nombre>`
-`/roastme`
-`/remindme <tiempo> <mensaje>`
-`/unremindme <recordatorio>`
-`/help`
-`/setup`
-`/srvstatus <ip_o_dominio>`
-Unidades de tiempo: `m`, `h`, `d`, `w`, `mo`, `y`
-Ejemplo: `/roast @User`"""
-
-        birthday_en = """`/birthday set <MM-DD|DD/MM> [birth_year]` - Save your birthday.
-`/birthday remove` - Remove your birthday data from this server.
-`/birthday next [count]` - Show upcoming birthdays in this server.
-Examples:
-`/birthday set 07-14`
-`/birthday set 14/07 2001`
-`/birthday remove`"""
-        birthday_es = """`/birthday set <MM-DD|DD/MM> [año_nacimiento]` - Guarda tu cumpleaños.
-`/birthday remove` - Elimina tus datos de cumpleaños de este servidor.
-`/birthday next [cantidad]` - Muestra los próximos cumpleaños del servidor.
-Ejemplos:
-`/birthday set 07-14`
-`/birthday set 14/07 2001`
-`/birthday remove`"""
-        birthday_admin_en = """`/birthday setup [channel] [role]` - Quick server birthday setup.
-`/birthday channel [#channel]` - Set/clear announcement channel.
-`/birthday role [@role]` - Set/clear birthday role.
-`/birthday timezone <iana_tz>` - Set server timezone.
-`/birthday mode <user|server>` - Choose timezone mode for birthdays.
-`/birthday ages <true|false>` - Show or hide ages.
-`/birthday event <default|year|join|server|disable> [color] [image] [message]` - Configure/disable event messages.
-`/birthday preview <default|year|server|user>` - Preview how each event will be posted.
-`/birthday templateadd|templatelist|templateremove` - Manage custom templates.
-`/birthday blacklistuser|blacklistrole <target> <true|false>` - Exclude users/roles.
-`/birthday trusted [role] [prevent_message] [prevent_role] [prevent_list]` - Trusted-role restrictions."""
-        birthday_admin_es = """`/birthday setup [canal] [rol]` - Configuración rápida del módulo.
-`/birthday channel [#canal]` - Define/limpia el canal de anuncios.
-`/birthday role [@rol]` - Define/limpia el rol de cumpleaños.
-`/birthday timezone <zona_iana>` - Define zona horaria del servidor.
-`/birthday mode <user|server>` - Modo de zona horaria para cumpleaños.
-`/birthday ages <true|false>` - Muestra u oculta edades.
-`/birthday event <default|year|join|server|disable> [color] [image] [message]` - Configura/desactiva mensajes del evento.
-`/birthday preview <default|year|server|user>` - Vista previa de cómo se publica cada evento.
-`/birthday templateadd|templatelist|templateremove` - Gestiona plantillas personalizadas.
-`/birthday blacklistuser|blacklistrole <objetivo> <true|false>` - Excluye usuarios/roles.
-`/birthday trusted [rol] [prevent_message] [prevent_role] [prevent_list]` - Restricciones por rol confiable."""
-
-        coding_en = """`/code code:<code> language:<language> [source_file]` - Compile/run code.
-`/codelangs` - List supported languages and file extensions.
-Languages: `c`, `c#`, `cpp`, `python`, `java`, `javascript`, `rust`
-Files: `.c`, `.cpp`, `.cs`, `.java`, `.js`, `.py`, `.rs`"""
-        coding_es = """`/code code:<codigo> language:<lenguaje> [archivo_fuente]` - Compila/ejecuta codigo.
-`/codelangs` - Lista lenguajes y extensiones soportadas.
-Lenguajes: `c`, `c#`, `cpp`, `python`, `java`, `javascript`, `rust`
-Archivos: `.c`, `.cpp`, `.cs`, `.java`, `.js`, `.py`, `.rs`"""
-
-        sports_en = """`/football live <league>` - Live matches happening now.
-`/football today <league>` - Matches scheduled for today.
-`/football next <league> [count|team]` - Next matches (global or by team).
-`/football last <league> <team>` - Last result for a specific team.
-`/football table <league>` - Current league standings table.
-`/football team <league> <team>` - Team details and recent form.
-`/football scorers <league>` - Top scorers leaderboard.
-`/football match <fixture|team>` - Match center by fixture ID or team.
-`/football schedule <team|league> [next|last|season]` - Fixture schedule.
-`/football player <player>` - Player profile and season stats.
-`/football lineup <fixture_id>` - Confirmed fixture lineups.
-`/football stats <fixture_id>` - Fixture statistics.
-`/football injuries <team>` - Injuries/unavailable players.
-`/football transfers <team>` - Recent transfers.
-`/football h2h <team_a> <team_b>` - Head-to-head matches.
-`/football top <scorers|assists|yellowcards|redcards>` - Leaderboards.
-`/football preview <fixture_id>` - Data-only match preview.
-`/football summary <fixture_id>` - Data-only match summary.
-Leagues: `ligamx`, `premier`, `laliga`, `concacaf`, `worldcup`."""
-        sports_es = """`/football live <liga>` - Partidos en vivo ahora mismo.
-`/football today <liga>` - Partidos programados para hoy.
-`/football next <liga> [cantidad|equipo]` - Próximos partidos (global o por equipo).
-`/football last <liga> <equipo>` - Último resultado de un equipo.
-`/football table <liga>` - Tabla de posiciones actual.
-`/football team <liga> <equipo>` - Datos del equipo y forma reciente.
-`/football scorers <liga>` - Tabla de goleadores.
-`/football match <partido|equipo>` - Centro de partido por ID o equipo.
-`/football schedule <equipo|liga> [next|last|season]` - Calendario de partidos.
-`/football player <jugador>` - Perfil y estadísticas del jugador.
-`/football lineup <fixture_id>` - Alineaciones confirmadas.
-`/football stats <fixture_id>` - Estadísticas del partido.
-`/football injuries <equipo>` - Lesiones/jugadores no disponibles.
-`/football transfers <equipo>` - Transferencias recientes.
-`/football h2h <equipo_a> <equipo_b>` - Historial entre equipos.
-`/football top <scorers|assists|yellowcards|redcards>` - Tablas de líderes.
-`/football preview <fixture_id>` - Previa del partido con datos.
-`/football summary <fixture_id>` - Resumen del partido con datos.
-Ligas: `ligamx`, `premier`, `laliga`, `concacaf`, `worldcup`."""
-
-        fun_en = """`/joke` - Random joke.
-`/dadjoke` - Random dad joke.
-`/advice` - Random advice.
-`/whois <domain>` - Domain WHOIS info.
-`/convert <amount> <from_unit> <to_unit>` - Unit conversion.
-`/roast <user|user-id|name>` - Roast a target user.
-`/roastme` - Roast yourself.
-`/meme create <template> <top_text> [bottom_text]` - Template meme.
-`/meme random <top_text> [bottom_text]` - Random template meme.
-`/meme custom <image_url> <top_text> [bottom_text]` - URL image meme.
-`/meme custom <top_text> [bottom_text]` + attach image - Attached image meme.
-`/meme templates [query]` - List meme templates.
-`/meme fonts [query]` - List meme fonts.
-`/speech <user>` - Speech bubble avatar meme.
-`/meme help` - Meme usage guide."""
-        fun_es = """`/joke` - Chiste aleatorio.
-`/dadjoke` - Chiste de papa aleatorio.
-`/advice` - Consejo aleatorio.
-`/whois <dominio>` - Info WHOIS del dominio.
-`/convert <cantidad> <unidad_origen> <unidad_destino>` - Conversion de unidades.
-`/roast <usuario|id-usuario|nombre>` - Roast a un usuario.
-`/roastme` - Roast para ti.
-`/meme create <plantilla> <texto_arriba> [texto_abajo]` - Meme con plantilla.
-`/meme random <texto_arriba> [texto_abajo]` - Meme con plantilla aleatoria.
-`/meme custom <url_imagen> <texto_arriba> [texto_abajo]` - Meme desde URL.
-`/meme custom <texto_arriba> [texto_abajo]` + adjunta imagen - Meme con imagen adjunta.
-`/meme templates [busqueda]` - Lista plantillas de meme.
-`/meme fonts [busqueda]` - Lista fuentes de meme.
-`/speech <usuario>` - Meme de burbuja de dialogo.
-`/meme help` - Guia de memes."""
-
-        mod_a_en = """`/message delete <amount>` - Delete recent messages.
-`/utility say <message>` - Bot sends your text.
-`/channel add <channel-name>` - Create a text channel.
-`/channel delete <#channel>` - Delete a channel.
-`/channel clear [#channel]` - Clear messages in a channel.
-`/channel clone [#channel]` - Clone channel settings.
-`/channel lock [#channel]` - Lock posting permissions.
-`/channel unlock [#channel]` - Restore posting permissions.
-`/channel slowmode <#channel|channel-id> <seconds|disable>` - Set or disable slowmode.
-`/message purgeuser <user|user-id> <amount>` - Remove one user's messages.
-`/user info <user|user-id>` - Show member info.
-`/user warn <user> [reason]` - Add a warning.
-`/user unwarn <user> <1|2|3>` - Remove a warning slot.
-`/user warnings <user>` - View active warnings.
-`/user clearwarnings <user> [reason]` - Clear all warnings."""
-        mod_a_es = """`/message delete <cantidad>` - Borra mensajes recientes.
-`/utility say <mensaje>` - El bot envia tu texto.
-`/channel add <nombre-canal>` - Crea un canal de texto.
-`/channel delete <#canal>` - Elimina un canal.
-`/channel clear [#canal]` - Limpia mensajes de un canal.
-`/channel clone [#canal]` - Clona configuracion del canal.
-`/channel lock [#canal]` - Bloquea envio de mensajes.
-`/channel unlock [#canal]` - Restaura envio de mensajes.
-`/channel slowmode <#canal|id-canal> <segundos|disable>` - Configura o desactiva slowmode.
-`/message purgeuser <usuario|id-usuario> <cantidad>` - Borra mensajes de un usuario.
-`/user info <usuario|id-usuario>` - Muestra info del miembro.
-`/user warn <usuario> [razon]` - Agrega una advertencia.
-`/user unwarn <usuario> <1|2|3>` - Quita una advertencia.
-`/user warnings <usuario>` - Ver advertencias activas.
-`/user clearwarnings <usuario> [razon]` - Limpia todas las advertencias."""
-
-        mod_b_en = """`/user mute <user> [reason]` - Mute a member.
-`/user unmute <user> [reason]` - Remove mute role.
-`/user kick <user> [reason]` - Kick a member.
-`/user ban <user> [reason]` - Ban a member.
-`/user unban <user_id> [reason]` - Unban by user ID.
-`/user tempmute <user> <time> [reason]` - Temporary mute.
-`/user tempban <user> <time> [reason]` - Temporary ban.
-`/role add <user> <role|role-id>` - Add a role to a member.
-`/role remove <user> <role|role-id>` - Remove a role from a member.
-`/role create <role-name> [hex-color]` - Create a role.
-`/user setnick <user> <nickname>` - Change member nickname."""
-        mod_b_es = """`/user mute <usuario> [razon]` - Silencia a un miembro.
-`/user unmute <usuario> [razon]` - Quita el rol de silencio.
-`/user kick <usuario> [razon]` - Expulsa a un miembro.
-`/user ban <usuario> [razon]` - Banea a un miembro.
-`/user unban <id_usuario> [razon]` - Desbanea por ID.
-`/user tempmute <usuario> <tiempo> [razon]` - Silencio temporal.
-`/user tempban <usuario> <tiempo> [razon]` - Ban temporal.
-`/role add <usuario> <rol|id-rol>` - Agrega un rol al miembro.
-`/role remove <usuario> <rol|id-rol>` - Quita un rol al miembro.
-`/role create <nombre-rol> [color-hex]` - Crea un rol.
-`/user setnick <usuario> <apodo>` - Cambia el apodo del miembro."""
-
-        admin_en = """`/config modlog [#channel]` - Set moderation log channel.
-`/config prefix <new_prefix>` - Change server prefix.
-`/config language <en|es>` - Set response language.
-`/setservercontext <#channel>` - Add/update AI context channel.
-`/resetservercontext [scope]` - Clear summaries, memory, AI history, or all.
-`/viewservercontext` - View summary context and structured memory counts.
-`/servercontext remember|forget|list|user|approve|reject|reset` - Manage structured AI memory.
-`/config antispam <true|false>` - Toggle anti-spam filter.
-`/config antilink <true|false>` - Toggle anti-link filter.
-`/color setup` - Create default color roles.
-`/color list` - Show public color panel.
-`/color channel <#channel>` - Set color panel channel.
-`/color add <hex-color> [name]` - Add a custom color role.
-`/color remove <name>` - Remove a color role.
-`/color reload` - Repost/update color panel."""
-        admin_es = """`/config modlog [#canal]` - Define canal de logs de moderacion.
-`/config prefix <nuevo_prefijo>` - Cambia el prefijo del servidor.
-`/config language <en|es>` - Define idioma de respuestas.
-`/setservercontext <#canal>` - Agrega/actualiza canal de contexto IA.
-`/resetservercontext [scope]` - Limpia resumenes, memoria, historial IA o todo.
-`/viewservercontext` - Muestra contexto resumen y conteos de memoria estructurada.
-`/servercontext remember|forget|list|user|approve|reject|reset` - Gestiona memoria IA estructurada.
-`/config antispam <true|false>` - Activa/desactiva filtro anti-spam.
-`/config antilink <true|false>` - Activa/desactiva filtro anti-links.
-`/color setup` - Crea roles de color por defecto.
-`/color list` - Muestra panel publico de colores.
-`/color channel <#canal>` - Define canal del panel de colores.
-`/color add <color-hex> [nombre]` - Agrega rol de color personalizado.
-`/color remove <nombre>` - Elimina un rol de color.
-`/color reload` - Republica/actualiza panel de colores."""
-
-        announcements_en = """`/welcome show`
-`/welcome set mode:<text|embed|both> [channel] [message] [image] [color]`
-`/welcome edit [message] [color] [mode] [image] [channel]`
-`/welcome test`
-Example: `/welcome set mode:both message:Hello {user}, welcome to {server}! image:https://... color:#00FFAA`
-
-`/goodbye show`
-`/goodbye set mode:<text|embed|both> [channel] [message] [image] [color]`
-`/goodbye edit [message] [color] [mode] [image] [channel]`
-`/goodbye test`
-Example: `/goodbye set mode:both message:Bye {user}, thanks for being here. image:https://... color:#FF4D4D`"""
-
-        announcements_es = """`/welcome show`
-`/welcome set mode:<text|embed|both> [channel] [message] [image] [color]`
-`/welcome edit [message] [color] [mode] [image] [channel]`
-`/welcome test`
-Ejemplo: `/welcome set mode:both message:Hola {user}, bienvenido a {server}! image:https://... color:#00FFAA`
-
-`/goodbye show`
-`/goodbye set mode:<text|embed|both> [channel] [message] [image] [color]`
-`/goodbye edit [message] [color] [mode] [image] [channel]`
-`/goodbye test`
-Ejemplo: `/goodbye set mode:both message:Adios {user}, gracias por estar aqui. image:https://... color:#FF4D4D`"""
-
-        variables_en = """Bot variables:
-`{user}` -> @John
-`{username}` -> John
-`{avatar}` -> Shows the user's avatar
-`{server}` -> Server name
-`{channel}` -> Supports channel name or channel ID. Example: `{rules}` -> #rules
-`{role}` -> Role helper. Use `{role:member}` or `{role:123456789012345678}`
-`{RoleName}` -> Also works by role name. Example: `{member}` -> @Member
-`{123456789012345678}` -> Also works by ID (channel/role auto-detected)
-
-Birthday variables:
-`{age}` -> Shows the user's new age. Only applies when birth year is set.
-`{year}` -> Shows birth year (birthday) or years count (member/server anniversary)."""
-
-        variables_es = """Variables del bot:
-`{user}` -> @John
-`{username}` -> John
-`{avatar}` -> Muestra el avatar del usuario
-`{server}` -> Nombre de servidor
-`{channel}` -> Soporta nombre de canal o ID de canal. Ejemplo: `{reglas}` -> #reglas
-`{role}` -> Helper de rol. Usa `{role:miembro}` o `{role:123456789012345678}`
-`{NombreRol}` -> Tambien funciona por nombre de rol. Ejemplo: `{miembro}` -> @Miembro
-`{123456789012345678}` -> Tambien funciona por ID (deteccion automatica canal/rol)
-
-Variables de cumpleaños:
-`{age}` -> Muestra la nueva edad del usuario. Solo aplica si se define el año de nacimiento.
-`{year}` -> Muestra el año de nacimiento (cumpleaños) o los años transcurridos (aniversarios)."""
-
-        ai_channels_en = """`/aichannel add <#channel>` - Allow AI in one channel.
-`/aichannel remove <#channel>` - Remove one allowed AI channel.
-`/aichannel list` - Show current AI-allowed channels/scope.
-`/aichannel clear` - Remove restrictions (AI allowed in all channels)."""
-        ai_channels_es = """`/aichannel add <#canal>` - Permite IA en un canal.
-`/aichannel remove <#canal>` - Quita un canal permitido para IA.
-`/aichannel list` - Muestra canales/alcance actual de IA.
-`/aichannel clear` - Quita restricciones (IA permitida en todos los canales)."""
-
-        page1 = discord.Embed(
-            title=tr(lang, "Nitori Help", "Ayuda de Nitori"),
-            description=tr(
-                lang,
-                "Welcome. Use the buttons below to navigate command pages.",
-                "Bienvenido. Usa los botones de abajo para navegar por las paginas de comandos.",
-            ),
-            color=discord.Color.blurple(),
-        )
-        page1.add_field(name=tr(lang, "Quick Start", "Inicio Rapido"), value=tr(lang, quick_en, quick_es), inline=False)
-        page1.add_field(
-            name=tr(lang, "Usage Note", "Nota de uso"),
-            value=tr(
-                lang,
-                "Most commands support prefix usage too.",
-                "La mayoria de comandos tambien soportan prefijo.",
-            ),
-            inline=False,
-        )
-        page1.add_field(
-            name=tr(lang, "Notes", "Notas"),
-            value=tr(lang, "Some commands require mod/admin permissions.", "Algunos comandos requieren permisos de mod/admin."),
-            inline=False,
-        )
-
-        section_items_en = [
-            "1. Basic help",
-            "2. Sections index",
-            "3. General / AI",
-            "4. Birthday",
-            "5. Coding",
-            "6. Sports",
-            "7. Fun",
-        ]
-        section_items_es = [
-            "1. Ayuda basica",
-            "2. Indice de secciones",
-            "3. General / IA",
-            "4. Cumpleaños",
-            "5. Programacion",
-            "6. Deportes",
-            "7. Diversion",
-        ]
-        if is_mod:
-            section_items_en.append("8. Moderation")
-            section_items_es.append("8. Moderacion")
-        if is_admin:
-            section_items_en.extend(["9. Admin", "10. Welcome/Goodbye", "11. Variables"])
-            section_items_es.extend(["9. Admin", "10. Welcome/Goodbye", "11. Variables"])
-        sections_en = "\n".join(section_items_en)
-        sections_es = "\n".join(section_items_es)
-
-        page2 = discord.Embed(title=tr(lang, "Help Sections", "Secciones de Ayuda"), color=discord.Color.blurple())
-        page2.add_field(name=tr(lang, "This Guide Contains", "Esta Guia Contiene"), value=tr(lang, sections_en, sections_es), inline=False)
-        page2.add_field(
-            name=tr(lang, "Target Formats", "Formatos de objetivo"),
-            value=tr(lang, "Moderation commands accept: @mention, user ID, username, or display name.", "Los comandos de moderacion aceptan: @mencion, ID, nombre de usuario o nombre visible."),
-            inline=False,
-        )
-
-        page3 = discord.Embed(title=tr(lang, "General / AI", "General / IA"), color=discord.Color.green())
-        page3.add_field(name=tr(lang, "General + AI", "General + IA"), value=tr(lang, general_en, general_es), inline=False)
-
-        page4 = discord.Embed(title=tr(lang, "Birthday", "Cumpleaños"), color=discord.Color.purple())
-        page4.add_field(name=tr(lang, "User Commands", "Comandos de usuario"), value=tr(lang, birthday_en, birthday_es), inline=False)
-        if is_admin:
-            page4.add_field(
-                name=tr(lang, "Admin Commands", "Comandos de admin"),
-                value=tr(lang, birthday_admin_en, birthday_admin_es),
-                inline=False,
-            )
-
-        page5 = discord.Embed(title=tr(lang, "Coding", "Programacion"), color=discord.Color.dark_teal())
-        page5.add_field(name=tr(lang, "Code Execution", "Ejecucion de codigo"), value=tr(lang, coding_en, coding_es), inline=False)
-
-        page6 = discord.Embed(title=tr(lang, "Sports", "Deportes"), color=discord.Color.gold())
-        page6.add_field(name=tr(lang, "Football", "Football"), value=tr(lang, sports_en, sports_es), inline=False)
-
-        page7 = discord.Embed(title=tr(lang, "Fun", "Diversion"), color=discord.Color.teal())
-        page7.add_field(name=tr(lang, "Meme + Ninja APIs", "Memes + APIs Ninja"), value=tr(lang, fun_en, fun_es), inline=False)
-
-        pages = [page1, page2, page3, page4, page5, page6, page7]
-        if is_mod:
-            page_mod = discord.Embed(title=tr(lang, "Moderation Commands", "Comandos de Moderacion"), color=discord.Color.orange())
-            page_mod.add_field(name=tr(lang, "Messages + Warnings", "Mensajes + Advertencias"), value=tr(lang, mod_a_en, mod_a_es), inline=False)
-            page_mod.add_field(name=tr(lang, "Member Actions", "Acciones de miembros"), value=tr(lang, mod_b_en, mod_b_es), inline=False)
-            pages.append(page_mod)
-
-        if is_admin:
-            page_admin = discord.Embed(title=tr(lang, "Admin Commands", "Comandos de Admin"), color=discord.Color.red())
-            page_admin.add_field(name=tr(lang, "Server Configuration", "Configuración del servidor"), value=tr(lang, admin_en, admin_es), inline=False)
-            page_admin.add_field(name=tr(lang, "AI Channel Restrictions", "Canales de IA"), value=tr(lang, ai_channels_en, ai_channels_es), inline=False)
-            pages.append(page_admin)
-
-            page_ann = discord.Embed(
-                title=tr(lang, "Welcome / Goodbye", "Welcome / Goodbye"),
-                color=discord.Color.dark_gold(),
-            )
-            page_ann.add_field(
-                name=tr(lang, "Announcement Commands", "Comandos de anuncios"),
-                value=tr(lang, announcements_en, announcements_es),
-                inline=False,
-            )
-            pages.append(page_ann)
-
-            page_vars = discord.Embed(
-                title=tr(lang, "Template Variables", "Variables de plantilla"),
-                color=discord.Color.dark_blue(),
-            )
-            page_vars.add_field(
-                name=tr(lang, "Variable Examples", "Ejemplos de variables"),
-                value=tr(lang, variables_en, variables_es),
-                inline=False,
-            )
-            pages.append(page_vars)
-
-        self._set_page_footers(pages, lang)
-        return pages
+        return self._build_registered_help_pages(lang, member=member)
 
     def _set_page_footers(self, pages: list[discord.Embed], lang: str) -> None:
         total = len(pages)

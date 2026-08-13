@@ -211,6 +211,33 @@ class Database:
 
             await conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS member_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'discord_event',
+                    created_at TEXT NOT NULL,
+                    UNIQUE(guild_id, user_id, event_type, occurred_at, source)
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_member_events_guild_type_time
+                ON member_events(guild_id, event_type, occurred_at)
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_member_events_user_type_time
+                ON member_events(guild_id, user_id, event_type, occurred_at)
+                """
+            )
+
+            await conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS reminders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     guild_id INTEGER NOT NULL,
@@ -456,6 +483,98 @@ class Database:
 
     async def get_guild_settings(self, guild_id: int) -> GuildSettings:
         return await self.get_or_create_guild_settings(guild_id)
+
+    @staticmethod
+    def _member_event_type(value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized not in {"join", "leave"}:
+            raise ValueError(f"Unsupported member event type: {value}")
+        return normalized
+
+    @staticmethod
+    def _iso_utc(value: datetime | str | None) -> str:
+        if isinstance(value, str):
+            return value
+        if value is None:
+            return datetime.now(timezone.utc).isoformat()
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
+
+    async def record_member_event(
+        self,
+        guild_id: int,
+        user_id: int,
+        event_type: str,
+        occurred_at: datetime | str | None = None,
+        *,
+        source: str = "discord_event",
+    ) -> bool:
+        event = self._member_event_type(event_type)
+        occurred = self._iso_utc(occurred_at)
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                """
+                INSERT OR IGNORE INTO member_events
+                (guild_id, user_id, event_type, occurred_at, source, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (guild_id, user_id, event, occurred, source, self._now_iso()),
+            )
+            await conn.commit()
+            return bool(cursor.rowcount)
+
+    async def record_member_join(
+        self,
+        guild_id: int,
+        user_id: int,
+        occurred_at: datetime | str | None = None,
+    ) -> bool:
+        return await self.record_member_event(guild_id, user_id, "join", occurred_at)
+
+    async def record_member_leave(
+        self,
+        guild_id: int,
+        user_id: int,
+        occurred_at: datetime | str | None = None,
+    ) -> bool:
+        return await self.record_member_event(guild_id, user_id, "leave", occurred_at)
+
+    async def count_member_events(
+        self,
+        guild_id: int,
+        event_type: str,
+        since: datetime | str,
+    ) -> int:
+        return await self.count_member_events_between(
+            guild_id,
+            event_type,
+            self._iso_utc(since),
+            datetime.now(timezone.utc).isoformat(),
+        )
+
+    async def count_member_events_between(
+        self,
+        guild_id: int,
+        event_type: str,
+        start: datetime | str,
+        end: datetime | str,
+    ) -> int:
+        event = self._member_event_type(event_type)
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM member_events
+                WHERE guild_id = ?
+                  AND event_type = ?
+                  AND occurred_at >= ?
+                  AND occurred_at < ?
+                """,
+                (guild_id, event, self._iso_utc(start), self._iso_utc(end)),
+            )
+            row = await cursor.fetchone()
+            return int(row["count"] or 0)
 
     @staticmethod
     def _validate_birthday_event_type(event_type: str) -> str:
@@ -2272,7 +2391,9 @@ class Database:
         async with self._connect() as conn:
             cursor = await conn.execute(
                 """
-                SELECT guild_id, channel_id, role, speaker, content, created_at
+                SELECT guild_id, channel_id, role, speaker, content, message_id,
+                       author_user_id, parent_message_id, action_type,
+                       resolved_request, created_at
                 FROM ai_conversation_turns
                 WHERE guild_id = ? AND created_at >= ?
                 ORDER BY id DESC
@@ -2289,6 +2410,11 @@ class Database:
                     "role": str(row["role"]),
                     "speaker": str(row["speaker"]),
                     "content": str(row["content"]),
+                    "message_id": "" if row["message_id"] is None else str(row["message_id"]),
+                    "author_user_id": "" if row["author_user_id"] is None else str(row["author_user_id"]),
+                    "parent_message_id": "" if row["parent_message_id"] is None else str(row["parent_message_id"]),
+                    "action_type": "" if row["action_type"] is None else str(row["action_type"]),
+                    "resolved_request": "" if row["resolved_request"] is None else str(row["resolved_request"]),
                     "created_at": str(row["created_at"]),
                 }
                 for row in rows
