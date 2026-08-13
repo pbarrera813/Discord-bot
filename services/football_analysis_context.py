@@ -63,6 +63,8 @@ def build_player_context(
     player_row: dict[str, Any] | None,
     stat_focus: str | None = None,
     fixtures: list[dict[str, Any]] | None = None,
+    extra_label: str | None = None,
+    extra_rows: list[dict[str, Any]] | None = None,
     notes: list[str] | None = None,
     source_endpoints: list[str] | None = None,
 ) -> str:
@@ -74,6 +76,8 @@ def build_player_context(
         "statistics": stats[:3] if isinstance(stats, list) else [],
         "stat_focus": stat_focus,
         "fixtures": [_compact_fixture(item) for item in (fixtures or [])[:3]],
+        "extra_label": extra_label,
+        "extra_rows": (extra_rows or [])[:5],
         "notes": notes or [],
         "source_endpoints": source_endpoints or [],
     }

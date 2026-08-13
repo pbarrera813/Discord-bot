@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import discord
@@ -66,8 +66,26 @@ def fixture_datetime(item: dict[str, Any]) -> str:
         return "N/A"
     iso = fixture.get("date")
     if isinstance(iso, str) and iso.strip():
-        return iso.strip().replace("T", " ").replace("+00:00", " UTC")
+        cleaned = iso.strip()
+        try:
+            parsed = datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+        except ValueError:
+            return cleaned.replace("T", " ").replace("+00:00", " UTC")
+        label = _timezone_label(parsed)
+        return f"{parsed.strftime('%Y-%m-%d %H:%M')} {label}".strip()
     return "N/A"
+
+
+def _timezone_label(value: datetime) -> str:
+    offset = value.utcoffset()
+    if offset == timedelta(hours=-6):
+        return "CST"
+    if offset == timedelta(hours=-5):
+        return "CDT"
+    if offset == timedelta(0):
+        return "UTC"
+    name = value.tzname()
+    return name or ""
 
 
 def format_fixture_line(item: dict[str, Any]) -> tuple[str, str]:

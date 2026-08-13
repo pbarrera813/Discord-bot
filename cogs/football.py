@@ -11,6 +11,9 @@ from discord.ext import commands
 
 from services import football_formatter as football_fmt
 from services import football_resolver
+from services.football_live_match_service import normalize_match_statistics
+from services.football_operation_service import FootballOperationService, FootballOutcome
+from services.football_query_service import compile_football_operation
 from utils.i18n import tr
 
 
@@ -118,6 +121,24 @@ class FootballCog(commands.Cog):
         raw_league: str,
     ) -> tuple[str, int, int] | None:
         league_key = self._normalize_league_key(raw_league)
+        service = FootballOperationService(client)
+        if league_key is None:
+            operation = compile_football_operation(
+                "FOOTBALL_LOOKUP",
+                raw_league,
+                {"data_focus": "league_lookup", "league_candidates": [raw_league]},
+            )
+            if operation.league_slots:
+                resolved_league_id, resolved_season, row, outcome = await service.resolve_league_and_season(
+                    operation,
+                    league_id=None,
+                    season=None,
+                )
+                if outcome == FootballOutcome.SELECTED and resolved_league_id is not None and resolved_season is not None:
+                    league = row.get("league") if isinstance(row, dict) else {}
+                    label = str(league.get("name", raw_league)).strip() if isinstance(league, dict) else raw_league.strip()
+                    league_key = football_resolver.normalize_key(label) or "custom"
+                    return league_key, resolved_league_id, resolved_season
         if league_key is None:
             await ctx.send(
                 tr(
@@ -127,8 +148,7 @@ class FootballCog(commands.Cog):
                 )
             )
             return None
-        league_id = await client.resolve_league_id(league_key)
-        season = await client.get_current_season(league_id)
+        league_id, season = await service.resolve_league_key(league_key)
         return league_key, league_id, season
 
     @staticmethod
@@ -244,7 +264,18 @@ class FootballCog(commands.Cog):
             if context is None:
                 return
             league_key, league_id, _season = context
-            fixtures = await client.get_live_fixtures(league_id=league_id, cache_ttl_seconds=30)
+            operation = compile_football_operation(
+                "FOOTBALL_FIXTURE_QUERY",
+                "live fixtures",
+                {"data_focus": "live_fixtures", "league_candidates": [raw_league]},
+            )
+            result = await FootballOperationService(client).execute(
+                operation,
+                league_id=league_id,
+                season=None,
+                data_focus="live_fixtures",
+            )
+            fixtures = result.fixtures
         except Exception as exc:
             await ctx.send(
                 tr(
@@ -318,12 +349,18 @@ class FootballCog(commands.Cog):
             if context is None:
                 return
             league_key, league_id, season = context
-            today = date.today().isoformat()
-            fixtures = await client.get_fixtures_on_date(
+            operation = compile_football_operation(
+                "FOOTBALL_WATCH_TODAY",
+                "today fixtures",
+                {"data_focus": "today_fixtures", "league_candidates": [league]},
+            )
+            result = await FootballOperationService(client).execute(
+                operation,
                 league_id=league_id,
                 season=season,
-                date_iso=today,
+                data_focus="today_fixtures",
             )
+            fixtures = result.fixtures
         except Exception as exc:
             await ctx.send(
                 tr(
@@ -410,11 +447,18 @@ class FootballCog(commands.Cog):
             if context is None:
                 return
             league_key, league_id, season = context
-            fixtures = await client.get_next_fixtures(
+            operation = compile_football_operation(
+                "FOOTBALL_LOOKUP",
+                f"next fixtures {league}",
+                {"data_focus": "next_fixtures", "league_candidates": [league]},
+            )
+            result = await FootballOperationService(client).execute(
+                operation,
                 league_id=league_id,
                 season=season,
-                next_count=count,
+                data_focus="schedule_next_fixtures",
             )
+            fixtures = result.fixtures[:count]
         except Exception as exc:
             await ctx.send(
                 tr(
@@ -473,18 +517,24 @@ class FootballCog(commands.Cog):
             if context is None:
                 return
             league_key, league_id, season = context
-            selected = await self._resolve_team(ctx, client=client, lang=lang, league_id=league_id, season=season, query=team_query)
-            if selected is None:
-                return
-
-            team_id, team_name = selected
-
-            fixtures = await client.get_next_fixtures(
+            operation = compile_football_operation(
+                "FOOTBALL_LOOKUP",
+                team_query,
+                {"data_focus": "next_fixtures", "team_candidates": [team_query]},
+            )
+            result = await FootballOperationService(client).execute(
+                operation,
                 league_id=league_id,
                 season=season,
-                next_count=1,
-                team_id=team_id,
+                data_focus="next_fixtures",
             )
+            if result.outcome == FootballOutcome.AMBIGUOUS:
+                await ctx.send(tr(lang, "Multiple teams matched. Please be more specific.", "Varios equipos coinciden. Se mas especifico."))
+                return
+            team_row = result.team_context_row or {}
+            team_info = team_row.get("team") if isinstance(team_row, dict) else {}
+            team_name = str(team_info.get("name", team_query)) if isinstance(team_info, dict) else team_query
+            fixtures = result.fixtures[:1]
         except Exception as exc:
             await ctx.send(
                 tr(
@@ -584,18 +634,24 @@ class FootballCog(commands.Cog):
             if context is None:
                 return
             league_key, league_id, season = context
-            selected = await self._resolve_team(ctx, client=client, lang=lang, league_id=league_id, season=season, query=query)
-            if selected is None:
-                return
-
-            team_id, team_name = selected
-
-            fixtures = await client.get_last_fixtures(
+            operation = compile_football_operation(
+                "FOOTBALL_LOOKUP",
+                query,
+                {"data_focus": "last_fixtures", "team_candidates": [query]},
+            )
+            result = await FootballOperationService(client).execute(
+                operation,
                 league_id=league_id,
                 season=season,
-                last_count=1,
-                team_id=team_id,
+                data_focus="last_fixtures",
             )
+            if result.outcome == FootballOutcome.AMBIGUOUS:
+                await ctx.send(tr(lang, "Multiple teams matched. Please be more specific.", "Varios equipos coinciden. Se mas especifico."))
+                return
+            team_row = result.team_context_row or {}
+            team_info = team_row.get("team") if isinstance(team_row, dict) else {}
+            team_name = str(team_info.get("name", query)) if isinstance(team_info, dict) else query
+            fixtures = result.fixtures[:1]
         except Exception as exc:
             await ctx.send(
                 tr(
@@ -695,7 +751,17 @@ class FootballCog(commands.Cog):
             if context is None:
                 return
             league_key, league_id, season = context
-            rows = await client.get_standings(league_id=league_id, season=season)
+            operation = compile_football_operation(
+                "FOOTBALL_TABLE",
+                league,
+                {"data_focus": "standings", "league_candidates": [league]},
+            )
+            result = await FootballOperationService(client).execute(
+                operation,
+                league_id=league_id,
+                season=season,
+                data_focus="standings",
+            )
         except Exception as exc:
             await ctx.send(
                 tr(
@@ -706,7 +772,7 @@ class FootballCog(commands.Cog):
             )
             return
 
-        table = self._extract_table_rows(rows)
+        table = result.standings_table
         if not table:
             await ctx.send(
                 tr(
@@ -766,26 +832,29 @@ class FootballCog(commands.Cog):
             if context is None:
                 return
             league_key, league_id, season = context
-            selected = await self._resolve_team(ctx, client=client, lang=lang, league_id=league_id, season=season, query=query)
-            if selected is None:
+            operation = compile_football_operation(
+                "FOOTBALL_TEAM_QUERY",
+                query,
+                {"data_focus": "team", "team_candidates": [query]},
+            )
+            result = await FootballOperationService(client).execute(
+                operation,
+                league_id=league_id,
+                season=season,
+                data_focus="team",
+            )
+            if result.outcome == FootballOutcome.AMBIGUOUS:
+                await ctx.send(tr(lang, "Multiple teams matched. Please be more specific.", "Varios equipos coinciden. Se mas especifico."))
                 return
-
-            team_id, team_name = selected
-
-            standings_raw = await client.get_standings(league_id=league_id, season=season)
-            standings = self._extract_table_rows(standings_raw)
-            standing_row = self._find_team_row(standings, team_id)
-
-            next_fixture = None
-            if isinstance(team_id, int):
-                upcoming = await client.get_next_fixtures(
-                    league_id=league_id,
-                    season=season,
-                    next_count=1,
-                    team_id=team_id,
-                )
-                if upcoming:
-                    next_fixture = upcoming[0]
+            if result.team_context_row is None:
+                await ctx.send(tr(lang, "Team not found in that league.", "No se encontro ese equipo en esa liga."))
+                return
+            team_row = result.team_context_row
+            team = team_row.get("team") if isinstance(team_row, dict) else {}
+            team_id = team.get("id") if isinstance(team, dict) else None
+            team_name = str(team.get("name", query)) if isinstance(team, dict) else query
+            standing_row = result.standing_row
+            next_fixture = result.fixtures[0] if result.fixtures else None
         except Exception as exc:
             await ctx.send(
                 tr(
@@ -877,7 +946,18 @@ class FootballCog(commands.Cog):
             if context is None:
                 return
             league_key, league_id, season = context
-            scorers = await client.get_top_scorers(league_id=league_id, season=season)
+            operation = compile_football_operation(
+                "FOOTBALL_LOOKUP",
+                league,
+                {"data_focus": "scorers", "league_candidates": [league]},
+            )
+            result = await FootballOperationService(client).execute(
+                operation,
+                league_id=league_id,
+                season=season,
+                data_focus="top_scorers",
+            )
+            scorers = result.generic_rows
         except Exception as exc:
             await ctx.send(
                 tr(
@@ -938,15 +1018,24 @@ class FootballCog(commands.Cog):
             return
         await self._defer_if_needed(ctx)
         try:
-            fixtures = await self._fixtures_for_query(client, query=query, league=league, lang=lang, ctx=ctx)
-            if not fixtures:
-                await ctx.send(tr(lang, "No match found.", "No se encontro partido."))
-                return
-            item = fixtures[0]
-            fixture = item.get("fixture") if isinstance(item.get("fixture"), dict) else {}
-            fixture_id = fixture.get("id")
-            events = await client.get_fixture_events(fixture_id=fixture_id) if isinstance(fixture_id, int) else []
-            stats = await client.get_fixture_statistics(fixture_id=fixture_id) if isinstance(fixture_id, int) else []
+            events = []
+            stats = []
+            if query.strip().isdigit():
+                fixtures = await self._fixtures_for_query(client, query=query, league=league, lang=lang, ctx=ctx)
+                if not fixtures:
+                    await ctx.send(tr(lang, "No match found.", "No se encontro partido."))
+                    return
+                item = fixtures[0]
+                fixture = item.get("fixture") if isinstance(item.get("fixture"), dict) else {}
+                fixture_id = fixture.get("id")
+                events = await client.get_fixture_events(fixture_id=fixture_id) if isinstance(fixture_id, int) else []
+                stats = await client.get_fixture_statistics(fixture_id=fixture_id) if isinstance(fixture_id, int) else []
+            else:
+                fixtures = await self._fixtures_for_query(client, query=query, league=league, lang=lang, ctx=ctx)
+                if not fixtures:
+                    await ctx.send(tr(lang, "No match found.", "No se encontro partido."))
+                    return
+                item = fixtures[0]
         except Exception as exc:
             await ctx.send(tr(lang, f"Failed to get match data: {exc}", f"No se pudo obtener el partido: {exc}"))
             return
@@ -981,18 +1070,22 @@ class FootballCog(commands.Cog):
             if context is None:
                 return
             league_key, league_id, season = context
-            team_id = None
             target_text = target.strip()
-            if target_text and target_text.casefold() not in {"league", "liga", "all"}:
-                selected = await self._resolve_team(ctx, client=client, lang=lang, league_id=league_id, season=season, query=target_text)
-                if selected is None:
-                    return
-                team_id = selected[0]
-            if mode_key in {"last", "previous", "pasados", "ultimos"}:
-                fixtures = await client.get_last_fixtures(league_id=league_id, season=season, last_count=5, team_id=team_id)
+            is_team_target = bool(target_text and target_text.casefold() not in {"league", "liga", "all"})
+            data_focus = "last_fixtures" if mode_key in {"last", "previous", "pasados", "ultimos"} else "next_fixtures"
+            operation = compile_football_operation(
+                "FOOTBALL_LOOKUP",
+                target_text if is_team_target else f"{data_focus} {league}",
+                {"data_focus": data_focus, "team_candidates": [target_text] if is_team_target else []},
+            )
+            result = await FootballOperationService(client).execute(operation, league_id=league_id, season=season, data_focus=f"schedule_{data_focus}")
+            if result.outcome != FootballOutcome.SELECTED:
+                await ctx.send(tr(lang, "No fixtures found.", "No se encontraron partidos."))
+                return
+            fixtures = result.fixtures
+            if data_focus == "last_fixtures":
                 title_en, title_es = "Last Fixtures", "Ultimos Partidos"
             else:
-                fixtures = await client.get_next_fixtures(league_id=league_id, season=season, next_count=5, team_id=team_id)
                 title_en, title_es = "Upcoming Fixtures", "Proximos Partidos"
         except Exception as exc:
             await ctx.send(tr(lang, f"Failed to get schedule: {exc}", f"No se pudo obtener el calendario: {exc}"))
@@ -1016,37 +1109,41 @@ class FootballCog(commands.Cog):
                 if context is None:
                     return
                 _league_key, league_id, season = context
-            lookup = await football_resolver.resolve_player(
-                client,
+            operation = compile_football_operation(
+                "FOOTBALL_PLAYER_QUERY",
                 player,
-                league_id=league_id,
-                season=season,
-                explicit_context=explicit_context,
-                canonicalizer=self._football_player_canonicalizer(),
-                alias_cache=self._football_player_alias_cache(),
+                {"data_focus": "player", "player_candidates": [player]},
             )
+            if not operation.player_slots:
+                await ctx.send(tr(lang, "I need a clearer player name.", "Necesito un nombre de jugador mas claro."))
+                return
+            result = await FootballOperationService(
+                client,
+                player_canonicalizer=self._football_player_canonicalizer(),
+                player_alias_cache=self._football_player_alias_cache(),
+            ).execute(operation, league_id=league_id, season=season, data_focus="player")
             self._log_football_diagnostic(
                 command="player",
                 resolver_input=player,
-                normalized_query=" | ".join(lookup.query.candidates),
+                normalized_query=" | ".join(operation.player_candidates),
                 explicit_context=explicit_context,
-                endpoint="/players",
+                endpoint=",".join(result.endpoints),
                 params={"league": league_id, "season": season},
-                response_count=len(lookup.rows),
-                top_candidates=self._player_candidate_names(list(lookup.rows)),
-                final_decision="ambiguous" if lookup.resolution.ambiguous else ("selected" if lookup.resolution.selected else "not_found"),
-                fallback_reason=None if lookup.resolution.selected else "no_player_match",
+                response_count=len(result.generic_rows) or (1 if result.player_context_row else 0),
+                top_candidates=self._player_candidate_names(list(result.generic_rows)),
+                final_decision="ambiguous" if result.outcome == FootballOutcome.AMBIGUOUS else ("selected" if result.player_context_row else "not_found"),
+                fallback_reason=None if result.player_context_row else "no_player_match",
             )
         except Exception as exc:
             await ctx.send(tr(lang, f"Failed to get player data: {exc}", f"No se pudo obtener el jugador: {exc}"))
             return
-        if lookup.resolution.ambiguous:
-            await ctx.send(self._format_player_disambiguation(list(lookup.resolution.matches), lang))
+        if result.outcome == FootballOutcome.AMBIGUOUS:
+            await ctx.send(self._format_player_disambiguation(list(result.generic_rows), lang))
             return
-        if lookup.resolution.selected is None:
+        if result.player_context_row is None:
             await ctx.send(tr(lang, "Player not found.", "No se encontro el jugador."))
             return
-        await ctx.send(embed=self._build_player_embed(lookup.resolution.selected, lang=lang))
+        await ctx.send(embed=self._build_player_embed(result.player_context_row, lang=lang))
 
     @football.command(name="lineup", description="Show confirmed lineups for a fixture ID.")
     async def football_lineup(self, ctx: commands.Context, fixture_id: int) -> None:
@@ -1070,10 +1167,14 @@ class FootballCog(commands.Cog):
             if context is None:
                 return
             _league_key, league_id, season = context
-            team_id, team_name = await self._resolve_team(ctx, client=client, lang=lang, league_id=league_id, season=season, query=team) or (None, team)
-            if team_id is None:
+            operation = compile_football_operation("FOOTBALL_LOOKUP", team, {"data_focus": "injuries", "team_candidates": [team]})
+            result = await FootballOperationService(client).execute(operation, league_id=league_id, season=season, data_focus="injuries")
+            if result.outcome != FootballOutcome.SELECTED:
                 return
-            rows = await client.get_injuries(league_id=league_id, season=season, team_id=team_id)
+            rows = result.generic_rows
+            team_row = result.team_context_row or {}
+            team_info = team_row.get("team") if isinstance(team_row, dict) else {}
+            team_name = str(team_info.get("name", team)) if isinstance(team_info, dict) else team
         except Exception as exc:
             await ctx.send(tr(lang, f"Failed to get injuries: {exc}", f"No se pudieron obtener lesionados: {exc}"))
             return
@@ -1093,10 +1194,14 @@ class FootballCog(commands.Cog):
             if context is None:
                 return
             _league_key, league_id, season = context
-            team_id, team_name = await self._resolve_team(ctx, client=client, lang=lang, league_id=league_id, season=season, query=team) or (None, team)
-            if team_id is None:
+            operation = compile_football_operation("FOOTBALL_LOOKUP", team, {"data_focus": "transfers", "team_candidates": [team]})
+            result = await FootballOperationService(client).execute(operation, league_id=league_id, season=season, data_focus="transfers")
+            if result.outcome != FootballOutcome.SELECTED:
                 return
-            rows = await client.get_transfers(team_id=team_id)
+            rows = result.generic_rows
+            team_row = result.team_context_row or {}
+            team_info = team_row.get("team") if isinstance(team_row, dict) else {}
+            team_name = str(team_info.get("name", team)) if isinstance(team_info, dict) else team
         except Exception as exc:
             await ctx.send(tr(lang, f"Failed to get transfers: {exc}", f"No se pudieron obtener transferencias: {exc}"))
             return
@@ -1116,15 +1221,15 @@ class FootballCog(commands.Cog):
             if context is None:
                 return
             _league_key, league_id, season = context
-            first = await self._resolve_team(ctx, client=client, lang=lang, league_id=league_id, season=season, query=team_a)
-            second = await self._resolve_team(ctx, client=client, lang=lang, league_id=league_id, season=season, query=team_b)
-            if first is None or second is None:
+            operation = compile_football_operation("FOOTBALL_COMPARISON", f"{team_a} vs {team_b}", {"data_focus": "h2h", "team_candidates": [team_a, team_b]})
+            result = await FootballOperationService(client).execute(operation, league_id=league_id, season=season, data_focus="h2h")
+            if result.outcome != FootballOutcome.SELECTED:
                 return
-            fixtures = await client.get_head_to_head(team_a_id=first[0], team_b_id=second[0])
+            fixtures = result.generic_rows
         except Exception as exc:
             await ctx.send(tr(lang, f"Failed to get H2H: {exc}", f"No se pudo obtener H2H: {exc}"))
             return
-        await self._send_fixture_embeds(ctx, fixtures, lang=lang, league_label=f"{first[1]} vs {second[1]}", title_en="Head to Head", title_es="Historial")
+        await self._send_fixture_embeds(ctx, fixtures, lang=lang, league_label=f"{team_a} vs {team_b}", title_en="Head to Head", title_es="Historial")
 
     @football.command(name="top", description="Show top scorers, assists, or cards.")
     @app_commands.describe(category="scorers, assists, yellowcards, redcards", league=LEAGUE_HELP_TEXT)
@@ -1141,18 +1246,21 @@ class FootballCog(commands.Cog):
                 return
             league_key, league_id, season = context
             key = category.strip().casefold()
+            data_focus = "top_scorers"
             if key in {"assists", "asistencias"}:
-                rows = await client.get_top_assists(league_id=league_id, season=season)
+                data_focus = "top_assists"
                 label = "Top Assists"
             elif key in {"yellowcards", "yellow", "amarillas"}:
-                rows = await client.get_top_yellow_cards(league_id=league_id, season=season)
+                data_focus = "top_yellow_cards"
                 label = "Top Yellow Cards"
             elif key in {"redcards", "red", "rojas"}:
-                rows = await client.get_top_red_cards(league_id=league_id, season=season)
+                data_focus = "top_red_cards"
                 label = "Top Red Cards"
             else:
-                rows = await client.get_top_scorers(league_id=league_id, season=season)
                 label = "Top Scorers"
+            operation = compile_football_operation("FOOTBALL_LOOKUP", f"{category} {league}", {"data_focus": data_focus, "league_candidates": [league]})
+            result = await FootballOperationService(client).execute(operation, league_id=league_id, season=season, data_focus=data_focus)
+            rows = result.generic_rows
         except Exception as exc:
             await ctx.send(tr(lang, f"Failed to get leaderboard: {exc}", f"No se pudo obtener la tabla: {exc}"))
             return
@@ -1182,10 +1290,15 @@ class FootballCog(commands.Cog):
         if context is None:
             return []
         _league_key, league_id, season = context
-        selected = await self._resolve_team(ctx, client=client, lang=lang, league_id=league_id, season=season, query=stripped)
-        if selected is None:
+        operation = compile_football_operation(
+            "FOOTBALL_LOOKUP",
+            stripped,
+            {"data_focus": "next_fixtures", "team_candidates": [stripped]},
+        )
+        result = await FootballOperationService(client).execute(operation, league_id=league_id, season=season, data_focus="single_next_fixtures")
+        if result.outcome != FootballOutcome.SELECTED:
             return []
-        return await client.get_next_fixtures(league_id=league_id, season=season, next_count=1, team_id=selected[0])
+        return result.fixtures[:1]
 
     async def _resolve_team(
         self,
@@ -1197,15 +1310,17 @@ class FootballCog(commands.Cog):
         season: int,
         query: str,
     ) -> tuple[int, str] | None:
-        normalized = football_resolver.canonical_team_query(query)
-        teams = await client.search_teams(name=normalized, league_id=league_id, season=season)
-        picked = football_resolver.pick_team(teams, query)
-        if picked.selected is None and not picked.ambiguous:
-            fallback_teams = await client.search_teams(name=normalized, league_id=None, season=None)
-            fallback = football_resolver.pick_team(fallback_teams, query)
-            if fallback.selected is not None or fallback.ambiguous:
-                picked = fallback
-                teams = fallback_teams
+        operation = compile_football_operation(
+            "FOOTBALL_LOOKUP",
+            query,
+            {"data_focus": "team", "team_candidates": [query]},
+        )
+        if not operation.team_slots:
+            await ctx.send(tr(lang, "I need a clearer team name.", "Necesito un nombre de equipo mas claro."))
+            return None
+        normalized = football_resolver.canonical_team_query(operation.team_slots[0].name)
+        service = FootballOperationService(client)
+        team_row, outcome = await service.resolve_team(operation, league_id=league_id, season=season)
         self._log_football_diagnostic(
             command="team_resolver",
             resolver_input=query,
@@ -1213,23 +1328,18 @@ class FootballCog(commands.Cog):
             explicit_context=True,
             endpoint="/teams",
             params={"league": league_id, "season": season},
-            response_count=len(teams),
-            top_candidates=self._team_candidate_names(teams),
-            final_decision="ambiguous" if picked.ambiguous else ("selected" if picked.selected else "not_found"),
-            fallback_reason=None if picked.selected else "no_team_match",
+            response_count=1 if team_row else 0,
+            top_candidates=self._team_candidate_names([team_row] if team_row else []),
+            final_decision="ambiguous" if outcome == FootballOutcome.AMBIGUOUS else ("selected" if team_row else "not_found"),
+            fallback_reason=None if team_row else "no_team_match",
         )
-        if picked.ambiguous:
-            names = []
-            for item in picked.matches[:5]:
-                team = item.get("team") if isinstance(item, dict) else {}
-                if isinstance(team, dict):
-                    names.append(str(team.get("name", "Unknown")))
-            await ctx.send(tr(lang, f"Multiple teams matched: {', '.join(names)}", f"Varios equipos coinciden: {', '.join(names)}"))
+        if outcome == FootballOutcome.AMBIGUOUS:
+            await ctx.send(tr(lang, "Multiple teams matched. Please be more specific.", "Varios equipos coinciden. Se mas especifico."))
             return None
-        if picked.selected is None:
+        if team_row is None:
             await ctx.send(tr(lang, "Team not found in that league.", "No se encontro ese equipo en esa liga."))
             return None
-        team = picked.selected.get("team") if isinstance(picked.selected, dict) else {}
+        team = team_row.get("team") if isinstance(team_row, dict) else {}
         team_id = team.get("id") if isinstance(team, dict) else None
         team_name = str(team.get("name", query)) if isinstance(team, dict) else query
         if not isinstance(team_id, int):
@@ -1272,6 +1382,16 @@ class FootballCog(commands.Cog):
             names.append(f"{name} ({team_name})")
         joined = ", ".join(names) or "Unknown"
         return tr(lang, f"Multiple players matched: {joined}", f"Varios jugadores coinciden: {joined}")
+
+    @staticmethod
+    def _football_today_iso(client: Any) -> str:
+        method = getattr(client, "today_iso", None)
+        if callable(method):
+            try:
+                return str(method())
+            except Exception:
+                logging.warning("API-Football timezone date helper failed; falling back to local date")
+        return date.today().isoformat()
 
     @staticmethod
     def _log_football_diagnostic(
@@ -1421,14 +1541,13 @@ class FootballCog(commands.Cog):
     @staticmethod
     def _format_statistics(stats: list[dict[str, Any]]) -> str:
         lines = []
-        for item in stats[:2]:
-            team = item.get("team") if isinstance(item.get("team"), dict) else {}
-            values = item.get("statistics") if isinstance(item.get("statistics"), list) else []
+        for team_stats in list(normalize_match_statistics(stats).values())[:2]:
             compact = []
-            for value in values[:6]:
-                if isinstance(value, dict):
-                    compact.append(f"{value.get('type')}: {value.get('value')}")
-            lines.append(f"**{team.get('name', 'Team')}**\n" + "\n".join(compact))
+            team_name = "Team"
+            for stat in list(team_stats.values())[:6]:
+                team_name = stat.team_name or team_name
+                compact.append(f"{stat.original_label}: {stat.display_value}")
+            lines.append(f"**{team_name}**\n" + "\n".join(compact))
         return ("\n\n".join(lines) or "N/A")[:1024]
 
     @staticmethod

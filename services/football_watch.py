@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from services.football_formatter import fixture_score, fixture_status, fixture_teams
+from services.football_live_match_service import match_event_key, normalize_shootout, stats_for_watch
 
 
 WATCH_CHECKPOINT_MINUTES = (15, 30, 60, 75)
@@ -17,6 +18,9 @@ class FootballWatchSnapshot:
     status_short: str
     elapsed: int | None
     stats: dict[str, dict[str, float]] = field(default_factory=dict)
+    event_keys: tuple[str, ...] = ()
+    shootout_attempt_keys: tuple[str, ...] = ()
+    shootout_score: str = ""
 
 
 @dataclass(frozen=True)
@@ -41,7 +45,8 @@ def snapshot_from_fixture(
         status=status,
         status_short=str(status_obj.get("short") or status.split()[0] if status else "").upper(),
         elapsed=status_obj.get("elapsed") if isinstance(status_obj.get("elapsed"), int) else None,
-        stats=_parse_team_statistics(statistics or []),
+        stats=stats_for_watch(statistics or []),
+        shootout_score=_shootout_score(fixture),
     )
 
 
@@ -90,13 +95,36 @@ def build_watch_updates(
     lineups: list[dict[str, Any]] | None = None,
 ) -> tuple[list[FootballWatchUpdate], FootballWatchSnapshot]:
     updates: list[FootballWatchUpdate] = []
-    for event in events[:80]:
-        key = event_key(event)
+    ordered_events = [event for event in events[:80] if isinstance(event, dict)]
+    ordered_keys = tuple(event_key(event, index=index) for index, event in enumerate(ordered_events))
+    for index, event in enumerate(ordered_events):
+        key = event_key(event, index=index)
         if key in seen_event_keys or not _event_is_meaningful(event):
             continue
         text = format_event_update(event, fixture)
         if text:
             updates.append(FootballWatchUpdate("event", text, event_key=key))
+
+    entered_shootout = previous is not None and previous.status_short != "P" and current.status_short == "P"
+    pre_shootout_keys = set(previous.event_keys if previous is not None else ordered_keys)
+    shootout = normalize_shootout(
+        fixture,
+        ordered_events,
+        pre_shootout_event_keys=pre_shootout_keys,
+        live_entered_shootout=entered_shootout or (previous is not None and previous.status_short == "P" and current.status_short == "P"),
+    )
+    prior_attempt_keys = set(previous.shootout_attempt_keys if previous is not None else ())
+    current_attempt_keys = tuple(item.attempt_key for item in shootout.attempts)
+    for attempt in shootout.attempts:
+        if attempt.attempt_key in prior_attempt_keys or attempt.attempt_key in seen_event_keys:
+            continue
+        outcome = "anota" if attempt.scored else "falla"
+        label = attempt.player_name or "Jugador"
+        team = f" ({attempt.team_name})" if attempt.team_name else ""
+        score = _shootout_score(fixture)
+        updates.append(FootballWatchUpdate("shootout", f"Penales: {label}{team} {outcome}. {score}".strip(), event_key=attempt.attempt_key))
+    if previous is not None and current.shootout_score != previous.shootout_score and current.status_short in {"P", "PEN"} and not any(item.update_type == "shootout" for item in updates):
+        updates.append(FootballWatchUpdate("shootout", f"Penales: {_fixture_label(fixture)} {current.shootout_score}".strip()))
 
     if lineups:
         lineups_text = _format_lineups_update(lineups)
@@ -117,24 +145,20 @@ def build_watch_updates(
         if checkpoint_text:
             updates.append(FootballWatchUpdate("checkpoint", checkpoint_text, checkpoint=checkpoint))
 
-    return [item for item in updates if item.needs_send and item.text.strip()], current
-
-
-def event_key(event: dict[str, Any]) -> str:
-    time_info = event.get("time") if isinstance(event.get("time"), dict) else {}
-    team = event.get("team") if isinstance(event.get("team"), dict) else {}
-    player = event.get("player") if isinstance(event.get("player"), dict) else {}
-    return "|".join(
-        str(part or "")
-        for part in (
-            time_info.get("elapsed"),
-            time_info.get("extra"),
-            team.get("id") or team.get("name"),
-            player.get("id") or player.get("name"),
-            event.get("type"),
-            event.get("detail"),
-        )
+    return [item for item in updates if item.needs_send and item.text.strip()], FootballWatchSnapshot(
+        score=current.score,
+        status=current.status,
+        status_short=current.status_short,
+        elapsed=current.elapsed,
+        stats=current.stats,
+        event_keys=ordered_keys,
+        shootout_attempt_keys=current_attempt_keys,
+        shootout_score=current.shootout_score,
     )
+
+
+def event_key(event: dict[str, Any], *, index: int = 0) -> str:
+    return match_event_key(event, index)
 
 
 def format_event_update(event: dict[str, Any], fixture: dict[str, Any]) -> str:
@@ -192,7 +216,7 @@ def _event_is_meaningful(event: dict[str, Any]) -> bool:
 
 
 def _status_changed_meaningfully(previous: str, current: str) -> bool:
-    return previous != current and current in {"1H", "HT", "2H", "ET", "BT", "P", "FT", "AET", "PEN", "CANC", "ABD", "PST"}
+    return previous != current and current in {"1H", "HT", "2H", "ET", "BT", "P", "FT", "AET", "PEN", "CANC", "ABD", "PST", "SUSP", "INT", "AWD", "WO"}
 
 
 def _phase_label(status_short: str) -> str:
@@ -206,8 +230,12 @@ def _phase_label(status_short: str) -> str:
         "FT": "Final",
         "AET": "Final en tiempos extra",
         "PEN": "Final por penales",
+        "SUSP": "Suspendido",
+        "INT": "Interrumpido",
         "CANC": "Cancelado",
         "ABD": "Suspendido",
+        "AWD": "Adjudicado",
+        "WO": "Walkover",
         "PST": "Pospuesto",
     }.get(status_short, status_short)
 
@@ -215,6 +243,16 @@ def _phase_label(status_short: str) -> str:
 def _fixture_label(fixture: dict[str, Any]) -> str:
     home, away = fixture_teams(fixture)
     return f"{home} vs {away}"
+
+
+def _shootout_score(fixture: dict[str, Any]) -> str:
+    score = fixture.get("score") if isinstance(fixture.get("score"), dict) else {}
+    penalty = score.get("penalty") if isinstance(score.get("penalty"), dict) else {}
+    home = penalty.get("home")
+    away = penalty.get("away")
+    if isinstance(home, int) or isinstance(away, int):
+        return f"Shootout: {home if isinstance(home, int) else '-'}-{away if isinstance(away, int) else '-'}"
+    return ""
 
 
 def _goal_impact(event: dict[str, Any], fixture: dict[str, Any]) -> str:
@@ -249,52 +287,6 @@ def _goal_impact(event: dict[str, Any], fixture: dict[str, Any]) -> str:
     if scored < conceded:
         return "Descuenta"
     return ""
-
-
-def _parse_team_statistics(rows: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
-    parsed: dict[str, dict[str, float]] = {}
-    for row in rows:
-        team = row.get("team") if isinstance(row, dict) else {}
-        team_name = str(team.get("name") or "").strip()
-        stats = row.get("statistics") if isinstance(row.get("statistics"), list) else []
-        if not team_name:
-            continue
-        values: dict[str, float] = {}
-        for item in stats:
-            if not isinstance(item, dict):
-                continue
-            stat_type = str(item.get("type") or "").casefold()
-            key = _stat_key(stat_type)
-            if not key:
-                continue
-            value = _numeric_stat_value(item.get("value"))
-            if value is not None:
-                values[key] = value
-        if values:
-            parsed[team_name] = values
-    return parsed
-
-
-def _stat_key(stat_type: str) -> str | None:
-    if "shot" in stat_type and ("goal" in stat_type or "target" in stat_type):
-        return "shots_on_target"
-    if "total shot" in stat_type or stat_type == "shots total":
-        return "shots"
-    if "corner" in stat_type:
-        return "corners"
-    if "possession" in stat_type:
-        return "possession"
-    return None
-
-
-def _numeric_stat_value(value: object) -> float | None:
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value or "").strip().replace("%", "")
-    try:
-        return float(text)
-    except ValueError:
-        return None
 
 
 def _format_lineups_update(lineups: list[dict[str, Any]]) -> str:

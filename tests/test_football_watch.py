@@ -144,6 +144,67 @@ class FootballWatchTests(unittest.TestCase):
         self.assertTrue(is_terminal_status("AET"))
         self.assertFalse(is_terminal_status("2H 80'"))
 
+    def test_multiple_events_between_polls_are_all_emitted_in_order(self) -> None:
+        fixture = _fixture(home=2, away=1, elapsed=70)
+        events = [
+            {"time": {"elapsed": 61}, "team": {"id": 1, "name": "Francia"}, "player": {"id": 9, "name": "A"}, "type": "Goal", "detail": "Normal Goal"},
+            {"time": {"elapsed": 63}, "team": {"id": 2, "name": "Inglaterra"}, "player": {"id": 10, "name": "B"}, "type": "Card", "detail": "Yellow Card"},
+            {"time": {"elapsed": 66}, "team": {"id": 1, "name": "Francia"}, "player": {"id": 11, "name": "C"}, "type": "Var", "detail": "Penalty confirmed"},
+        ]
+
+        updates, snapshot = build_watch_updates(
+            previous=snapshot_from_fixture(_fixture(home=1, away=0, elapsed=60)),
+            current=snapshot_from_fixture(fixture),
+            fixture=fixture,
+            events=events,
+            seen_event_keys=set(),
+            emitted_checkpoints=set(),
+        )
+
+        self.assertEqual([update.update_type for update in updates[:3]], ["event", "event", "event"])
+        self.assertIn("A", updates[0].text)
+        self.assertIn("B", updates[1].text)
+        self.assertIn("VAR", updates[2].text)
+        seen = {update.event_key for update in updates if update.event_key}
+        repeated, _ = build_watch_updates(
+            previous=snapshot,
+            current=snapshot,
+            fixture=fixture,
+            events=events,
+            seen_event_keys=seen,
+            emitted_checkpoints=set(),
+        )
+        self.assertEqual(repeated, [])
+
+    def test_shootout_diff_uses_pre_shootout_baseline(self) -> None:
+        regulation_penalty = {"time": {"elapsed": 80}, "team": {"id": 1, "name": "Francia"}, "player": {"id": 7, "name": "Reg"}, "type": "Goal", "detail": "Penalty"}
+        previous_snapshot = snapshot_from_fixture(_fixture(home=1, away=1, status="ET", elapsed=120))
+        previous_snapshot = type(previous_snapshot)(
+            score=previous_snapshot.score,
+            status=previous_snapshot.status,
+            status_short=previous_snapshot.status_short,
+            elapsed=previous_snapshot.elapsed,
+            stats=previous_snapshot.stats,
+            event_keys=("0|80||1|7|Goal|Penalty",),
+        )
+        shootout_fixture = _fixture(home=1, away=1, status="P", elapsed=120)
+        shootout_fixture["score"] = {"penalty": {"home": 1, "away": 0}}
+        shootout_attempt = {"time": {"elapsed": 120}, "team": {"id": 1, "name": "Francia"}, "player": {"id": 8, "name": "Shooter"}, "type": "Goal", "detail": "Penalty"}
+
+        updates, _snapshot = build_watch_updates(
+            previous=previous_snapshot,
+            current=snapshot_from_fixture(shootout_fixture),
+            fixture=shootout_fixture,
+            events=[regulation_penalty, shootout_attempt],
+            seen_event_keys={"0|80||1|7|Goal|Penalty"},
+            emitted_checkpoints=set(),
+        )
+        text = "\n".join(update.text for update in updates)
+
+        self.assertNotIn("Reg", text)
+        self.assertIn("Shooter", text)
+        self.assertIn("Shootout: 1-0", text)
+
 
 if __name__ == "__main__":
     unittest.main()
