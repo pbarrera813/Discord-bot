@@ -11,9 +11,10 @@ Nitori was built as a single, no-paywall Discord bot for communities that want b
 
 ## Main Features
 - Moderation toolkit (message, user, channel, role, and color-role panel management).
-- Natural AI conversation with explicit mention/reply/name anchors, same-user continuation leases, replied-message awareness, pending interaction changes, reaction-only requests, and safe noisy-channel replies.
+- Natural AI conversation with explicit mention/reply/name anchors, same-user continuation leases, replied-message awareness, pending interaction tracking, reaction-only requests, and safe noisy-channel replies.
+- Native Discord voice-message responses when a user explicitly asks for the current AI response as audio/voice. Voice is one-turn only and returns to text on the next turn unless requested again.
 - AI image generation, image analysis, and image editing from current or replied image messages.
-- AI football answers grounded in API-Football data, including teams, players, leagues, fixtures, standings, scorers, injuries, transfers, match events, stats, lineups, summaries, previews, and live-watch updates.
+- AI football answers grounded in API-Football data, including teams, players, leagues, fixtures, standings, scorers, injuries, transfers, match events, stats, lineups, summaries, previews, current score/status, and live-watch updates.
 - Optional xAI web search for current external information and API-Football gaps.
 - Structured server memory and trusted owner/admin behavior rules for server-specific style and context.
 - Translation command with multiple target languages.
@@ -43,12 +44,15 @@ Required for full feature set:
 - `XAI_API_KEY`
 - `API_NINJAS_KEY`
 - `API_FOOTBALL_KEY`
+- `API_FOOTBALL_TIMEZONE` (defaults to `America/Mexico_City` for fixture kickoff times)
 - `GLOT_API_TOKEN`
 
 Common optional settings:
 - `XAI_MODEL` (default model)
 - `XAI_VISION_MODEL` (optional image-capable model for AI chat attachments; defaults to `XAI_MODEL`)
 - `XAI_IMAGE_MODEL` (optional image generation/editing model; defaults to `grok-imagine-image-quality`)
+- `XAI_TTS_VOICE` (voice used for native Discord voice messages; defaults to `iris`)
+- `XAI_TTS_LANGUAGE` (language used for native Discord voice messages; defaults to `es-MX`)
 - `XAI_WEB_SEARCH_ENABLED` (default `false`; enable only when deployed bot should use xAI web search)
 - `XAI_X_SEARCH_ENABLED` (default `false`; reserved for explicit X/social search support)
 - `XAI_WEB_SEARCH_MAX_SOURCES` (default `3`)
@@ -179,7 +183,16 @@ Temp time format:
 - `/color remove <name>`
 
 ### Utility
-- `/say <message>` (mod/admin permission required)
+- `/say <message>` (mod/admin permission required; slash form supports `modo=text|voice`)
+
+### Voice
+- Any normal user can explicitly ask Nitori to deliver the current AI response as a native Discord voice message.
+- Voice delivery is per-turn only. The next conversation turn returns to text unless voice/audio is requested again in that current message.
+- Conversational voice uses the normal AI/football/web/tool pipeline first, then converts the final response through xAI TTS.
+- `/say mensaje:<text> modo:<text|voice>` is still restricted by its existing Manage Messages permission; `modo=voice` sends a native Discord voice message.
+- Native voice means a Discord voice-message upload, not Discord `tts=true` and not voice-channel playback.
+- Default TTS configuration is Iris with `es-MX`, configurable through `XAI_TTS_VOICE` and `XAI_TTS_LANGUAGE`.
+- Supported expressive xAI TTS tags in voice output: `[pause]`, `[long-pause]`, `[hum-tune]`, `[laugh]`, `[chuckle]`, `[giggle]`, `[cry]`, `[tsk]`, `[tongue-click]`, `[lip-smack]`, `[breath]`, `[inhale]`, `[exhale]`, `[sigh]`.
 
 ### Reminders
 - `/remindme <time> <message>`
@@ -245,6 +258,8 @@ Supported leagues:
 - `worldcup`
 
 Natural AI football requests are not limited to these short keys. When addressed directly, Nitori can resolve natural names such as Liga MX, Liga de Expansion MX, Premier League, LaLiga, World Cup, clubs, national teams, and player aliases through the shared football resolver before calling API-Football.
+
+The AI football pipeline also supports typed follow-ups from validated football context, fixture result/date questions, match-center details, events, statistics, lineups, fixture-player data, injuries, transfers, top scorers/assists/cards, H2H, and live-watch selection without treating model guesses as facts.
 
 ### Fun APIs (API Ninjas)
 - `/joke`
