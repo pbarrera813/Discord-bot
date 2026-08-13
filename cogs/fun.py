@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import calendar
+import logging
 import re
 import time
 from datetime import datetime, time as dt_time, timedelta
+from typing import Literal
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from services.voice_messages import DiscordVoiceMessageSender, VoiceAudioProcessor, sanitize_tts_text
+from services.xai_client import XAITTSAuthorizationError
 from utils.i18n import tr
 
 
@@ -301,16 +305,39 @@ class FunCog(commands.Cog):
         except (discord.Forbidden, discord.HTTPException):
             return False
 
+    async def _send_say_voice_as_bot(self, ctx: commands.Context, text: str) -> tuple[bool, str]:
+        channel = getattr(ctx, "channel", None)
+        llm_client = getattr(self.bot, "llm_client", None)
+        if channel is None or llm_client is None or not hasattr(llm_client, "text_to_speech"):
+            return False, "Voice output is not configured."
+        try:
+            tts_text = sanitize_tts_text(text)
+            audio_bytes, content_type = await llm_client.text_to_speech(tts_text)
+            extension = ".wav" if "wav" in content_type.casefold() else ".mp3"
+            processor = getattr(self.bot, "voice_audio_processor", None) or VoiceAudioProcessor()
+            processed = await processor.process(audio_bytes, source_extension=extension)
+            sender = getattr(self.bot, "discord_voice_sender", None) or DiscordVoiceMessageSender(self.bot)
+            await sender.send(channel, processed)
+            return True, "Sent voice message."
+        except Exception as exc:
+            logging.exception("say voice message failed guild=%s channel=%s", getattr(getattr(ctx, "guild", None), "id", None), getattr(channel, "id", None))
+            if isinstance(exc, XAITTSAuthorizationError):
+                return False, "Voice output is not authorized for the configured xAI API key."
+            return False, f"Failed to send the voice message: {type(exc).__name__}"
+
     @commands.hybrid_command(
         name="say",
         description="Make the bot repeat a message.",
     )
+    @app_commands.rename(message="mensaje", mode="modo")
+    @app_commands.describe(message="Message to send.", mode="Send as text or as a native Discord voice message.")
     @commands.has_permissions(manage_messages=True)
-    async def say(self, ctx: commands.Context, *, message: str) -> None:
+    async def say(self, ctx: commands.Context, *, message: str, mode: Literal["text", "voice"] = "text") -> None:
         text = message.strip()
         if not text:
             await ctx.send("Message cannot be empty.")
             return
+        voice_mode = mode == "voice" and ctx.interaction is not None
 
         if ctx.interaction is None and ctx.message:
             try:
@@ -327,15 +354,16 @@ class FunCog(commands.Cog):
         except (discord.NotFound, discord.HTTPException):
             pass
 
-        sent = await self._send_say_as_bot(ctx, text)
+        if voice_mode:
+            sent, status = await self._send_say_voice_as_bot(ctx, text)
+        else:
+            sent = await self._send_say_as_bot(ctx, text)
+            status = "Sent." if sent else "Failed to send the message in this channel."
         try:
             if sent:
-                await ctx.interaction.followup.send("Sent.", ephemeral=True)
+                await ctx.interaction.followup.send(status, ephemeral=True)
             else:
-                await ctx.interaction.followup.send(
-                    "Failed to send the message in this channel.",
-                    ephemeral=True,
-                )
+                await ctx.interaction.followup.send(status, ephemeral=True)
         except (discord.NotFound, discord.HTTPException):
             pass
 
