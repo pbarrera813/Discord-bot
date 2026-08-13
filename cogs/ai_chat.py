@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 import difflib
 import json
@@ -16,10 +16,12 @@ from typing import Any, Final
 import discord
 from discord.ext import commands
 
+from services.admin_actions import AdminActionService, DISCORD_TIMEOUT_MAX_SECONDS
 from services.football_analysis_context import build_fixture_context, build_player_context, build_standings_context, build_team_context, football_grounding_prompt
 from services.football_formatter import fixture_score, fixture_status, fixture_teams
-from services.football_query_service import FootballQueryOperation, build_operation, clean_entity_candidates, looks_like_raw_sentence, season_hint_to_int
-from services.football_resolver import canonical_team_query, normalize_league_key, pick_team
+from services.football_live_match_service import FootballLiveMatchService, compact_match_data, match_requested_stat
+from services.football_operation_service import FootballOperationService, FootballOutcome
+from services.football_query_service import FootballQueryOperation, build_operation, compile_football_operation
 from services.football_watch import (
     FootballWatchSnapshot,
     build_watch_updates,
@@ -31,6 +33,15 @@ from services.football_watch import (
 from services import football_resolver
 from services.server_memory import ServerMemoryInput, ServerMemoryService
 from services.server_memory_context import ServerMemoryContextBuilder
+from services.voice_messages import (
+    ALLOWED_TTS_TAGS,
+    DiscordVoiceMessageSender,
+    ResponseModality,
+    VoiceAudioProcessor,
+    VoiceResponseDecision,
+    sanitize_tts_text,
+)
+from services.xai_client import XAITTSAuthorizationError
 from services.web_research import WebResearchRequest, WebResearchService
 from services.web_research_context import football_web_grounding_prompt, format_web_research_context, web_grounding_prompt
 from utils.discord_helpers import parse_user_id_from_text
@@ -64,6 +75,26 @@ class ContinuationLease:
     expires_at: float
     last_action: str = "CHAT"
     resolved_request: str | None = None
+    football_context: dict[str, object] | None = None
+
+
+@dataclass
+class FootballTurnContext:
+    guild_id: int
+    channel_id: int
+    owner_user_id: int
+    payload: dict[str, object]
+    last_operation: str
+    source_user_message_id: int | None
+    source_assistant_message_id: int | None
+    updated_at: float
+    expires_at: float
+    dormant: bool = False
+
+    def to_prior_context(self) -> str:
+        data = dict(self.payload)
+        data["operation_type"] = data.get("operation_type") or self.last_operation
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":"))[:700]
 
 
 @dataclass(frozen=True)
@@ -78,8 +109,10 @@ class RouteDecision:
     emoji: str | None = None
     emojis: tuple[str, ...] = ()
     send_text: bool = True
+    response_delivery: dict[str, Any] | None = None
     pending_operation: str | None = None
     memory: dict[str, str] | None = None
+    admin: dict[str, Any] | None = None
     valid: bool = True
     failure: bool = False
     failure_reason: str | None = None
@@ -167,6 +200,7 @@ ROUTE_ACTIONS: Final[set[str]] = {
     "FOOTBALL_LIVE_WATCH_STOP",
     "FOOTBALL_EXPLAIN_RESULT",
     "WEB_LOOKUP",
+    "ADMIN_ACTION",
     "SERVER_MEMORY_LOOKUP",
     "SERVER_MEMORY_WRITE",
     "SERVER_MEMORY_UPDATE",
@@ -192,6 +226,7 @@ ROUTE_REASON_CODES: Final[set[str]] = {
     "ROUTER_FAILURE",
     "MISSED_RESPONSE_REPAIR",
     "SERVER_MEMORY_REQUEST",
+    "ADMIN_ACTION_REQUEST",
 }
 AMBIGUOUS_ALLOWED_REASON_CODES: Final[set[str]] = {
     "SAME_USER_CONTINUATION",
@@ -335,6 +370,7 @@ class AIChatCog(commands.Cog):
         self._cooldown_seconds = 4.0
         self._continuation_lease_seconds = CONTINUATION_LEASE_SECONDS
         self._continuation_leases: dict[tuple[int, int], ContinuationLease] = {}
+        self._football_turn_contexts: dict[tuple[int, int, int], FootballTurnContext] = {}
         self._pending_interactions: dict[tuple[int, int, int, int | None], PendingInteraction] = {}
         self._pending_versions: dict[tuple[int, int, int, int | None], int] = {}
         self._missed_response_ttl_seconds = 90.0
@@ -363,6 +399,7 @@ class AIChatCog(commands.Cog):
             if self._server_memory is not None
             else None
         )
+        self._admin_actions = AdminActionService(bot)
         settings = getattr(self.bot, "settings", None)
         self._web_research = getattr(self.bot, "web_research_service", None) or WebResearchService(
             getattr(self.bot, "llm_client", None),
@@ -375,6 +412,10 @@ class AIChatCog(commands.Cog):
         self._chat_response_id_limit = 600
         self._chat_response_ids: deque[int] = deque(maxlen=self._chat_response_id_limit)
         self._chat_response_id_set: set[int] = set()
+        self._voice_response_consumed_ids: deque[int] = deque(maxlen=600)
+        self._voice_response_consumed_set: set[int] = set()
+        self._voice_response_decision_ids: deque[int] = deque(maxlen=600)
+        self._voice_response_decisions: dict[int, VoiceResponseDecision] = {}
 
     def cog_unload(self) -> None:
         for watch in list(self._football_live_watches.values()):
@@ -425,8 +466,8 @@ class AIChatCog(commands.Cog):
 
         replied_message = await self._get_replied_message(message)
 
-        if self._is_slash_command_response_message(replied_message):
-            self._invalidate_owner_lease_for_rejection(message, "slash_output_reply")
+        if self._is_command_result_message(replied_message) and not self._message_mentions_bot_with_prompt(message):
+            self._invalidate_owner_lease_for_rejection(message, "command_output_reply")
             return
         pending_interaction = self._get_pending_interaction(message)
         pending_context = self._is_pending_followup_candidate(message, pending_interaction)
@@ -457,7 +498,7 @@ class AIChatCog(commands.Cog):
         if not user_prompt:
             self._invalidate_owner_lease_for_rejection(message, "empty_prompt")
             return
-        if self.bot.user in message.mentions:
+        if self.bot.user in message.mentions and self._local_admin_action_plan(message) is None:
             hinted_command = self._detect_command_hint(user_prompt)
             if hinted_command:
                 await message.reply(
@@ -555,6 +596,18 @@ class AIChatCog(commands.Cog):
                 pending_interaction=pending_interaction,
             )
             return
+        if route_decision.action == "ADMIN_ACTION":
+            await self._execute_admin_action(
+                message,
+                route_decision,
+                lang=lang,
+                replied_message=replied_message,
+                reply_to_trigger=self._should_reply_to_trigger(
+                    message,
+                    is_direct_trigger=anchor_type in STRONG_ANCHORS,
+                ),
+            )
+            return
         if route_decision.action.startswith("SERVER_MEMORY_"):
             if self._server_memory is not None:
                 await self._execute_server_memory_action(
@@ -587,6 +640,7 @@ class AIChatCog(commands.Cog):
                 route_decision,
                 lang=lang,
                 user_prompt=user_prompt,
+                anchor_type=anchor_type,
                 reply_to_trigger=self._should_reply_to_trigger(
                     message,
                     is_direct_trigger=anchor_type in STRONG_ANCHORS,
@@ -600,6 +654,7 @@ class AIChatCog(commands.Cog):
                 settings=settings,
                 lang=lang,
                 user_prompt=user_prompt,
+                anchor_type=anchor_type,
                 reply_to_trigger=self._should_reply_to_trigger(
                     message,
                     is_direct_trigger=anchor_type in STRONG_ANCHORS,
@@ -802,6 +857,17 @@ class AIChatCog(commands.Cog):
         if anchor_type == "SAME_USER_CONTINUATION":
             conversation_mode = "continuation"
 
+        football_chat_context = self._football_chat_context_for_message(
+            message,
+            user_prompt,
+            anchor_type=anchor_type,
+            action=route_decision.action,
+        )
+        if football_chat_context is not None:
+            llm_prompt = f"{llm_prompt}\n\n{self._football_chat_grounding_note(football_chat_context)}"
+        if self._response_modality_for_message(message) == ResponseModality.VOICE:
+            llm_prompt = f"{llm_prompt}\n\n{self._voice_delivery_prompt_note()}"
+
         pending_for_send = self._set_pending_interaction(
             message,
             route_decision=route_decision,
@@ -952,6 +1018,14 @@ class AIChatCog(commands.Cog):
                 action=route_decision.action,
                 resolved_request=route_decision.resolved_request,
             )
+        if football_chat_context is not None:
+            football_chat_context.dormant = False
+            football_chat_context.source_user_message_id = getattr(message, "id", None)
+            football_chat_context.source_assistant_message_id = sent_message_id
+            football_chat_context.updated_at = time.monotonic()
+            football_chat_context.expires_at = football_chat_context.updated_at + self._continuation_lease_seconds
+        elif route_decision.action == "CHAT":
+            self._mark_football_context_dormant(message)
         self._clear_missed_response_candidate(message, "success")
         self._clear_pending_interaction(pending_for_send, event="success")
         await self._maybe_add_ai_reaction(
@@ -1870,16 +1944,39 @@ class AIChatCog(commands.Cog):
     def _is_slash_command_response_message(self, message: discord.Message | None) -> bool:
         if message is None:
             return False
-        if getattr(message, "interaction", None) or getattr(message, "interaction_metadata", None):
+        if getattr(message, "interaction_metadata", None):
             return True
         application_id = getattr(message, "application_id", None)
         bot_application_id = getattr(self.bot, "application_id", None)
-        if application_id is None or bot_application_id is None:
+        if application_id is not None and bot_application_id is not None:
+            try:
+                return int(application_id) == int(bot_application_id)
+            except (TypeError, ValueError):
+                return application_id == bot_application_id
+        return False
+
+    def _is_command_result_message(self, message: discord.Message | None) -> bool:
+        return self._is_slash_command_response_message(message) or self._is_bot_embed_message(message)
+
+    def _is_bot_embed_message(self, message: discord.Message | None) -> bool:
+        if message is None or self.bot.user is None:
             return False
-        try:
-            return int(application_id) == int(bot_application_id)
-        except (TypeError, ValueError):
-            return application_id == bot_application_id
+        author = getattr(message, "author", None)
+        if getattr(author, "id", None) != self.bot.user.id:
+            return False
+        return bool(getattr(message, "embeds", None))
+
+    def _message_freshly_addresses_bot(self, message: discord.Message) -> bool:
+        if self.bot.user is not None and self.bot.user in getattr(message, "mentions", []):
+            return bool(self._remove_bot_mentions(message.content, self.bot.user.id))
+        return self._is_addressed_to_bot_by_name(message.content)
+
+    def _message_mentions_bot_with_prompt(self, message: discord.Message) -> bool:
+        return (
+            self.bot.user is not None
+            and self.bot.user in getattr(message, "mentions", [])
+            and bool(self._remove_bot_mentions(message.content, self.bot.user.id))
+        )
 
     async def _is_reply_to_ai_message(
         self,
@@ -1889,6 +1986,8 @@ class AIChatCog(commands.Cog):
         if self.bot.user is None or replied_message is None:
             return False
         if replied_message.author.id != self.bot.user.id:
+            return False
+        if self._is_command_result_message(replied_message):
             return False
         if self._is_chat_response_message(replied_message.id):
             return True
@@ -2246,6 +2345,7 @@ class AIChatCog(commands.Cog):
         last_bot_response_id: int | None,
         action: str,
         resolved_request: str | None = None,
+        football_context: dict[str, object] | None = None,
     ) -> None:
         self._continuation_leases[self._message_channel_key(message)] = ContinuationLease(
             owner_user_id=int(message.author.id),
@@ -2254,7 +2354,81 @@ class AIChatCog(commands.Cog):
             expires_at=time.monotonic() + self._continuation_lease_seconds,
             last_action=action,
             resolved_request=resolved_request,
+            football_context=football_context,
         )
+
+    def _football_context_key(self, message: discord.Message) -> tuple[int, int, int] | None:
+        guild_id = getattr(getattr(message, "guild", None), "id", None)
+        channel_id = getattr(getattr(message, "channel", None), "id", None)
+        author_id = getattr(getattr(message, "author", None), "id", None)
+        if guild_id is None or channel_id is None or author_id is None:
+            return None
+        return int(guild_id), int(channel_id), int(author_id)
+
+    def _valid_football_turn_context(self, message: discord.Message) -> FootballTurnContext | None:
+        key = self._football_context_key(message)
+        if key is None:
+            return None
+        context = self._football_turn_contexts.get(key)
+        if context is None:
+            return None
+        if time.monotonic() > context.expires_at:
+            self._football_turn_contexts.pop(key, None)
+            return None
+        return context
+
+    def _store_football_turn_context(
+        self,
+        message: discord.Message,
+        *,
+        last_bot_response_id: int | None,
+        action: str,
+        payload: dict[str, object] | None,
+    ) -> None:
+        key = self._football_context_key(message)
+        if key is None or not payload:
+            return
+        cleaned = {str(k): v for k, v in payload.items() if v not in (None, "", [], {})}
+        if not cleaned:
+            return
+        now = time.monotonic()
+        self._football_turn_contexts[key] = FootballTurnContext(
+            guild_id=key[0],
+            channel_id=key[1],
+            owner_user_id=key[2],
+            payload=cleaned,
+            last_operation=action,
+            source_user_message_id=getattr(message, "id", None),
+            source_assistant_message_id=last_bot_response_id,
+            updated_at=now,
+            expires_at=now + self._continuation_lease_seconds,
+            dormant=False,
+        )
+
+    def _mark_football_context_dormant(self, message: discord.Message) -> None:
+        context = self._valid_football_turn_context(message)
+        if context is not None:
+            context.dormant = True
+
+    @staticmethod
+    def _football_context_payload_label(payload: dict[str, object]) -> str:
+        names = [
+            str(payload.get(key) or "").strip()
+            for key in ("team_name", "opponent_name", "player_name", "league_name", "fixture_label")
+            if payload.get(key)
+        ]
+        return " vs ".join(names[:2]) if len(names) >= 2 else (names[0] if names else "the active football context")
+
+    def _football_chat_grounding_note(self, context: FootballTurnContext) -> str:
+        label = self._football_context_payload_label(context.payload)
+        status = str(context.payload.get("fixture_status") or context.payload.get("status") or "").strip()
+        pieces = [f"Referent: {label}"]
+        fixture_id = context.payload.get("fixture_id")
+        if fixture_id:
+            pieces.append(f"fixture_id={fixture_id}")
+        if status:
+            pieces.append(f"status={status}")
+        return "[TRUSTED_FOOTBALL_CONTEXT]\n" + "; ".join(pieces)
 
     def _pending_key(
         self,
@@ -2445,6 +2619,458 @@ class AIChatCog(commands.Cog):
         except Exception:
             logging.exception("Failed to add routed AI reaction")
             return False
+
+    async def _execute_admin_action(
+        self,
+        message: discord.Message,
+        decision: RouteDecision,
+        *,
+        lang: str,
+        replied_message: discord.Message | None,
+        reply_to_trigger: bool,
+    ) -> None:
+        guild = message.guild
+        if guild is None:
+            return
+        plan = self._local_admin_action_plan(message) or decision.admin or await self._plan_admin_action(message, decision, replied_message)
+        admin_plan = self._coerce_admin_plan(plan)
+        logging.info(
+            "AI admin action plan guild=%s channel=%s author=%s admin_action=%s confidence=%.2f duration_seconds=%s time_window_seconds=%s message_count=%s reason_present=%s",
+            getattr(guild, "id", None),
+            getattr(message.channel, "id", None),
+            getattr(message.author, "id", None),
+            admin_plan.get("admin_action"),
+            float(admin_plan.get("confidence", 0.0) or 0.0),
+            admin_plan.get("duration_seconds"),
+            admin_plan.get("time_window_seconds"),
+            admin_plan.get("message_count"),
+            bool(admin_plan.get("reason")),
+        )
+        if not admin_plan.get("valid"):
+            await self._send_long_reply(
+                message,
+                admin_plan.get("clarification_question") or tr(lang, "I need a clearer admin action before doing that.", "Necesito una accion de admin mas clara antes de hacer eso."),
+                reply_to_trigger=reply_to_trigger,
+                mention_author=True,
+            )
+            return
+        action = str(admin_plan["admin_action"])
+        if action in {"join_stats", "leave_stats"}:
+            await self._execute_member_event_stats(message, admin_plan, lang=lang, reply_to_trigger=reply_to_trigger)
+            return
+        if action == "delete_messages":
+            result = await self._admin_actions.delete_recent_messages(
+                guild,
+                message.author,
+                message.channel,
+                message,
+                int(admin_plan.get("message_count") or 0),
+                lang=lang,
+            )
+            await self._send_long_reply(
+                message,
+                result.message,
+                reply_to_trigger=reply_to_trigger,
+                mention_author=True,
+                delete_after=5 if result.success else None,
+            )
+            return
+        if action == "delete_role":
+            role = self._resolve_admin_target_role(message, admin_plan, lang)
+            if isinstance(role, str):
+                await self._send_long_reply(message, str(role), reply_to_trigger=reply_to_trigger, mention_author=True)
+                return
+            result = await self._admin_actions.delete_role(
+                guild,
+                message.author,
+                role,
+                reason=admin_plan.get("reason"),
+                lang=lang,
+            )
+            await self._send_long_reply(message, result.message, reply_to_trigger=reply_to_trigger, mention_author=True)
+            return
+        if action in {"mute", "tempmute", "unmute"}:
+            target = await self._resolve_admin_target_member(message, admin_plan, lang)
+            if isinstance(target, str):
+                await self._send_long_reply(message, str(target), reply_to_trigger=reply_to_trigger, mention_author=True)
+                return
+            if action == "unmute":
+                result = await self._admin_actions.unmute_member(
+                    guild,
+                    message.author,
+                    target,
+                    reason=admin_plan.get("reason"),
+                    lang=lang,
+                )
+            else:
+                result = await self._admin_actions.mute_member(
+                    guild,
+                    message.author,
+                    target,
+                    duration_seconds=admin_plan.get("duration_seconds"),
+                    duration_label=self._duration_label(admin_plan.get("duration_seconds")),
+                    reason=admin_plan.get("reason"),
+                    mute_mode="auto",
+                    lang=lang,
+                )
+            await self._send_long_reply(message, result.message, reply_to_trigger=reply_to_trigger, mention_author=True)
+            return
+        if action in {"lock_channel", "unlock_channel"}:
+            channel = self._resolve_admin_target_channel(message, admin_plan, lang)
+            if isinstance(channel, str):
+                await self._send_long_reply(message, str(channel), reply_to_trigger=reply_to_trigger, mention_author=True)
+                return
+            result = await self._admin_actions.set_channel_lock(
+                guild,
+                message.author,
+                channel,
+                locked=action == "lock_channel",
+                lang=lang,
+            )
+            await self._send_long_reply(message, result.message, reply_to_trigger=reply_to_trigger, mention_author=True)
+            return
+        await self._send_long_reply(
+            message,
+            tr(lang, "I cannot do that admin action yet.", "Todavia no puedo hacer esa accion de admin."),
+            reply_to_trigger=reply_to_trigger,
+            mention_author=True,
+        )
+
+    async def _plan_admin_action(
+        self,
+        message: discord.Message,
+        decision: RouteDecision,
+        replied_message: discord.Message | None,
+    ) -> dict[str, Any]:
+        planner = getattr(self.bot.llm_client, "plan_admin_action", None)
+        if planner is None:
+            return {"valid": False, "admin_action": "unknown", "confidence": 0.0}
+        try:
+            return await planner(
+                current_message=message.content,
+                authority_metadata=self._route_authority_metadata(message),
+                mentions=self._route_mentions(message),
+                reply_metadata=self._route_reply_metadata(message, replied_message),
+                channel_metadata={
+                    "id": getattr(message.channel, "id", None),
+                    "name": getattr(message.channel, "name", None),
+                },
+                resolved_request=decision.resolved_request,
+            )
+        except Exception:
+            logging.exception("AI admin planner failure")
+            return {"valid": False, "admin_action": "unknown", "confidence": 0.0}
+
+    def _coerce_admin_plan(self, raw: object) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            return {"valid": False, "admin_action": "unknown", "confidence": 0.0}
+        action = str(raw.get("admin_action", "unknown") or "unknown").strip().casefold()
+        allowed = {"mute", "tempmute", "unmute", "lock_channel", "unlock_channel", "delete_messages", "delete_role", "join_stats", "leave_stats"}
+        confidence = self._coerce_float(raw.get("confidence"), default=0.0)
+        duration_seconds = self._coerce_positive_int(raw.get("duration_seconds"))
+        time_window_seconds = self._coerce_positive_int(raw.get("time_window_seconds"))
+        message_count = self._coerce_positive_int(raw.get("message_count"))
+        if message_count is not None:
+            message_count = min(message_count, 500)
+        reason = " ".join(str(raw.get("reason", "") or "").split())[:280] or None
+        clarification = " ".join(str(raw.get("clarification_question", "") or "").split())[:240] or None
+        target_user_candidates = [
+            " ".join(str(item).split())[:120]
+            for item in raw.get("target_user_candidates", [])
+            if isinstance(raw.get("target_user_candidates", []), list) and " ".join(str(item).split())
+        ][:5]
+        target_role_candidates = [
+            " ".join(str(item).split())[:120]
+            for item in raw.get("target_role_candidates", [])
+            if isinstance(raw.get("target_role_candidates", []), list) and " ".join(str(item).split())
+        ][:5]
+        target_channel = " ".join(str(raw.get("target_channel", "") or "").split())[:120] or None
+        valid = bool(raw.get("valid", True)) and action in allowed and confidence >= 0.70
+        if action == "tempmute" and (
+            duration_seconds is None
+            or duration_seconds <= 0
+            or duration_seconds > DISCORD_TIMEOUT_MAX_SECONDS
+        ):
+            valid = False
+            clarification = clarification or "How long should the temporary mute last?"
+        if action in {"join_stats", "leave_stats"} and time_window_seconds is None:
+            valid = False
+            clarification = clarification or "What time window should I count?"
+        if action == "delete_messages" and message_count is None:
+            valid = False
+            clarification = clarification or "How many previous messages should I delete?"
+        if action == "delete_role" and not target_role_candidates:
+            valid = False
+            clarification = clarification or "Which role should I delete?"
+        if action in {"mute", "tempmute", "unmute"} and not target_user_candidates:
+            valid = False
+            clarification = clarification or "Which member should I moderate?"
+        return {
+            "valid": valid,
+            "admin_action": action,
+            "target_user_candidates": target_user_candidates,
+            "target_role_candidates": target_role_candidates,
+            "target_channel": target_channel,
+            "message_count": message_count,
+            "duration_seconds": duration_seconds,
+            "reason": reason,
+            "time_window_seconds": time_window_seconds,
+            "requires_confirmation": bool(raw.get("requires_confirmation", False)),
+            "confidence": confidence,
+            "clarification_question": clarification,
+        }
+
+    def _local_admin_action_plan(self, message: discord.Message) -> dict[str, Any] | None:
+        bot_user = getattr(self.bot, "user", None)
+        content = self._remove_bot_mentions(message.content, bot_user.id) if bot_user is not None else message.content
+        compact = " ".join(str(content or "").split())
+        normalized = self._normalize_admin_text(compact)
+        if not normalized:
+            return None
+
+        message_match = re.search(
+            r"\b(?:elimina|eliminar|borra|borrar|delete|remove)\b.*?\b(\d{1,3})\b.*?\b(?:mensajes?|messages?)\b.*?\b(?:anteriores|previos|previous|above)\b",
+            normalized,
+        ) or re.search(
+            r"\b(?:elimina|eliminar|borra|borrar|delete|remove)\b.*?\b(?:anteriores|previos|previous|above)\b.*?\b(\d{1,3})\b.*?\b(?:mensajes?|messages?)\b",
+            normalized,
+        )
+        if message_match:
+            count = self._coerce_positive_int(message_match.group(1))
+            if count is not None:
+                return {
+                    "valid": True,
+                    "admin_action": "delete_messages",
+                    "message_count": min(count, 500),
+                    "confidence": 1.0,
+                }
+
+        role_delete = re.search(r"\b(?:elimina|eliminar|borra|borrar|delete|remove)\b.*?\b(?:rol|role)\b", normalized)
+        if role_delete and (getattr(message, "role_mentions", None) or re.search(r"<@&\d{15,22}>", compact)):
+            candidates = [
+                getattr(role, "mention", None) or str(getattr(role, "id", ""))
+                for role in getattr(message, "role_mentions", []) or []
+            ]
+            candidates.extend(re.findall(r"<@&\d{15,22}>", compact))
+            return {
+                "valid": True,
+                "admin_action": "delete_role",
+                "target_role_candidates": [candidate for candidate in candidates if candidate][:5],
+                "confidence": 1.0,
+            }
+        return None
+
+    @staticmethod
+    def _normalize_admin_text(text: str) -> str:
+        lowered = text.casefold()
+        normalized = "".join(
+            char for char in unicodedata.normalize("NFKD", lowered)
+            if not unicodedata.combining(char)
+        )
+        return normalized
+
+    @staticmethod
+    def _coerce_float(value: object, *, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _coerce_positive_int(value: object) -> int | None:
+        if value is None:
+            return None
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return None
+        return number if number > 0 else None
+
+    async def _execute_member_event_stats(
+        self,
+        message: discord.Message,
+        admin_plan: dict[str, Any],
+        *,
+        lang: str,
+        reply_to_trigger: bool,
+    ) -> None:
+        authority = self._route_authority_metadata(message)
+        if not (
+            authority["author_is_bot_owner"]
+            or authority["author_is_guild_owner"]
+            or authority["author_has_administrator"]
+            or authority["author_has_manage_guild"]
+        ):
+            logging.info(
+                "AI admin stats rejected guild=%s channel=%s author=%s rejected_reason=missing_manage_guild author_is_bot_owner=%s author_has_manage_guild=%s",
+                getattr(message.guild, "id", None),
+                getattr(message.channel, "id", None),
+                getattr(message.author, "id", None),
+                authority["author_is_bot_owner"],
+                authority["author_has_manage_guild"],
+            )
+            await self._send_long_reply(
+                message,
+                tr(lang, "You need Manage Server permission to ask for member stats.", "Necesitas Gestionar servidor para pedir estadisticas de miembros."),
+                reply_to_trigger=reply_to_trigger,
+                mention_author=True,
+            )
+            return
+        seconds = int(admin_plan.get("time_window_seconds") or 0)
+        if seconds <= 0:
+            await self._send_long_reply(
+                message,
+                tr(lang, "Tell me the time window to count.", "Dime la ventana de tiempo que quieres contar."),
+                reply_to_trigger=reply_to_trigger,
+                mention_author=True,
+            )
+            return
+        event_type = "join" if admin_plan.get("admin_action") == "join_stats" else "leave"
+        since = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+        count = await self.bot.db.count_member_events(message.guild.id, event_type, since)
+        label = self._duration_label(seconds)
+        noun_en = "joined" if event_type == "join" else "left"
+        noun_es = "entraron" if event_type == "join" else "salieron"
+        text = tr(
+            lang,
+            f"{count} member(s) {noun_en} in the last {label}. I can only count events tracked after this feature was enabled.",
+            f"{count} persona(s) {noun_es} en los ultimos {label}. Solo puedo contar eventos registrados desde que se activo este seguimiento.",
+        )
+        logging.info(
+            "AI admin stats guild=%s channel=%s author=%s admin_action=%s time_window_seconds=%s count=%s",
+            getattr(message.guild, "id", None),
+            getattr(message.channel, "id", None),
+            getattr(message.author, "id", None),
+            admin_plan.get("admin_action"),
+            seconds,
+            count,
+        )
+        await self._send_long_reply(message, text, reply_to_trigger=reply_to_trigger, mention_author=True)
+
+    async def _resolve_admin_target_member(
+        self,
+        message: discord.Message,
+        admin_plan: dict[str, Any],
+        lang: str,
+    ) -> discord.Member | str:
+        bot_user = getattr(self.bot, "user", None)
+        for member in getattr(message, "mentions", []) or []:
+            if getattr(member, "id", None) != getattr(bot_user, "id", None) and not getattr(member, "bot", False):
+                return member
+        guild = message.guild
+        candidates = admin_plan.get("target_user_candidates") or []
+        matches: list[discord.Member] = []
+        for candidate in candidates:
+            member = guild.get_member_named(candidate) if hasattr(guild, "get_member_named") else None
+            if member is not None:
+                matches.append(member)
+                continue
+            query_members = getattr(guild, "query_members", None)
+            if query_members is not None:
+                try:
+                    matches.extend(await query_members(query=candidate, limit=5))
+                except Exception:
+                    logging.exception("AI admin member query failed")
+        unique: dict[int, discord.Member] = {
+            int(getattr(member, "id", 0)): member
+            for member in matches
+            if getattr(member, "id", None) is not None
+        }
+        if len(unique) == 1:
+            return next(iter(unique.values()))
+        if len(unique) > 1:
+            names = ", ".join(getattr(member, "display_name", getattr(member, "name", "user")) for member in list(unique.values())[:5])
+            return tr(lang, f"I found multiple matching members: {names}. Mention the exact user.", f"Encontre varios miembros: {names}. Menciona al usuario exacto.")
+        return tr(lang, "I could not find that member. Mention the exact user.", "No encontre a ese miembro. Menciona al usuario exacto.")
+
+    def _resolve_admin_target_role(
+        self,
+        message: discord.Message,
+        admin_plan: dict[str, Any],
+        lang: str,
+    ) -> discord.Role | str:
+        mentioned = getattr(message, "role_mentions", None) or []
+        if mentioned:
+            return mentioned[0]
+        guild = message.guild
+        candidates = admin_plan.get("target_role_candidates") or []
+        matches: list[discord.Role] = []
+        for candidate in candidates:
+            query = str(candidate or "").strip()
+            if not query:
+                continue
+            role_id = self._parse_role_id(query)
+            if role_id is not None and hasattr(guild, "get_role"):
+                role = guild.get_role(role_id)
+                if role is not None:
+                    matches.append(role)
+                continue
+            normalized = query.lstrip("@").strip().casefold()
+            exact = [
+                role
+                for role in getattr(guild, "roles", []) or []
+                if str(getattr(role, "name", "")).casefold() == normalized
+            ]
+            matches.extend(exact)
+            if not exact:
+                matches.extend(
+                    role
+                    for role in getattr(guild, "roles", []) or []
+                    if str(getattr(role, "name", "")).casefold().startswith(normalized)
+                )
+        unique: dict[int, discord.Role] = {
+            int(getattr(role, "id", 0)): role
+            for role in matches
+            if getattr(role, "id", None) is not None
+        }
+        if len(unique) == 1:
+            return next(iter(unique.values()))
+        if len(unique) > 1:
+            names = ", ".join(getattr(role, "name", "role") for role in list(unique.values())[:5])
+            return tr(lang, f"I found multiple matching roles: {names}. Mention the exact role.", f"Encontre varios roles: {names}. Menciona el rol exacto.")
+        return tr(lang, "I could not find that role. Mention the exact role.", "No encontre ese rol. Menciona el rol exacto.")
+
+    @staticmethod
+    def _parse_role_id(text: str) -> int | None:
+        cleaned = text.strip()
+        mention = re.fullmatch(r"<@&(\d{15,22})>", cleaned)
+        if mention:
+            return int(mention.group(1))
+        if cleaned.isdigit():
+            return int(cleaned)
+        return None
+
+    def _resolve_admin_target_channel(
+        self,
+        message: discord.Message,
+        admin_plan: dict[str, Any],
+        lang: str,
+    ) -> discord.TextChannel | str:
+        mentioned = getattr(message, "channel_mentions", None) or []
+        if mentioned:
+            return mentioned[0]
+        target = str(admin_plan.get("target_channel") or "").strip().lstrip("#").casefold()
+        if not target:
+            return message.channel
+        guild = message.guild
+        for channel in getattr(guild, "text_channels", []) or []:
+            if str(getattr(channel, "id", "")) == target or str(getattr(channel, "name", "")).casefold() == target:
+                return channel
+        return tr(lang, "I could not find that channel.", "No encontre ese canal.")
+
+    @staticmethod
+    def _duration_label(seconds: int | None) -> str:
+        if not seconds:
+            return ""
+        units = (
+            (86400, "d"),
+            (3600, "h"),
+            (60, "m"),
+        )
+        for unit_seconds, suffix in units:
+            if seconds % unit_seconds == 0 and seconds >= unit_seconds:
+                return f"{seconds // unit_seconds}{suffix}"
+        return f"{seconds}s"
 
     async def _execute_server_memory_action(
         self,
@@ -2767,11 +3393,11 @@ class AIChatCog(commands.Cog):
     @staticmethod
     def _web_lookup_type_from_text(text: str) -> str:
         lowered = text.casefold()
-        if any(marker in lowered for marker in ("football", "soccer", "futbol", "fÃºtbol", "liga", "match", "partido")):
+        if any(marker in lowered for marker in ("football", "soccer", "futbol", "fútbol", "liga", "match", "partido")):
             return "sports"
         if any(marker in lowered for marker in ("price", "precio", "cost", "cuesta")):
             return "price"
-        if any(marker in lowered for marker in ("outage", "status", "caido", "caÃ­do")):
+        if any(marker in lowered for marker in ("outage", "status", "caido", "caído")):
             return "status"
         if any(marker in lowered for marker in ("release", "version", "update", "launch")):
             return "release"
@@ -2785,6 +3411,7 @@ class AIChatCog(commands.Cog):
         settings: object,
         lang: str,
         user_prompt: str,
+        anchor_type: str,
         reply_to_trigger: bool,
         create_lease: bool = True,
     ) -> None:
@@ -2797,18 +3424,26 @@ class AIChatCog(commands.Cog):
                 mention_author=True,
             )
             return
-        request = self._football_request_with_lease_context(message, decision.resolved_request or user_prompt)
+        request = self._football_request_with_lease_context(message, user_prompt, anchor_type=anchor_type)
         action = self._football_effective_action(decision.action, request)
         plan = await self._football_request_plan(message, action=action, request=request)
-        operation = build_operation(action, request, plan)
-        action = self._football_effective_action_from_plan(action, request, plan)
-        league_key = self._football_league_from_operation_or_text(operation, request)
+        operation = compile_football_operation(
+            action,
+            request,
+            plan,
+            prior_context=self._football_prior_lease_context(message),
+        )
+        action = operation.route_action
+        league_key = None
+        league_id = None
+        season = None
+        entity_context = bool(
+            operation.league_slots
+            or operation.team_slots
+            or operation.player_slots
+            or operation.fixture_focus
+        )
         try:
-            league_id: int | None = None
-            season: int | None = None
-            if league_key is not None:
-                league_id = await client.resolve_league_id(league_key)
-                season = season_hint_to_int(operation.season_hint) or await client.get_current_season(league_id)
             fixtures: list[dict[str, Any]] = []
             events: list[dict[str, Any]] = []
             stats: list[dict[str, Any]] = []
@@ -2822,258 +3457,134 @@ class AIChatCog(commands.Cog):
             standings_table: list[dict[str, Any]] = []
             generic_rows: list[dict[str, Any]] = []
             generic_label: str | None = None
-            data_focus = self._football_data_focus_from_plan_or_text(plan, action, request)
+            match_data = None
+            match_stat_key: str | None = None
+            football_entity_context: dict[str, object] | None = None
+            data_focus = operation.data_focus
             logging.info(
-                "AI football plan action=%s data_focus=%s league_candidates=%s team_candidates=%s player_candidates=%s selected_league=%s",
+                "AI football plan action=%s operation=%s data_focus=%s league_candidates=%s team_candidates=%s player_candidates=%s selected_league=%s capability=%s",
                 action,
+                operation.operation_type,
                 data_focus,
-                self._football_plan_list(plan, "league_candidates")[:4],
+                list(operation.league_candidates)[:4],
                 list(operation.team_candidates)[:4],
                 list(operation.player_candidates)[:4],
                 league_key,
+                getattr(operation.capability_intent, "operation_family", None),
             )
 
-            if action == "FOOTBALL_PLAYER_QUERY" or (
-                data_focus not in {"scorers", "standings", "injuries", "transfers", "events", "lineups", "statistics"}
-                and any(name in request.casefold() for name in ("mbappe", "haaland"))
-            ):
-                lookup = await football_resolver.resolve_player(
-                    client,
-                    request,
-                    league_id=league_id,
-                    season=season,
-                    explicit_context=league_key is not None,
-                    canonicalizer=self._football_player_canonicalizer(),
-                    alias_cache=self._football_player_alias_cache(),
-                    candidate_names=list(operation.player_candidates),
-                    stat_focus=operation.stat_focus,
+            result = await FootballOperationService(
+                client,
+                player_canonicalizer=self._football_player_canonicalizer(),
+                player_alias_cache=self._football_player_alias_cache(),
+            ).execute(operation, league_id=league_id, season=season, data_focus=data_focus)
+            fixtures = result.fixtures
+            events = result.events
+            stats = result.statistics
+            lineups = result.lineups
+            player_context_row = result.player_context_row
+            player_stat_focus = result.player_stat_focus
+            team_context_row = result.team_context_row
+            standing_row = result.standing_row
+            standings_table = result.standings_table
+            generic_rows = result.generic_rows
+            generic_label = result.generic_label
+            match_data = result.match_data
+            endpoints.extend(endpoint for endpoint in result.endpoints if endpoint not in endpoints)
+            football_notes.extend(result.notes)
+            football_entity_context = result.football_entity_context
+            if match_data is not None and operation.operation_type == "fixture_statistics":
+                match_stat_key = match_requested_stat(match_data.stats, operation.stat_focus or request)
+                if match_stat_key is None:
+                    football_notes.append("requested_stat_missing")
+            logging.info(
+                "AI football retrieval action=%s operation=%s outcome=%s endpoints=%s notes=%s",
+                action,
+                operation.operation_type,
+                result.outcome,
+                result.endpoints,
+                result.notes[:5],
+            )
+            if result.outcome != FootballOutcome.SELECTED:
+                terminal_payload = self._football_turn_payload_from_retrieval(
+                    football_entity_context=football_entity_context,
+                    match_data=match_data,
+                    fixtures=fixtures,
+                    requested_scope=result.requested_scope,
+                    outcome=str(result.outcome),
                 )
-                if league_key is not None and lookup.resolution.selected is None and not lookup.resolution.ambiguous:
-                    fallback_lookup = await football_resolver.resolve_player(
-                        client,
-                        request,
-                        canonicalizer=self._football_player_canonicalizer(),
-                        alias_cache=self._football_player_alias_cache(),
-                        candidate_names=list(operation.player_candidates),
-                        stat_focus=operation.stat_focus,
-                    )
-                    if fallback_lookup.resolution.selected is not None or fallback_lookup.resolution.ambiguous:
-                        football_notes.append("explicit_league_player_lookup_empty_global_fallback_used")
-                        lookup = fallback_lookup
-                picked = lookup.resolution
-                logging.info(
-                    "AI football player lookup action=%s raw_request=%s normalized_query=%s stat_focus=%s inferred_league=%s inferred_season=%s endpoint=/players response_count=%s top_candidates=%s resolver_decision=%s",
-                    action,
-                    request[:160],
-                    " | ".join(lookup.query.candidates)[:160],
-                    lookup.query.stat_focus,
-                    league_key,
-                    season,
-                    len(lookup.rows),
-                    self._football_player_candidate_names(list(lookup.rows)),
-                    "ambiguous" if picked.ambiguous else ("selected" if picked.selected else "not_found"),
-                )
-                player_stat_focus = lookup.query.stat_focus
-                if picked.selected is not None:
-                    player_context_row = picked.selected
-                    player_stats = picked.selected.get("statistics") if isinstance(picked.selected, dict) else []
-                    first_stats = player_stats[0] if isinstance(player_stats, list) and player_stats else {}
-                    team = first_stats.get("team") if isinstance(first_stats, dict) else {}
-                    team_id = team.get("id") if isinstance(team, dict) else None
-                    if isinstance(team_id, int) and league_id is not None and season is not None:
-                        fixtures = await client.get_next_fixtures(league_id=league_id, season=season, next_count=3, team_id=team_id)
-                    player = picked.selected.get("player") if isinstance(picked.selected, dict) else {}
-                    football_notes.append(f"player_found={player.get('name') if isinstance(player, dict) else 'unknown'}")
-                    if lookup.query.stat_focus == "penalties":
-                        football_notes.append("penalty_specific_data=missing")
-                elif picked.ambiguous:
-                    names = self._football_player_candidate_names(list(picked.matches))
-                    football_notes.append(f"player_ambiguous={', '.join(names)}")
-                else:
-                    football_notes.append("player_not_found")
-                endpoints.append("/players")
-            elif action == "FOOTBALL_TABLE":
-                league_id, season = await self._football_default_league_context(client, league_id, season)
-                standings_raw = await client.get_standings(league_id=league_id, season=season)
-                standings_table = self._football_extract_table_rows(standings_raw)
-                endpoints.append("/standings")
-            elif data_focus == "scorers":
-                league_id, season = await self._football_default_league_context(client, league_id, season)
-                generic_rows = await client.get_top_scorers(league_id=league_id, season=season)
-                generic_label = "FOOTBALL_SCORERS"
-                endpoints.append("/players/topscorers")
-            elif data_focus in {"next_fixtures", "last_fixtures", "season_start"}:
-                team_context_row = await self._football_team_from_text(
-                    client,
+                if result.outcome in {FootballOutcome.NOT_FOUND, FootballOutcome.NO_DATA_FOR_SCOPE} and WebResearchService.should_try_football_web_fallback(
                     request=request,
-                    league_id=league_id,
-                    season=season,
-                    candidate_names=list(operation.team_candidates),
+                    action=action,
+                    has_api_data=False,
+                ):
+                    try:
+                        web_result = await self._web_research.research(
+                            WebResearchRequest(
+                                query=request,
+                                lookup_type="sports",
+                                max_sources=int(getattr(getattr(self.bot, "settings", None), "xai_web_search_max_sources", 3) or 3),
+                            ),
+                            guild_id=getattr(message.guild, "id", None),
+                            user_id=getattr(message.author, "id", None),
+                        )
+                        web_answer = str(getattr(web_result, "answer", "") or "").strip()
+                        if web_answer:
+                            sent_message_id = await self._send_long_reply(
+                                message,
+                                web_answer,
+                                reply_to_trigger=reply_to_trigger,
+                                mention_author=True,
+                            )
+                            if create_lease and terminal_payload:
+                                self._create_or_renew_lease(message, last_bot_response_id=sent_message_id, action=action, resolved_request=request[:900], football_context=terminal_payload)
+                                self._store_football_turn_context(message, last_bot_response_id=sent_message_id, action=action, payload=terminal_payload)
+                            return
+                    except Exception:
+                        logging.exception("AI football terminal web fallback failed")
+                sent_message_id = await self._send_long_reply(
+                    message,
+                    self._football_terminal_outcome_message(result, operation, lang),
+                    reply_to_trigger=reply_to_trigger,
+                    mention_author=True,
                 )
-                team = team_context_row.get("team") if isinstance(team_context_row, dict) else {}
-                team_id = team.get("id") if isinstance(team, dict) else None
-                if league_id is None:
-                    league_id, season = await self._football_default_league_context(client, league_id, season)
-                elif season is None:
-                    season = await client.get_current_season(league_id)
-                if data_focus == "last_fixtures":
-                    fixtures = await client.get_last_fixtures(league_id=league_id, season=season, last_count=3, team_id=team_id if isinstance(team_id, int) else None)
-                else:
-                    fixtures = await client.get_next_fixtures(league_id=league_id, season=season, next_count=5 if data_focus == "season_start" else 3, team_id=team_id if isinstance(team_id, int) else None)
-                endpoints.extend(["/teams"] if team_context_row is not None else [])
-                endpoints.append("/fixtures")
-            elif data_focus in {"h2h", "comparison"} or action == "FOOTBALL_COMPARISON":
-                team_rows = await self._football_resolve_team_candidates(
-                    client,
-                    request=request,
-                    league_id=league_id,
-                    season=season,
-                    candidate_names=list(operation.team_candidates),
-                    max_teams=2,
-                )
-                team_ids = [row.get("team", {}).get("id") for row in team_rows if isinstance(row.get("team"), dict)]
-                if len(team_ids) >= 2 and all(isinstance(item, int) for item in team_ids[:2]):
-                    generic_rows = await client.get_head_to_head(team_a_id=team_ids[0], team_b_id=team_ids[1], last=10)
-                    generic_label = "FOOTBALL_H2H"
-                    endpoints.extend(["/teams", "/fixtures/headtohead"])
-                else:
-                    football_notes.append("h2h_teams_not_found")
-                    endpoints.append("/teams")
-            elif data_focus in {"injuries", "transfers"}:
-                team_context_row = await self._football_team_from_text(
-                    client,
-                    request=request,
-                    league_id=league_id,
-                    season=season,
-                    candidate_names=list(operation.team_candidates),
-                )
-                team = team_context_row.get("team") if isinstance(team_context_row, dict) else {}
-                team_id = team.get("id") if isinstance(team, dict) else None
-                if isinstance(team_id, int) and data_focus == "injuries":
-                    if league_id is not None and season is None:
-                        season = await client.get_current_season(league_id)
-                    generic_rows = await client.get_injuries(league_id=league_id, season=season, team_id=team_id)
-                    generic_label = "FOOTBALL_INJURIES"
-                    endpoints.extend(["/teams", "/injuries"])
-                elif isinstance(team_id, int):
-                    generic_rows = await client.get_transfers(team_id=team_id)
-                    generic_label = "FOOTBALL_TRANSFERS"
-                    endpoints.extend(["/teams", "/transfers"])
-                else:
-                    football_notes.append("team_not_found")
-                    endpoints.append("/teams")
-            elif action == "FOOTBALL_TEAM_QUERY":
-                team_context_row = await self._football_team_from_text(
-                    client,
-                    request=request,
-                    league_id=league_id,
-                    season=season,
-                    candidate_names=list(operation.team_candidates),
-                )
-                team = team_context_row.get("team") if isinstance(team_context_row, dict) else {}
-                team_id = team.get("id") if isinstance(team, dict) else None
-                if isinstance(team_id, int) and league_id is not None and season is not None:
-                    standings_raw = await client.get_standings(league_id=league_id, season=season)
-                    standing_row = self._football_find_team_row(self._football_extract_table_rows(standings_raw), team_id)
-                    fixtures = await client.get_next_fixtures(league_id=league_id, season=season, next_count=1, team_id=team_id)
-                    if not fixtures:
-                        fixtures = await client.get_last_fixtures(league_id=league_id, season=season, last_count=1, team_id=team_id)
-                    endpoints.extend(["/teams", "/standings", "/fixtures"])
-                elif isinstance(team_id, int):
-                    fixtures = await client.get_fixtures_on_date(team_id=team_id, date_iso=date.today().isoformat())
-                    endpoints.extend(["/teams", "/fixtures?date"])
-                else:
-                    football_notes.append("team_not_found")
-                    endpoints.append("/teams")
-            elif action == "FOOTBALL_MATCH_CENTER":
-                if league_id is not None and season is None:
-                    season = await client.get_current_season(league_id)
-                team_id = await self._football_team_id_from_text(
-                    client,
-                    request=request,
-                    league_id=league_id,
-                    season=season,
-                    candidate_names=list(operation.team_candidates),
-                )
-                fixtures = await client.get_live_fixtures(league_id=league_id, team_id=team_id)
-                endpoints.append("/fixtures?live=all")
-                if not fixtures:
-                    fixtures = await client.get_fixtures_on_date(
-                        league_id=league_id,
-                        season=season,
-                        team_id=team_id,
-                        date_iso=date.today().isoformat(),
-                    )
-                    endpoints.append("/fixtures?date")
-            elif decision.action in {"FOOTBALL_EXPLAIN_RESULT", "FOOTBALL_SUMMARY", "FOOTBALL_TEAM_QUERY"} or any(word in request.casefold() for word in ("perdio", "perdió", "lost", "gano", "ganó", "won")):
-                league_id, season = await self._football_default_league_context(client, league_id, season)
-                team_id = await self._football_team_id_from_text(
-                    client,
-                    request=request,
-                    league_id=league_id,
-                    season=season,
-                    candidate_names=list(operation.team_candidates),
-                )
-                fixtures = await client.get_last_fixtures(league_id=league_id, season=season, last_count=1, team_id=team_id)
-                endpoints.append("/fixtures")
-            elif self._football_request_is_live_or_preseason(request):
-                team_id = await self._football_team_id_from_text(
-                    client,
-                    request=request,
-                    league_id=league_id,
-                    season=season,
-                    candidate_names=list(operation.team_candidates),
-                )
-                if team_id is None and league_id is None:
-                    football_notes.append("team_not_found")
-                fixtures = await client.get_live_fixtures(league_id=league_id, team_id=team_id)
-                endpoints.append("/fixtures?live=all")
-                if not fixtures:
-                    if league_id is not None and season is None:
-                        season = await client.get_current_season(league_id)
-                    fixtures = await client.get_fixtures_on_date(
-                        league_id=league_id,
-                        season=season,
-                        team_id=team_id,
-                        date_iso=date.today().isoformat(),
-                    )
-                    endpoints.append("/fixtures?date")
-                    football_notes.append(
-                        "live_status_missing_same_day_fixture_found"
-                        if fixtures
-                        else "live_status_missing_no_same_day_fixture"
-                    )
-            else:
-                if league_key is None and self._football_plan_has_entity_context(plan):
-                    season = await client.get_current_season(league_id) if league_id is not None and season is None else season
-                else:
-                    league_id, season = await self._football_default_league_context(client, league_id, season)
-                fixtures = await client.get_fixtures_on_date(league_id=league_id, season=season, date_iso=date.today().isoformat())
-                endpoints.append("/fixtures")
+                if create_lease and terminal_payload:
+                    self._create_or_renew_lease(message, last_bot_response_id=sent_message_id, action=action, resolved_request=request[:900], football_context=terminal_payload)
+                    self._store_football_turn_context(message, last_bot_response_id=sent_message_id, action=action, payload=terminal_payload)
+                return
 
             fixture_id = self._first_fixture_id(fixtures)
-            if fixture_id is not None and data_focus != "fixtures" and self._football_request_needs_match_details(action, request):
-                events = await client.get_fixture_events(fixture_id=fixture_id)
-                stats = await client.get_fixture_statistics(fixture_id=fixture_id)
-                lineups = await client.get_fixture_lineups(fixture_id=fixture_id)
-                endpoints.extend(["/fixtures/events", "/fixtures/statistics", "/fixtures/lineups"])
 
-            if action == "FOOTBALL_PLAYER_QUERY":
+            if match_data is not None:
+                context = json.dumps(
+                    {
+                        "label": action,
+                        "match": compact_match_data(match_data, stat_key=match_stat_key),
+                        "requested_stat": operation.stat_focus,
+                        "matched_stat_key": match_stat_key,
+                        "notes": football_notes,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )[:6000]
+            elif operation.operation_type in {"player_profile", "player_recent_stats", "player_current_team", "player_previous_team", "player_career_history"}:
                 context = build_player_context(
                     label=action,
                     player_row=player_context_row,
                     stat_focus=player_stat_focus,
                     fixtures=fixtures,
+                    extra_label=generic_label,
+                    extra_rows=generic_rows,
                     notes=football_notes,
                     source_endpoints=endpoints,
                 )
-            elif action == "FOOTBALL_TABLE":
+            elif operation.operation_type == "standings":
                 context = build_standings_context(
                     label=action,
                     standings=standings_table,
                     source_endpoints=endpoints,
                 )
-            elif action == "FOOTBALL_TEAM_QUERY" and team_context_row is not None:
+            elif operation.operation_type == "team_profile" and team_context_row is not None:
                 context = build_team_context(
                     team=team_context_row,
                     standings_row=standing_row,
@@ -3134,13 +3645,7 @@ class AIChatCog(commands.Cog):
                 if web_context
                 else football_grounding_prompt(request, context)
             )
-            enhanced_server_context = await self._server_context_with_memory(
-                message,
-                base_context=getattr(settings, "server_context", ""),
-                route_action=action,
-                current_text=request,
-                replied_message=None,
-            )
+            enhanced_server_context = getattr(settings, "server_context", "")
             reply = await self.bot.llm_client.chat(
                 server_context=enhanced_server_context,
                 user_message=grounded_prompt,
@@ -3167,6 +3672,8 @@ class AIChatCog(commands.Cog):
             return
 
         reply = self._sanitize_visible_ai_output(reply)
+        guard_context = football_entity_context or self._football_guard_context_from_operation(operation)
+        reply = self._guard_football_entity_reply(reply, guard_context, self._football_prior_lease_context(message), lang)
         sent_message_id = await self._send_long_reply(
             message,
             self._dearm_mass_mentions(reply),
@@ -3174,7 +3681,17 @@ class AIChatCog(commands.Cog):
             mention_author=True,
         )
         if create_lease:
-            self._create_or_renew_lease(message, last_bot_response_id=sent_message_id, action=action, resolved_request=request[:900])
+            self._create_or_renew_lease(message, last_bot_response_id=sent_message_id, action=action, resolved_request=request[:900], football_context=football_entity_context)
+            self._store_football_turn_context(
+                message,
+                last_bot_response_id=sent_message_id,
+                action=action,
+                payload=self._football_turn_payload_from_retrieval(
+                    football_entity_context=football_entity_context,
+                    match_data=match_data,
+                    fixtures=fixtures,
+                ),
+            )
 
     async def _football_request_plan(self, message: discord.Message, *, action: str, request: str) -> dict[str, Any] | None:
         planner = getattr(getattr(self.bot, "llm_client", None), "plan_football_request", None)
@@ -3192,13 +3709,193 @@ class AIChatCog(commands.Cog):
             return None
         return plan if isinstance(plan, dict) else None
 
+    @staticmethod
+    def _football_turn_payload_from_retrieval(
+        *,
+        football_entity_context: dict[str, object] | None,
+        match_data: object | None,
+        fixtures: list[dict[str, Any]],
+        requested_scope: dict[str, Any] | None = None,
+        outcome: str | None = None,
+    ) -> dict[str, object] | None:
+        payload: dict[str, object] = dict(football_entity_context or {})
+        if requested_scope:
+            payload.setdefault("requested_scope", dict(requested_scope))
+        if outcome:
+            payload.setdefault("last_outcome", outcome)
+        if match_data is not None:
+            for attr, key in (
+                ("fixture_id", "fixture_id"),
+                ("status", "fixture_status"),
+                ("status_short", "fixture_status"),
+                ("selected_team_id", "team_id"),
+                ("selected_opponent_id", "opponent_id"),
+                ("fixture_date", "date_hint"),
+            ):
+                value = getattr(match_data, attr, None)
+                if value not in (None, "", [], {}):
+                    payload.setdefault(key, value)
+            selected_team_id = payload.get("team_id")
+            if selected_team_id == getattr(match_data, "home_team_id", None):
+                payload.setdefault("team_name", getattr(match_data, "home_team_name", ""))
+                payload.setdefault("opponent_name", getattr(match_data, "away_team_name", ""))
+            elif selected_team_id == getattr(match_data, "away_team_id", None):
+                payload.setdefault("team_name", getattr(match_data, "away_team_name", ""))
+                payload.setdefault("opponent_name", getattr(match_data, "home_team_name", ""))
+            else:
+                payload.setdefault("team_name", getattr(match_data, "home_team_name", ""))
+                payload.setdefault("opponent_name", getattr(match_data, "away_team_name", ""))
+        if fixtures:
+            fixture = fixtures[0] if isinstance(fixtures[0], dict) else {}
+            fixture_info = fixture.get("fixture") if isinstance(fixture, dict) else {}
+            league = fixture.get("league") if isinstance(fixture, dict) else {}
+            teams = fixture.get("teams") if isinstance(fixture, dict) else {}
+            if isinstance(fixture_info, dict):
+                payload.setdefault("fixture_id", fixture_info.get("id"))
+                status = fixture_info.get("status")
+                if isinstance(status, dict):
+                    payload.setdefault("fixture_status", status.get("short"))
+                payload.setdefault("date_hint", fixture_info.get("date"))
+            if isinstance(league, dict):
+                payload.setdefault("league_id", league.get("id"))
+                payload.setdefault("league_name", league.get("name"))
+            if isinstance(teams, dict):
+                home = teams.get("home") if isinstance(teams.get("home"), dict) else {}
+                away = teams.get("away") if isinstance(teams.get("away"), dict) else {}
+                if isinstance(home, dict):
+                    payload.setdefault("team_id", home.get("id"))
+                    payload.setdefault("team_name", home.get("name"))
+                if isinstance(away, dict):
+                    payload.setdefault("opponent_id", away.get("id"))
+                    payload.setdefault("opponent_name", away.get("name"))
+        return payload or None
+
+    def _guard_football_entity_reply(
+        self,
+        reply: str,
+        football_context: dict[str, object] | None,
+        prior_context: str | None,
+        lang: str,
+    ) -> str:
+        if not football_context:
+            return reply
+        active_name = str(football_context.get("player_name") or "").strip()
+        if not active_name:
+            return reply
+        prior_name = self._football_prior_player_name_from_context(prior_context)
+        if prior_name and football_resolver.normalize_key(prior_name) != football_resolver.normalize_key(active_name):
+            if self._football_reply_mentions_prior_player(reply, prior_name, active_name):
+                return tr(
+                    lang,
+                    f"I found validated API-Football context for {active_name}, but I will not mix it with an older player context.",
+                    f"Encontre contexto validado de API-Football para {active_name}, pero no lo voy a mezclar con otro jugador anterior.",
+                )
+        return reply
+
+    def _football_terminal_outcome_message(
+        self,
+        result: object,
+        operation: FootballQueryOperation,
+        lang: str,
+    ) -> str:
+        outcome = getattr(result, "outcome", None)
+        if outcome == FootballOutcome.AMBIGUOUS:
+            options = self._football_ambiguity_options(getattr(result, "ambiguity_candidates", []) or getattr(result, "generic_rows", []))
+            suffix = f" {options}" if options else ""
+            return tr(
+                lang,
+                f"I found more than one possible football match for that request.{suffix} Please be more specific.",
+                f"Encontre mas de una opcion posible para esa consulta de futbol.{suffix} Dime cual es.",
+            )
+        if outcome == FootballOutcome.NO_DATA_FOR_SCOPE:
+            return tr(
+                lang,
+                "I found the football entity, but API-Football does not have that data for the requested scope right now.",
+                "Encontre la entidad de futbol, pero API-Football no tiene ese dato para el alcance pedido ahora mismo.",
+            )
+        if outcome == FootballOutcome.NOT_FOUND:
+            missing = ", ".join(getattr(result, "missing_inputs", []) or [])
+            suffix = f" ({missing})" if missing else ""
+            return tr(
+                lang,
+                f"I could not find that football entity or fixture in API-Football.{suffix}",
+                f"No encontre esa entidad o partido en API-Football.{suffix}",
+            )
+        if outcome == FootballOutcome.UNSUPPORTED:
+            return tr(
+                lang,
+                "That football operation is not supported yet.",
+                "Esa operacion de futbol todavia no esta soportada.",
+            )
+        missing = ", ".join(getattr(result, "missing_inputs", []) or [])
+        if not missing:
+            missing = operation.operation_type
+        return tr(
+            lang,
+            f"I need a clearer football input before I can look that up: {missing}.",
+            f"Necesito un dato de futbol mas claro antes de buscar eso: {missing}.",
+        )
+
+    @staticmethod
+    def _football_ambiguity_options(candidates: object) -> str:
+        if not isinstance(candidates, list):
+            return ""
+        labels: list[str] = []
+        for candidate in candidates[:5]:
+            if isinstance(candidate, dict) and "display_name" in candidate:
+                label = str(candidate.get("display_name") or "").strip()
+                extras = [str(candidate.get(key) or "").strip() for key in ("country", "nationality", "team", "league") if candidate.get(key)]
+                if extras:
+                    label = f"{label} ({', '.join(extras[:2])})"
+            elif isinstance(candidate, dict):
+                entity = candidate.get("player") or candidate.get("team") or candidate.get("league") or {}
+                label = str(entity.get("name") if isinstance(entity, dict) else "").strip()
+            else:
+                label = ""
+            if label:
+                labels.append(label)
+        return "Options: " + "; ".join(labels) if labels else ""
+
+    @staticmethod
+    def _football_guard_context_from_operation(operation: FootballQueryOperation) -> dict[str, object] | None:
+        if operation.player_slots:
+            return {"player_name": operation.player_slots[0].full_name}
+        return None
+
+    @staticmethod
+    def _football_reply_mentions_prior_player(reply: str, prior_name: str, active_name: str) -> bool:
+        reply_key = football_resolver.normalize_key(reply)
+        prior_key = football_resolver.normalize_key(prior_name)
+        if prior_key and prior_key in reply_key:
+            return True
+        active_tokens = set(AIChatCog._football_name_tokens(active_name))
+        return any(token not in active_tokens and token in AIChatCog._football_name_tokens(reply) for token in AIChatCog._football_name_tokens(prior_name))
+
+    @staticmethod
+    def _football_name_tokens(value: str) -> list[str]:
+        text = unicodedata.normalize("NFKD", str(value or ""))
+        text = "".join(ch for ch in text if not unicodedata.combining(ch))
+        return [token for token in re.findall(r"[a-z0-9]+", text.casefold()) if len(token) >= 4]
+
+    @staticmethod
+    def _football_prior_player_name_from_context(prior_context: str | None) -> str | None:
+        if not prior_context:
+            return None
+        match = re.search(r'"player_name"\s*:\s*"([^"]+)"', prior_context)
+        return match.group(1) if match else None
+
     def _football_prior_lease_context(self, message: discord.Message) -> str | None:
+        turn_context = self._valid_football_turn_context(message)
+        if turn_context is not None:
+            return turn_context.to_prior_context()
         watch = self._watch_for_replied_message(message)
         if watch is not None:
             return f"Watched fixture: {watch.fixture_label}. Original watch request: {watch.request}"[:450]
         lease = self._valid_lease_for_message(message)
         if lease is None or not str(lease.last_action).startswith("FOOTBALL_"):
             return None
+        if lease.football_context:
+            return json.dumps(lease.football_context, ensure_ascii=False, separators=(",", ":"))[:450]
         prior = " ".join(str(lease.resolved_request or "").split())
         return prior[:450] if prior else None
 
@@ -3239,6 +3936,13 @@ class AIChatCog(commands.Cog):
                 return "FOOTBALL_TEAM_QUERY"
             if focus_key in {"scorers", "injuries", "transfers"}:
                 return normalized_action
+            if focus_key in {"next_fixtures", "last_fixtures", "season_start"}:
+                return normalized_action
+            if focus_key == "summary" and (
+                normalized_action in {"FOOTBALL_SUMMARY", "FOOTBALL_EXPLAIN_RESULT"}
+                or self._football_request_is_result_request(request)
+            ):
+                return normalized_action if normalized_action != "FOOTBALL_LOOKUP" else "FOOTBALL_SUMMARY"
             if focus_key in {"events", "lineups", "statistics", "summary", "fixtures"}:
                 return "FOOTBALL_MATCH_CENTER"
         intent = self._football_plan_text(plan, "intent")
@@ -3253,46 +3957,6 @@ class AIChatCog(commands.Cog):
             if intent_key in {"FIXTURE", "MATCH_CENTER", "LIVE", "SUMMARY"}:
                 return "FOOTBALL_MATCH_CENTER"
         return normalized_action
-
-    def _football_league_from_plan_or_text(self, plan: dict[str, Any] | None, text: str) -> str | None:
-        for candidate in self._football_plan_list(plan, "league_candidates"):
-            league_key = normalize_league_key(candidate)
-            if league_key:
-                return league_key
-        return self._football_league_from_text(text)
-
-    def _football_league_from_operation_or_text(self, operation: FootballQueryOperation, text: str) -> str | None:
-        for candidate in operation.league_candidates:
-            league_key = normalize_league_key(candidate)
-            if league_key:
-                return league_key
-        return self._football_league_from_text(text)
-
-    def _football_league_from_text(self, text: str) -> str | None:
-        for token in (
-            "world cup",
-            "fifa world cup",
-            "worldcup",
-            "mundial",
-            "copa mundial",
-            "tercer lugar",
-            "third place",
-            "champions",
-            "premier",
-            "laliga",
-            "liga de expansion mx",
-            "liga de expansión mx",
-            "liga expansion mx",
-            "expansion mx",
-            "liga mx",
-            "ligamx",
-            "concacaf",
-        ):
-            lookup_token = "world cup" if token in {"mundial", "copa mundial", "tercer lugar", "third place"} else token
-            league_key = normalize_league_key(lookup_token)
-            if league_key and token in text.casefold():
-                return league_key
-        return None
 
     def _football_effective_action(self, action: str, request: str) -> str:
         normalized_action = str(action or "").upper()
@@ -3328,11 +3992,30 @@ class AIChatCog(commands.Cog):
         if any(marker in lowered for marker in ("gol", "goles", "eventos", "events", "quien metio")):
             return "events"
         return None
+
+    @staticmethod
+    def _football_request_is_result_request(text: str) -> bool:
+        lowered = text.casefold()
+        return any(
+            marker in lowered
+            for marker in (
+                "ya termino",
+                "ya termin",
+                "como quedaron",
+                "como quedo",
+                "resultado",
+                "result",
+                "final score",
+                "score final",
+                "ended",
+            )
+        )
     def _football_plan_has_entity_context(self, plan: dict[str, Any] | None) -> bool:
         if not isinstance(plan, dict):
             return False
         return bool(
             self._football_plan_list(plan, "league_candidates")
+            or self._football_plan_list(plan, "country_candidates")
             or self._football_plan_list(plan, "team_candidates")
             or self._football_plan_list(plan, "player_candidates")
             or self._football_plan_text(plan, "fixture_focus")
@@ -3343,19 +4026,9 @@ class AIChatCog(commands.Cog):
         lowered = text.casefold()
         return any(marker in lowered for marker in ("tabla", "table", "standings", "posiciones", "clasificacion", "clasificación"))
 
-    def _football_request_with_lease_context(self, message: discord.Message, request: str) -> str:
+    def _football_request_with_lease_context(self, message: discord.Message, request: str, *, anchor_type: str) -> str:
         cleaned = " ".join(str(request or "").split())
-        watch = self._watch_for_replied_message(message)
-        if watch is not None:
-            prior_watch = f"Watched football fixture: {watch.fixture_label}. Original live-watch request: {watch.request}"
-            return f"{cleaned}\nPrevious football context: {prior_watch}"[:900]
-        lease = self._valid_lease_for_message(message)
-        if lease is None or not str(lease.last_action).startswith("FOOTBALL_") or not lease.resolved_request:
-            return cleaned
-        prior = " ".join(str(lease.resolved_request).split())
-        if not prior or prior.casefold() in cleaned.casefold():
-            return cleaned
-        return f"{cleaned}\nPrevious football context: {prior}"[:900]
+        return cleaned
 
     @staticmethod
     def _football_request_needs_match_details(action: str, request: str) -> bool:
@@ -3383,12 +4056,23 @@ class AIChatCog(commands.Cog):
         )
 
     @staticmethod
-    async def _football_default_league_context(client: object, league_id: int | None, season: int | None) -> tuple[int, int]:
-        if league_id is None:
-            league_id = await client.resolve_league_id("ligamx")
-        if season is None:
-            season = await client.get_current_season(league_id)
-        return league_id, season
+    def _football_operation_needs_match_details(operation: FootballQueryOperation) -> bool:
+        return operation.operation_type in {
+            "fixture_result",
+            "fixture_events",
+            "fixture_statistics",
+            "fixture_lineups",
+        }
+
+    @staticmethod
+    def _football_today_iso(client: object) -> str:
+        method = getattr(client, "today_iso", None)
+        if callable(method):
+            try:
+                return str(method())
+            except Exception:
+                logging.warning("API-Football timezone date helper failed; falling back to local date")
+        return date.today().isoformat()
 
     @staticmethod
     def _football_request_is_live_or_preseason(text: str) -> bool:
@@ -3409,6 +4093,11 @@ class AIChatCog(commands.Cog):
             )
         )
 
+    @staticmethod
+    def _football_request_is_preseason_or_friendly(text: str) -> bool:
+        lowered = text.casefold()
+        return any(marker in lowered for marker in ("pretemporada", "pre temporada", "preseason", "amistoso", "friendly"))
+
     async def _execute_football_live_watch_action(
         self,
         message: discord.Message,
@@ -3416,6 +4105,7 @@ class AIChatCog(commands.Cog):
         *,
         lang: str,
         user_prompt: str,
+        anchor_type: str,
         reply_to_trigger: bool,
     ) -> None:
         key = (int(message.guild.id), int(message.channel.id))
@@ -3439,7 +4129,7 @@ class AIChatCog(commands.Cog):
             )
             return
 
-        request = self._football_request_with_lease_context(message, decision.resolved_request or user_prompt)
+        request = self._football_request_with_lease_context(message, user_prompt, anchor_type=anchor_type)
         action = "FOOTBALL_MATCH_CENTER"
         plan = await self._football_request_plan(message, action=action, request=request)
         operation = build_operation(decision.action, request, plan)
@@ -3501,27 +4191,13 @@ class AIChatCog(commands.Cog):
         operation: FootballQueryOperation | None = None,
     ) -> dict[str, Any] | None:
         operation = operation or build_operation("FOOTBALL_LIVE_WATCH_START", request, plan)
-        league_key = self._football_league_from_operation_or_text(operation, request)
-        league_id: int | None = None
-        season: int | None = None
-        if league_key is not None:
-            league_id = await client.resolve_league_id(league_key)
-            season = await client.get_current_season(league_id)
-        team_id = await self._football_team_id_from_text(
-            client,
-            request=request,
-            league_id=league_id,
-            season=season,
-            candidate_names=list(operation.team_candidates),
+        result = await FootballOperationService(client).execute(
+            operation,
+            league_id=None,
+            season=None,
+            data_focus="live_watch_start",
         )
-        fixtures = await client.get_live_fixtures(league_id=league_id, team_id=team_id)
-        if not fixtures:
-            fixtures = await client.get_fixtures_on_date(
-                league_id=league_id,
-                season=season,
-                team_id=team_id,
-                date_iso=date.today().isoformat(),
-            )
+        fixtures = result.fixtures
         if len(fixtures) == 1:
             return fixtures[0]
         if not fixtures:
@@ -3530,7 +4206,7 @@ class AIChatCog(commands.Cog):
         picked = self._pick_football_fixture(fixtures, focus)
         if picked is not None:
             return picked
-        return fixtures[0] if team_id is not None and len(fixtures) <= 2 else None
+        return fixtures[0] if operation.team_slots and len(fixtures) <= 2 else None
 
     def _create_football_live_watch(
         self,
@@ -3583,22 +4259,31 @@ class AIChatCog(commands.Cog):
         if watch is None or watch.canceled or client is None:
             return
         try:
-            fixtures = await client.get_fixture_by_id(fixture_id=watch.fixture_id)
-            fixture = fixtures[0] if fixtures else None
-            events = await client.get_fixture_events(fixture_id=watch.fixture_id)
+            base_detail = await FootballLiveMatchService(client).get_match_center(
+                watch.fixture_id,
+                time_scope="live_watch",
+                include_events=True,
+            )
+            fixture = base_detail.fixture
+            events = base_detail.events
             statistics: list[dict[str, Any]] = []
             lineups: list[dict[str, Any]] = []
             if fixture is not None:
                 current_snapshot = snapshot_from_fixture(fixture)
-                if should_fetch_lineups(current_snapshot, lineups_fetched=watch.lineups_fetched):
-                    lineups_method = getattr(client, "get_fixture_lineups", None)
-                    if lineups_method is not None:
-                        lineups = await lineups_method(fixture_id=watch.fixture_id)
-                    watch.lineups_fetched = True
-                if should_fetch_statistics(current_snapshot, emitted_checkpoints=watch.emitted_checkpoints):
-                    stats_method = getattr(client, "get_fixture_statistics", None)
-                    if stats_method is not None:
-                        statistics = await stats_method(fixture_id=watch.fixture_id)
+                include_lineups = should_fetch_lineups(current_snapshot, lineups_fetched=watch.lineups_fetched)
+                include_stats = should_fetch_statistics(current_snapshot, emitted_checkpoints=watch.emitted_checkpoints)
+                if include_lineups or include_stats:
+                    detail = await FootballLiveMatchService(client).get_match_center(
+                        watch.fixture_id,
+                        time_scope="live_watch",
+                        include_events=False,
+                        include_stats=include_stats,
+                        include_lineups=include_lineups,
+                    )
+                    statistics = detail.statistics
+                    lineups = detail.lineups
+                    if include_lineups:
+                        watch.lineups_fetched = True
         except Exception:
             logging.exception("AI football live watch poll failed guild=%s channel=%s fixture=%s", watch.guild_id, watch.channel_id, watch.fixture_id)
             return
@@ -3634,82 +4319,6 @@ class AIChatCog(commands.Cog):
         if is_terminal_status(new_snapshot.status):
             self._cancel_football_live_watch(key, reason="terminal")
 
-    def _football_live_watch_updates(
-        self,
-        watch: FootballLiveWatch,
-        fixture: dict[str, Any],
-        events: list[dict[str, Any]],
-    ) -> list[str]:
-        updates: list[str] = []
-        score = fixture_score(fixture)
-        status = fixture_status(fixture.get("fixture") if isinstance(fixture.get("fixture"), dict) else {})
-        for event in events[:60]:
-            if not self._football_event_is_meaningful(event):
-                continue
-            event_key = self._football_event_key(event)
-            if event_key in watch.seen_event_keys:
-                continue
-            watch.seen_event_keys.add(event_key)
-            updates.append(self._football_format_event_update(event, fixture))
-        if score != watch.last_score and not updates:
-            updates.append(f"{watch.fixture_label}: {score} ({status})")
-        elif self._football_status_changed_meaningfully(watch.last_status, status):
-            updates.append(f"{watch.fixture_label}: {score} ({status})")
-        watch.last_score = score
-        watch.last_status = status
-        return [item for item in updates if item]
-
-    @staticmethod
-    def _football_event_is_meaningful(event: dict[str, Any]) -> bool:
-        event_type = str(event.get("type") or "").casefold()
-        detail = str(event.get("detail") or "").casefold()
-        return event_type == "goal" or (event_type == "card" and "red" in detail)
-
-    @staticmethod
-    def _football_event_key(event: dict[str, Any]) -> str:
-        time_info = event.get("time") if isinstance(event.get("time"), dict) else {}
-        team = event.get("team") if isinstance(event.get("team"), dict) else {}
-        player = event.get("player") if isinstance(event.get("player"), dict) else {}
-        return "|".join(
-            str(part or "")
-            for part in (
-                time_info.get("elapsed"),
-                time_info.get("extra"),
-                team.get("id") or team.get("name"),
-                player.get("id") or player.get("name"),
-                event.get("type"),
-                event.get("detail"),
-            )
-        )
-
-    @staticmethod
-    def _football_format_event_update(event: dict[str, Any], fixture: dict[str, Any]) -> str:
-        time_info = event.get("time") if isinstance(event.get("time"), dict) else {}
-        team = event.get("team") if isinstance(event.get("team"), dict) else {}
-        player = event.get("player") if isinstance(event.get("player"), dict) else {}
-        elapsed = time_info.get("elapsed")
-        extra = time_info.get("extra")
-        minute = f"{elapsed}'" if isinstance(elapsed, int) else ""
-        if isinstance(extra, int):
-            minute = f"{elapsed}+{extra}'" if isinstance(elapsed, int) else f"+{extra}'"
-        event_type = str(event.get("type") or "")
-        detail = str(event.get("detail") or "")
-        label = "Gol" if event_type.casefold() == "goal" else "Roja"
-        team_name = str(team.get("name") or "Equipo")
-        player_name = str(player.get("name") or "Jugador")
-        return f"{label} {minute} {team_name} - {player_name}. Marcador: {fixture_score(fixture)}".strip()
-
-    @staticmethod
-    def _football_status_changed_meaningfully(previous: str, current: str) -> bool:
-        previous_short = previous.split()[0] if previous else ""
-        current_short = current.split()[0] if current else ""
-        return current_short != previous_short and current_short in {"1H", "HT", "2H", "ET", "BT", "P", "FT", "AET", "PEN"}
-
-    @staticmethod
-    def _football_status_is_terminal(status: str) -> bool:
-        short = status.split()[0] if status else ""
-        return short in {"FT", "AET", "PEN", "CANC", "ABD", "AWD", "PST"}
-
     def _football_live_watch_can_send(self, key: tuple[int, int], watch: FootballLiveWatch) -> bool:
         current = self._football_live_watches.get(key)
         return current is watch and not watch.canceled
@@ -3742,74 +4351,6 @@ class AIChatCog(commands.Cog):
                 return fixture
         return None
 
-    @staticmethod
-    def _football_team_candidates_from_text(text: str, candidate_names: list[str] | None = None) -> list[str]:
-        cleaned_request = re.sub(
-            r"(?i)\b(?:podrias?|puedes|dame|darme|informacion|info|sobre|del?|la|el|los|las|que|juega|en|de|liga|expansion|mx|mexico|fc|club)\b",
-            " ",
-            text,
-        )
-        candidates = list(candidate_names or [])
-        normalized = football_resolver.normalize_key(text)
-        for alias, canonical in football_resolver.TEAM_ALIASES.items():
-            if alias and alias in normalized:
-                candidates.insert(0, canonical)
-        if not looks_like_raw_sentence(cleaned_request, text):
-            candidates.extend([canonical_team_query(cleaned_request), cleaned_request.strip()])
-        else:
-            logging.info("AI football raw team sentence rejected request_hash=%s", abs(hash(normalized)) % 100000)
-        for side in re.split(r"(?i)\b(?:vs|contra|versus)\b", text):
-            side_cleaned = re.sub(
-                r"(?i)\b(?:historial|h2h|head\s+to\s+head|partido|juego|goles|quien|metio|de|del|la|el|los|las)\b",
-                " ",
-                side,
-            )
-            if not looks_like_raw_sentence(side_cleaned, text):
-                candidates.append(canonical_team_query(side_cleaned))
-        candidates = clean_entity_candidates("team", candidates, text)
-        deduped: list[str] = []
-        seen: set[str] = set()
-        for candidate in candidates:
-            cleaned = " ".join(str(candidate or "").split())
-            key = football_resolver.normalize_key(cleaned)
-            if cleaned and key and key not in seen:
-                deduped.append(cleaned)
-                seen.add(key)
-        return deduped
-
-    async def _football_resolve_team_candidates(
-        self,
-        client: object,
-        *,
-        request: str,
-        league_id: int | None,
-        season: int | None,
-        candidate_names: list[str] | None = None,
-        max_teams: int = 2,
-    ) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        seen_ids: set[int] = set()
-        for candidate in self._football_team_candidates_from_text(request, candidate_names):
-            for scoped_league_id, scoped_season in ((league_id, season), (None, None)):
-                try:
-                    teams = await client.search_teams(name=candidate, league_id=scoped_league_id, season=scoped_season)
-                except Exception:
-                    continue
-                picked = pick_team(teams, candidate)
-                if picked.selected is None:
-                    continue
-                team = picked.selected.get("team") if isinstance(picked.selected, dict) else {}
-                team_id = team.get("id") if isinstance(team, dict) else None
-                if isinstance(team_id, int) and team_id in seen_ids:
-                    continue
-                if isinstance(team_id, int):
-                    seen_ids.add(team_id)
-                rows.append(picked.selected)
-                break
-            if len(rows) >= max_teams:
-                break
-        return rows
-
     def _football_player_alias_cache(self) -> dict[str, dict[str, Any]]:
         cache = getattr(self.bot, "football_player_alias_cache", None)
         if not isinstance(cache, dict):
@@ -3831,58 +4372,6 @@ class AIChatCog(commands.Cog):
             )
 
         return _canonicalize
-
-    @staticmethod
-    def _football_player_candidate_names(rows: list[dict[str, Any]]) -> list[str]:
-        names = []
-        for item in rows[:5]:
-            player = item.get("player") if isinstance(item, dict) else {}
-            if isinstance(player, dict):
-                names.append(f"{player.get('name')}#{player.get('id')}"[:120])
-        return names
-
-    async def _football_team_from_text(
-        self,
-        client: object,
-        *,
-        request: str,
-        league_id: int | None,
-        season: int | None,
-        candidate_names: list[str] | None = None,
-    ) -> dict[str, Any] | None:
-        for candidate in self._football_team_candidates_from_text(request, candidate_names):
-            for scoped_league_id, scoped_season in ((league_id, season), (None, None)):
-                try:
-                    teams = await client.search_teams(name=candidate, league_id=scoped_league_id, season=scoped_season)
-                except Exception:
-                    continue
-                picked = pick_team(teams, candidate)
-                if picked.selected is None:
-                    continue
-                return picked.selected
-        return None
-
-    async def _football_team_id_from_text(
-        self,
-        client: object,
-        *,
-        request: str,
-        league_id: int | None,
-        season: int | None,
-        candidate_names: list[str] | None = None,
-    ) -> int | None:
-        selected = await self._football_team_from_text(
-            client,
-            request=request,
-            league_id=league_id,
-            season=season,
-            candidate_names=candidate_names,
-        )
-        team = selected.get("team") if isinstance(selected, dict) else {}
-        team_id = team.get("id") if isinstance(team, dict) else None
-        if isinstance(team_id, int):
-            return team_id
-        return None
 
     @staticmethod
     def _football_generic_context(
@@ -4845,12 +5334,19 @@ class AIChatCog(commands.Cog):
                     return local_reaction
             return self._fallback_route_decision(anchor_type, failure=True, failure_reason="api_exception")
         decision = self._coerce_route_decision(raw)
+        self._remember_response_delivery_decision(message, decision)
         local_behavior_update = self._local_trusted_behavior_update_decision(message, decision)
         if local_behavior_update is not None:
             return local_behavior_update
         local_visual = self._local_visual_action_decision(message, anchor_type, image_context, decision)
         if local_visual is not None:
             return local_visual
+        local_football_entity = self._local_football_entity_route_decision(message, anchor_type, decision)
+        if local_football_entity is not None:
+            return local_football_entity
+        local_football_followup = self._local_football_followup_route_decision(message, anchor_type, decision)
+        if local_football_followup is not None:
+            return local_football_followup
         if self._has_no_text_reaction_intent(message.content):
             local_reaction = self._local_reaction_only_decision(message, available_emojis or [])
             if local_reaction is not None:
@@ -4906,6 +5402,7 @@ class AIChatCog(commands.Cog):
                 emoji=decision.emoji,
                 emojis=decision.emojis,
                 send_text=decision.send_text,
+                response_delivery=decision.response_delivery,
                 pending_operation=decision.pending_operation,
                 failure_reason=decision.failure_reason,
             )
@@ -4929,10 +5426,335 @@ class AIChatCog(commands.Cog):
                     emoji=decision.emoji,
                     emojis=decision.emojis,
                     send_text=decision.send_text,
+                    response_delivery=decision.response_delivery,
                     pending_operation=decision.pending_operation,
                     failure_reason=decision.failure_reason,
                 )
+        local_football_opinion = self._local_football_opinion_chat_decision(message, decision)
+        if local_football_opinion is not None:
+            return local_football_opinion
         return decision
+
+    def _local_football_entity_route_decision(
+        self,
+        message: discord.Message,
+        anchor_type: str,
+        decision: RouteDecision,
+    ) -> RouteDecision | None:
+        if anchor_type not in STRONG_ANCHORS | {"SAME_USER_CONTINUATION", "REPLY_TO_AI"}:
+            return None
+        if decision.valid and not decision.failure and decision.action not in {"CHAT", "CLARIFY", "NONE"}:
+            return None
+        bot_user = getattr(self.bot, "user", None)
+        content = self._remove_bot_mentions(message.content, bot_user.id) if bot_user is not None else message.content
+        prior_context = self._football_prior_lease_context(message)
+        if not prior_context and not self._football_text_has_domain_evidence(content):
+            logging.info(
+                "AI football local rescue skipped guild=%s channel=%s message=%s reason=no_domain_evidence",
+                getattr(getattr(message, "guild", None), "id", None),
+                getattr(getattr(message, "channel", None), "id", None),
+                getattr(message, "id", None),
+            )
+            return None
+        operation = compile_football_operation("CHAT", content, None, prior_context=prior_context)
+        if not (
+            operation.operation_type.startswith("player_")
+            or operation.operation_type in {"player_profile", "team_squad", "team_transfers", "team_injuries", "league_lookup"}
+        ):
+            return None
+        logging.info(
+            "AI football entity route forced action=%s operation=%s route_forced_from_chat=True",
+            operation.route_action,
+            operation.operation_type,
+        )
+        return RouteDecision(
+            participation="RESPOND",
+            action=operation.route_action,
+            participation_confidence=max(decision.participation_confidence, 0.95),
+            action_confidence=max(decision.action_confidence, 0.95),
+            reason_code="FOOTBALL_ENTITY_REQUEST",
+            resolved_request=content,
+            valid=True,
+            failure=False,
+        )
+
+    def _local_football_followup_route_decision(
+        self,
+        message: discord.Message,
+        anchor_type: str,
+        decision: RouteDecision,
+    ) -> RouteDecision | None:
+        if anchor_type not in STRONG_ANCHORS | {"SAME_USER_CONTINUATION", "REPLY_TO_AI"}:
+            return None
+        if decision.valid and not decision.failure and decision.action not in {"CHAT", "CLARIFY", "NONE"}:
+            return None
+        context = self._valid_football_turn_context(message)
+        if context is None:
+            return None
+        bot_user = getattr(self.bot, "user", None)
+        content = self._remove_bot_mentions(message.content, bot_user.id) if bot_user is not None else message.content
+        if self._football_text_has_explicit_new_entity(content, context.payload):
+            return None
+        is_correction = self._football_text_is_slot_correction(content)
+        if not is_correction and not self._football_text_is_factual_followup(content):
+            return None
+        if context.dormant and not self._football_dormant_context_can_reactivate(message, content, context):
+            return None
+        action = "FOOTBALL_MATCH_CENTER"
+        if is_correction or self._football_text_is_status_followup(content):
+            action = "FOOTBALL_SUMMARY"
+        return RouteDecision(
+            participation="RESPOND",
+            action=action,
+            participation_confidence=max(decision.participation_confidence, 0.95),
+            action_confidence=max(decision.action_confidence, 0.95),
+            reason_code="SAME_USER_CONTINUATION",
+            resolved_request=content.strip()[:700],
+            valid=True,
+            failure=False,
+            send_text=True,
+        )
+
+    def _football_chat_context_for_message(
+        self,
+        message: discord.Message,
+        text: str,
+        *,
+        anchor_type: str,
+        action: str,
+    ) -> FootballTurnContext | None:
+        if action != "CHAT" or anchor_type not in STRONG_ANCHORS | {"SAME_USER_CONTINUATION", "REPLY_TO_AI"}:
+            return None
+        context = self._valid_football_turn_context(message)
+        if context is None:
+            return None
+        if self._football_text_has_explicit_new_entity(text, context.payload):
+            return None
+        if self._football_text_is_factual_followup(text):
+            return None
+        if not self._football_text_is_conversational_followup(text):
+            return None
+        if context.dormant and not self._football_dormant_context_can_reactivate(message, text, context):
+            return None
+        return context
+
+    def _football_dormant_context_can_reactivate(
+        self,
+        message: discord.Message,
+        text: str,
+        context: FootballTurnContext,
+    ) -> bool:
+        reference_id = getattr(getattr(message, "reference", None), "message_id", None)
+        if reference_id in {context.source_user_message_id, context.source_assistant_message_id}:
+            return True
+        return self._football_text_is_slot_correction(text) or self._football_text_is_factual_followup(text) or self._football_text_is_conversational_followup(text)
+
+    @staticmethod
+    def _football_text_is_slot_correction(text: str) -> bool:
+        lowered = AIChatCog._plain_words_text(text)
+        return any(
+            marker in lowered
+            for marker in (
+                "hoy no",
+                "no hoy",
+                "fue ayer",
+                "era ayer",
+                "it was yesterday",
+                "not today",
+                "ayer no",
+                "fue manana",
+                "fue mañana",
+                "era manana",
+                "era mañana",
+                "it was tomorrow",
+                "me equivoque de fecha",
+                "me equivoque del dia",
+                "wrong date",
+                "wrong day",
+                "i was wrong",
+            )
+        )
+
+    @staticmethod
+    def _football_text_is_factual_followup(text: str) -> bool:
+        lowered = AIChatCog._plain_words_text(text)
+        return any(
+            marker in lowered
+            for marker in (
+                "posesion",
+                "possession",
+                "tiros",
+                "shots",
+                "estadistica",
+                "stats",
+                "gol",
+                "goles",
+                "scorer",
+                "metio",
+                "marco",
+                "tarjeta",
+                "cards",
+                "amarilla",
+                "roja",
+                "alineacion",
+                "lineup",
+                "once",
+                "current score",
+                "marcador",
+                "como va",
+                "segundo tiempo",
+                "second half",
+                "ya empezo",
+                "status",
+            )
+        )
+
+    @staticmethod
+    def _football_text_is_status_followup(text: str) -> bool:
+        lowered = AIChatCog._plain_words_text(text)
+        return any(marker in lowered for marker in ("como va", "marcador", "current score", "status", "ya empezo", "segundo tiempo", "second half"))
+
+    @staticmethod
+    def _football_text_has_domain_evidence(text: str) -> bool:
+        lowered = AIChatCog._plain_words_text(text)
+        return any(
+            marker in lowered
+            for marker in (
+                "football",
+                "futbol",
+                "soccer",
+                "partido",
+                "match",
+                "fixture",
+                "juego",
+                "liga",
+                "league",
+                "cup",
+                "copa",
+                "equipo",
+                "team",
+                "jugador",
+                "player",
+                "gol",
+                "goles",
+                "scorer",
+                "estadistica",
+                "estadisticas",
+                "stats",
+                "statistics",
+                "tabla",
+                "standings",
+                "alineacion",
+                "lineup",
+                "tarjeta",
+                "cards",
+                "transfer",
+                "fichaje",
+                "lesion",
+                "injury",
+            )
+        )
+
+    @staticmethod
+    def _football_text_is_conversational_followup(text: str) -> bool:
+        lowered = AIChatCog._plain_words_text(text)
+        return any(
+            marker in lowered
+            for marker in (
+                "jaja",
+                "lol",
+                "no manches",
+                "que loco",
+                "increible",
+                "que opinas",
+                "opinion",
+                "crees",
+                "eso estuvo",
+                "ese partido",
+                "este partido",
+                "lo que dijiste",
+                "que quisiste decir",
+                "what did you mean",
+                "that was",
+                "crazy",
+            )
+        )
+
+    @staticmethod
+    def _football_text_has_explicit_new_entity(text: str, payload: dict[str, object]) -> bool:
+        lowered = AIChatCog._plain_words_text(text)
+        if not lowered:
+            return False
+        active_names = {
+            football_resolver.normalize_key(str(payload.get(key) or ""))
+            for key in ("team_name", "opponent_name", "player_name", "league_name")
+            if payload.get(key)
+        }
+        for candidate in re.findall(r"\b[A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ]+){0,3}", text):
+            key = football_resolver.normalize_key(candidate)
+            if key and key not in active_names and key not in {"nitori"}:
+                return True
+        return False
+
+    def _local_football_opinion_chat_decision(self, message: discord.Message, decision: RouteDecision) -> RouteDecision | None:
+        if not decision.valid or decision.failure or not decision.action.startswith("FOOTBALL_"):
+            return None
+        content = self._plain_words_text(getattr(message, "content", ""))
+        if not content:
+            return None
+        opinion_markers = (
+            "que opinas",
+            "opinion",
+            "cuanto crees",
+            "como crees",
+            "pronostico",
+            "prediction",
+            "predict",
+        )
+        if not any(marker in content for marker in opinion_markers):
+            return None
+        factual_markers = (
+            "resultado",
+            "como quedo",
+            "como quedaron",
+            "ya termino",
+            "quien metio",
+            "quienes metieron",
+            "goles",
+            "tabla",
+            "posiciones",
+            "alineacion",
+            "lineup",
+            "estadistica",
+            "stats",
+            "lesion",
+            "fichaje",
+            "transfer",
+            "cuando juega",
+            "proximo",
+            "ultimo",
+            "en vivo",
+            "live",
+        )
+        if any(marker in content for marker in factual_markers):
+            return None
+        return RouteDecision(
+            participation="RESPOND",
+            action="CHAT",
+            participation_confidence=decision.participation_confidence,
+            action_confidence=decision.action_confidence,
+            reason_code="FOOTBALL_OPINION_CHAT",
+            resolved_request=decision.resolved_request,
+            valid=True,
+            failure=False,
+            send_text=True,
+        )
+
+    @staticmethod
+    def _plain_words_text(value: str) -> str:
+        normalized = unicodedata.normalize("NFKD", str(value or ""))
+        normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+        return re.sub(r"\s+", " ", normalized.casefold()).strip()
 
     def _local_visual_action_decision(
         self,
@@ -5037,17 +5859,204 @@ class AIChatCog(commands.Cog):
         permissions = getattr(message.author, "guild_permissions", None)
         has_admin = bool(getattr(permissions, "administrator", False))
         has_manage_guild = bool(getattr(permissions, "manage_guild", False))
+        has_moderate_members = bool(getattr(permissions, "moderate_members", False))
+        has_manage_channels = bool(getattr(permissions, "manage_channels", False))
+        has_manage_messages = bool(getattr(permissions, "manage_messages", False))
         can_manage = is_owner or is_guild_owner or has_admin or has_manage_guild
         return {
             "author_is_bot_owner": is_owner,
             "author_is_guild_owner": is_guild_owner,
             "author_has_administrator": has_admin,
             "author_has_manage_guild": has_manage_guild,
+            "author_has_moderate_members": has_moderate_members,
+            "author_has_manage_channels": has_manage_channels,
+            "author_has_manage_messages": has_manage_messages,
             "author_can_manage_bot_behavior": can_manage,
+            "author_can_use_ai_moderation": is_owner
+            or is_guild_owner
+            or has_admin
+            or has_manage_guild
+            or has_moderate_members
+            or has_manage_channels
+            or has_manage_messages,
         }
 
     def _author_can_manage_bot_behavior(self, message: discord.Message) -> bool:
         return bool(self._route_authority_metadata(message).get("author_can_manage_bot_behavior"))
+
+    _QUOTED_DELIVERY_TEXT_RE: Final[re.Pattern[str]] = re.compile(
+        r"\"(?:\\.|[^\"])*\"|'(?:\\.|[^'])*'|\u201c[^\u201d]*\u201d|\u2018[^\u2019]*\u2019|\u00ab[^\u00bb]*\u00bb",
+        flags=re.DOTALL,
+    )
+
+    @staticmethod
+    def _normalize_delivery_evidence(text: str) -> str:
+        return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", str(text or "")).casefold()).strip()
+
+    def _delivery_evidence_text_for_message(self, message: discord.Message) -> str:
+        text = str(getattr(message, "content", "") or "")
+        bot_user = getattr(self.bot, "user", None)
+        bot_id = getattr(bot_user, "id", None)
+        if bot_id is not None:
+            text = self._remove_bot_mentions(text, bot_id)
+        return self._QUOTED_DELIVERY_TEXT_RE.sub(" ", text)
+
+    def _validated_response_delivery_for_message(
+        self,
+        message: discord.Message,
+        response_delivery: object,
+    ) -> VoiceResponseDecision:
+        if not isinstance(response_delivery, dict):
+            return VoiceResponseDecision(ResponseModality.UNSPECIFIED, False, source="semantic_router", reason="missing_response_delivery")
+
+        raw_modality = str(response_delivery.get("modality", "UNSPECIFIED")).strip().upper()
+        raw_source = str(response_delivery.get("source", "UNSPECIFIED")).strip().upper()
+        explicit = bool(response_delivery.get("explicit", False))
+        evidence = str(response_delivery.get("evidence_span", "") or "").strip()
+        semantic_reason = str(response_delivery.get("semantic_reason", "") or "").strip()
+        failure_reason = str(response_delivery.get("failure_reason", "") or "").strip()
+        ambiguous_reason = str(response_delivery.get("ambiguous_reason", "") or "").strip()
+
+        if raw_modality == "TEXT":
+            return VoiceResponseDecision(ResponseModality.TEXT, False, source="semantic_router", reason=semantic_reason or "explicit_text_or_no_voice_delivery")
+        if raw_modality != "VOICE":
+            return VoiceResponseDecision(ResponseModality.UNSPECIFIED, False, source="semantic_router", reason=semantic_reason or "unspecified_response_delivery")
+        if failure_reason or ambiguous_reason:
+            return VoiceResponseDecision(ResponseModality.TEXT, False, source="semantic_router", reason=failure_reason or ambiguous_reason)
+        if not explicit:
+            return VoiceResponseDecision(ResponseModality.TEXT, False, source="semantic_router", reason="voice_delivery_not_explicit")
+        if raw_source != "CURRENT_MESSAGE":
+            return VoiceResponseDecision(ResponseModality.TEXT, False, source="semantic_router", reason="voice_delivery_not_current_message")
+        if not evidence:
+            return VoiceResponseDecision(ResponseModality.TEXT, False, source="semantic_router", reason="voice_delivery_missing_evidence")
+
+        normalized_evidence = self._normalize_delivery_evidence(evidence)
+        normalized_current = self._normalize_delivery_evidence(self._delivery_evidence_text_for_message(message))
+        if not normalized_evidence or normalized_evidence not in normalized_current:
+            return VoiceResponseDecision(ResponseModality.TEXT, False, source="semantic_router", reason="voice_delivery_evidence_not_in_current_message")
+        return VoiceResponseDecision(ResponseModality.VOICE, True, source="current_message", reason=semantic_reason or "explicit_voice_output_request")
+
+    def _remember_response_delivery_decision(self, message: discord.Message, route_decision: RouteDecision) -> None:
+        message_id = getattr(message, "id", None)
+        if message_id is None:
+            return
+        decision = self._validated_response_delivery_for_message(message, route_decision.response_delivery)
+        message_key = int(message_id)
+        existing = self._voice_response_decisions.get(message_key)
+        if (
+            existing is not None
+            and existing.modality == ResponseModality.VOICE
+            and route_decision.response_delivery is None
+        ):
+            decision = existing
+        if message_key not in self._voice_response_decisions:
+            if len(self._voice_response_decision_ids) >= self._voice_response_decision_ids.maxlen:
+                oldest = self._voice_response_decision_ids.popleft()
+                self._voice_response_decisions.pop(oldest, None)
+            self._voice_response_decision_ids.append(message_key)
+        self._voice_response_decisions[message_key] = decision
+        logging.info(
+            "AI voice modality guild=%s channel=%s message=%s request_hash=%s voice_intent_detected=%s voice_intent_source=%s response_modality=%s reason=%s",
+            getattr(getattr(message, "guild", None), "id", None),
+            getattr(getattr(message, "channel", None), "id", None),
+            getattr(message, "id", None),
+            abs(hash(str(getattr(message, "content", "") or ""))) % 100000,
+            decision.intent_detected,
+            decision.source,
+            decision.modality.value,
+            decision.reason,
+        )
+
+    @staticmethod
+    def _voice_delivery_prompt_note() -> str:
+        tags = ", ".join(f"[{tag}]" for tag in sorted(ALLOWED_TTS_TAGS))
+        return (
+            "[PRIVATE_DELIVERY_INSTRUCTION]\n"
+            "This current user requested this response as a native Discord voice message. "
+            "Use the same substantive answer you would give in text, but write it for natural spoken delivery through xAI TTS. "
+            "Prefer spoken phrasing over Discord chat phrasing. "
+            f"When a non-verbal expression is semantically appropriate, you may use only these inline expressive tags: {tags}. "
+            "Do not force expressive tags, do not invent tags, and do not map written expressions to tags mechanically. "
+            "Preserve literal quoted text, code, commands, URLs, names, statistics, football results, and discussion about words or tags. "
+            "Do not say you cannot send audio or voice."
+        )
+
+    @staticmethod
+    def _voice_failure_visible_text(text: str) -> str:
+        tag_names = "|".join(re.escape(tag) for tag in sorted(ALLOWED_TTS_TAGS, key=len, reverse=True))
+        if not tag_names:
+            return text
+        # Display fallback only: successful voice keeps provider tags for TTS.
+        cleaned = re.sub(rf"(?<![`\\])\[(?:{tag_names})\](?!`)", "", text, flags=re.IGNORECASE)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip() or text
+
+    def _response_modality_for_message(self, message: discord.Message) -> ResponseModality:
+        message_id = getattr(message, "id", None)
+        if message_id in self._voice_response_consumed_set:
+            return ResponseModality.TEXT
+        if message_id is None:
+            return ResponseModality.TEXT
+        decision = self._voice_response_decisions.get(int(message_id))
+        return decision.modality if decision is not None and decision.modality == ResponseModality.VOICE else ResponseModality.TEXT
+
+    def _consume_voice_response_modality(self, message: discord.Message) -> bool:
+        if self._response_modality_for_message(message) != ResponseModality.VOICE:
+            return False
+        message_id = getattr(message, "id", None)
+        if message_id is None:
+            return False
+        if len(self._voice_response_consumed_ids) >= self._voice_response_consumed_ids.maxlen:
+            oldest = self._voice_response_consumed_ids.popleft()
+            self._voice_response_consumed_set.discard(oldest)
+        self._voice_response_consumed_ids.append(int(message_id))
+        self._voice_response_consumed_set.add(int(message_id))
+        return True
+
+    async def _send_voice_reply(
+        self,
+        trigger_message: discord.Message,
+        text: str,
+    ) -> int:
+        guild_id = getattr(getattr(trigger_message, "guild", None), "id", None)
+        channel_id = getattr(getattr(trigger_message, "channel", None), "id", None)
+        message_id = getattr(trigger_message, "id", None)
+        logging.info(
+            "AI voice pipeline event=voice_pipeline_entered guild=%s channel=%s message=%s",
+            guild_id,
+            channel_id,
+            message_id,
+        )
+        llm_client = getattr(self.bot, "llm_client", None)
+        if llm_client is None or not hasattr(llm_client, "text_to_speech"):
+            raise RuntimeError("voice_output_not_configured")
+        tts_text = sanitize_tts_text(text)
+        try:
+            logging.info("AI voice pipeline event=tts_started guild=%s channel=%s message=%s", guild_id, channel_id, message_id)
+            audio_bytes, content_type = await llm_client.text_to_speech(tts_text)
+            logging.info("AI voice pipeline event=tts_success guild=%s channel=%s message=%s bytes=%s", guild_id, channel_id, message_id, len(audio_bytes))
+        except Exception:
+            logging.exception("AI voice pipeline event=tts_failure guild=%s channel=%s message=%s", guild_id, channel_id, message_id)
+            raise
+        extension = ".wav" if "wav" in content_type.casefold() else ".mp3"
+        processor = getattr(self.bot, "voice_audio_processor", None) or VoiceAudioProcessor()
+        try:
+            logging.info("AI voice pipeline event=audio_processing_started guild=%s channel=%s message=%s", guild_id, channel_id, message_id)
+            processed = await processor.process(audio_bytes, source_extension=extension)
+            logging.info("AI voice pipeline event=audio_processing_success guild=%s channel=%s message=%s duration=%.3f", guild_id, channel_id, message_id, processed.duration_seconds)
+        except Exception:
+            logging.exception("AI voice pipeline event=audio_processing_failure guild=%s channel=%s message=%s", guild_id, channel_id, message_id)
+            raise
+        sender = getattr(self.bot, "discord_voice_sender", None) or DiscordVoiceMessageSender(self.bot)
+        try:
+            logging.info("AI voice pipeline event=discord_voice_upload_started guild=%s channel=%s message=%s", guild_id, channel_id, message_id)
+            sent_id = await sender.send(trigger_message.channel, processed)
+            logging.info("AI voice pipeline event=discord_voice_upload_success guild=%s channel=%s message=%s sent_message=%s", guild_id, channel_id, message_id, sent_id)
+            return sent_id
+        except Exception:
+            logging.exception("AI voice pipeline event=discord_voice_upload_failure guild=%s channel=%s message=%s", guild_id, channel_id, message_id)
+            raise
 
     def _local_trusted_behavior_update_decision(
         self,
@@ -5184,12 +6193,14 @@ class AIChatCog(commands.Cog):
                     if isinstance(raw.get("emojis", []), list) and str(item).strip()
                 ),
                 send_text=bool(raw.get("send_text", True)),
+                response_delivery=self._coerce_response_delivery_payload(raw.get("response_delivery")),
                 pending_operation=(
                     str(raw.get("pending_operation")).strip().upper()
                     if raw.get("pending_operation") is not None
                     else None
                 ),
                 memory=self._coerce_memory_payload(raw.get("memory")),
+                admin=self._coerce_admin_payload(raw.get("admin")),
                 valid=bool(raw.get("valid", False)),
                 failure=bool(raw.get("failure", False)),
                 failure_reason=(
@@ -5214,6 +6225,66 @@ class AIChatCog(commands.Cog):
             if raw is None:
                 continue
             cleaned = " ".join(str(raw).split())[:900 if key == "value" else 120]
+            if cleaned:
+                result[key] = cleaned
+        return result or None
+
+    @staticmethod
+    def _coerce_admin_payload(value: object) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        result: dict[str, Any] = {}
+        for key in ("admin_action", "target_channel", "reason", "clarification_question"):
+            raw = value.get(key)
+            if raw is None:
+                continue
+            cleaned = " ".join(str(raw).split())[:280 if key == "reason" else 120]
+            if cleaned:
+                result[key] = cleaned
+        for key in ("duration_seconds", "time_window_seconds"):
+            raw = value.get(key)
+            if raw is None:
+                continue
+            try:
+                result[key] = int(raw)
+            except (TypeError, ValueError):
+                continue
+        for key in ("confidence",):
+            raw = value.get(key)
+            if raw is None:
+                continue
+            try:
+                result[key] = float(raw)
+            except (TypeError, ValueError):
+                continue
+        if isinstance(value.get("target_user_candidates"), list):
+            result["target_user_candidates"] = [
+                " ".join(str(item).split())[:120]
+                for item in value["target_user_candidates"][:5]
+                if " ".join(str(item).split())
+            ]
+        for key in ("requires_confirmation", "valid"):
+            if key in value:
+                result[key] = bool(value.get(key))
+        return result or None
+
+    @staticmethod
+    def _coerce_response_delivery_payload(value: object) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        result: dict[str, Any] = {}
+        modality = str(value.get("modality", "UNSPECIFIED")).strip().upper()
+        if modality in {"TEXT", "VOICE", "UNSPECIFIED"}:
+            result["modality"] = modality
+        source = str(value.get("source", "UNSPECIFIED")).strip().upper()
+        if source in {"CURRENT_MESSAGE", "UNSPECIFIED"}:
+            result["source"] = source
+        result["explicit"] = bool(value.get("explicit", False))
+        for key in ("evidence_span", "semantic_reason", "failure_reason", "ambiguous_reason"):
+            raw = value.get(key)
+            if raw is None:
+                continue
+            cleaned = " ".join(str(raw).split())[:220 if key == "semantic_reason" else 160]
             if cleaned:
                 result[key] = cleaned
         return result or None
@@ -5376,10 +6447,20 @@ class AIChatCog(commands.Cog):
         for member in getattr(message, "mentions", []) or []:
             mentions.append(
                 {
+                    "kind": "member",
                     "id": getattr(member, "id", None),
                     "name": getattr(member, "display_name", None) or getattr(member, "name", "unknown"),
                     "is_bot": bool(getattr(member, "bot", False)),
                     "is_self": self.bot.user is not None and getattr(member, "id", None) == self.bot.user.id,
+                }
+            )
+        for role in getattr(message, "role_mentions", []) or []:
+            mentions.append(
+                {
+                    "kind": "role",
+                    "id": getattr(role, "id", None),
+                    "name": getattr(role, "name", "unknown"),
+                    "mention": getattr(role, "mention", None),
                 }
             )
         return mentions
@@ -5405,8 +6486,29 @@ class AIChatCog(commands.Cog):
 
     def _route_lease_metadata(self, message: discord.Message) -> dict[str, object]:
         lease = self._valid_lease_for_message(message)
+        football_context = self._valid_football_turn_context(message)
+        football_payload: dict[str, object] = {"active": False}
+        if football_context is not None:
+            football_payload = {
+                "active": True,
+                "dormant": football_context.dormant,
+                "last_operation": football_context.last_operation,
+                "source_user_message_id": football_context.source_user_message_id,
+                "source_assistant_message_id": football_context.source_assistant_message_id,
+                "entity_type": football_context.payload.get("entity_type"),
+                "team_id": football_context.payload.get("team_id"),
+                "team_name": football_context.payload.get("team_name"),
+                "opponent_id": football_context.payload.get("opponent_id"),
+                "opponent_name": football_context.payload.get("opponent_name"),
+                "player_id": football_context.payload.get("player_id"),
+                "player_name": football_context.payload.get("player_name"),
+                "league_id": football_context.payload.get("league_id"),
+                "league_name": football_context.payload.get("league_name"),
+                "fixture_id": football_context.payload.get("fixture_id"),
+                "fixture_status": football_context.payload.get("fixture_status") or football_context.payload.get("status"),
+            }
         if lease is None:
-            return {"active": False}
+            return {"active": False, "football": football_payload}
         return {
             "active": True,
             "owner_user_id": lease.owner_user_id,
@@ -5414,6 +6516,7 @@ class AIChatCog(commands.Cog):
             "last_bot_response_id": lease.last_bot_response_id,
             "last_action": lease.last_action,
             "resolved_request": lease.resolved_request,
+            "football": football_payload,
         }
 
     def _route_missed_response_metadata(self, message: discord.Message) -> dict[str, object]:
@@ -5638,7 +6741,31 @@ class AIChatCog(commands.Cog):
         mention_author: bool,
         reply_to_trigger: bool | None = None,
         send_mode: str | None = None,
+        delete_after: float | None = None,
     ) -> int | None:
+        if self._consume_voice_response_modality(trigger_message):
+            try:
+                message_id = await self._send_voice_reply(trigger_message, text)
+                self._remember_chat_response_message(message_id)
+                self._record_channel_ai_activity(trigger_message)
+                return message_id
+            except Exception as exc:
+                logging.exception(
+                    "AI voice response failed guild=%s channel=%s message=%s",
+                    getattr(getattr(trigger_message, "guild", None), "id", None),
+                    getattr(getattr(trigger_message, "channel", None), "id", None),
+                    getattr(trigger_message, "id", None),
+                )
+                if isinstance(exc, XAITTSAuthorizationError):
+                    text = (
+                        "Voice output is not authorized for the configured xAI API key, so here is the text instead.\n\n"
+                        f"{self._voice_failure_visible_text(text)}"
+                    )
+                else:
+                    text = (
+                        "I could not send that as a voice message, so here is the text instead.\n\n"
+                        f"{self._voice_failure_visible_text(text)}"
+                    )
         parts = self._split_for_discord(text, limit=1900)
         if not parts:
             return None
@@ -5654,6 +6781,7 @@ class AIChatCog(commands.Cog):
                     parts[0],
                     mention_author=mention_author,
                     allowed_mentions=allowed_mentions,
+                    delete_after=delete_after,
                 )
             except Exception:
                 logging.exception(
@@ -5665,11 +6793,13 @@ class AIChatCog(commands.Cog):
                 first = await trigger_message.channel.send(
                     parts[0],
                     allowed_mentions=allowed_mentions,
+                    delete_after=delete_after,
                 )
         else:
             first = await trigger_message.channel.send(
                 parts[0],
                 allowed_mentions=allowed_mentions,
+                delete_after=delete_after,
             )
         self._remember_chat_response_message(first.id)
         self._record_channel_ai_activity(trigger_message)
@@ -5700,6 +6830,9 @@ class AIChatCog(commands.Cog):
         for key in list(self._continuation_leases.keys()):
             if key[0] == guild_id:
                 del self._continuation_leases[key]
+        for key in list(self._football_turn_contexts.keys()):
+            if key[0] == guild_id:
+                del self._football_turn_contexts[key]
 
     def _sanitize_visible_ai_output(self, text: str) -> str:
         cleaned = text.strip()
@@ -5738,6 +6871,11 @@ class AIChatCog(commands.Cog):
         )
         cleaned = re.sub(r"\bTRUSTED_WEB_RESULTS\b\s*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\b(?:web_search|x_search)_tool\b\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"(?i)\bdatos\s+confiables\b(?:\s+de\s+\S+)?",
+            "datos",
+            cleaned,
+        )
         cleaned = re.sub(
             r"(?i)\b(?:according to|based on)\s+(?:my\s+)?sources[:,]?\s*",
             "",
