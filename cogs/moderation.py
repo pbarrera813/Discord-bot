@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import logging
 import colorsys
+import difflib
+import asyncio
 import re
 import time
 from collections.abc import Iterable
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from io import BytesIO
 
+import aiohttp
 import discord
 from discord.ext import commands, tasks
 
-from services.admin_actions import AdminActionService
+from services.admin_actions import AdminActionResult, AdminActionService
 from services.modlog import send_modlog_embed
 from utils.discord_helpers import (
     WARNING_ROLE_NAMES,
@@ -25,7 +28,7 @@ from utils.permissions import owner_or_has_permissions
 
 try:
     from PIL import Image, ImageDraw, ImageFont
-except ImportError:  # pragma: no cover - optional runtime dependency
+except ImportError:
     Image = None
     ImageDraw = None
     ImageFont = None
@@ -47,14 +50,152 @@ DEFAULT_COLOR_ROLES: list[tuple[str, str]] = [
 ]
 
 
+def _modlog_diff_chunks(before: str, after: str, *, before_side: bool) -> list[tuple[str, bool]]:
+    chunks: list[tuple[str, bool]] = []
+    matcher = difflib.SequenceMatcher(None, before, after, autojunk=False)
+    for tag, before_start, before_end, after_start, after_end in matcher.get_opcodes():
+        if before_side:
+            value = before[before_start:before_end]
+            changed = tag in {"delete", "replace"}
+        else:
+            value = after[after_start:after_end]
+            changed = tag in {"insert", "replace"}
+        if value:
+            chunks.append((value, changed))
+    return chunks
+
+
+def _bounded_modlog_diff(chunks: list[tuple[str, bool]], limit: int = 1024) -> str:
+    rendered: list[str] = []
+    remaining = limit
+    for value, changed in chunks:
+        escaped = discord.utils.escape_markdown(value, as_needed=False)
+        if not escaped:
+            continue
+        marker_size = 4 if changed else 0
+        if remaining <= marker_size:
+            break
+        if len(escaped) + marker_size <= remaining:
+            rendered.append(f"__{escaped}__" if changed else escaped)
+            remaining -= len(escaped) + marker_size
+            continue
+
+        available = remaining - marker_size
+        clipped = escaped[:available]
+        if len(clipped) < len(escaped) and available >= 3:
+            clipped = clipped[: available - 3] + "..."
+        if clipped.endswith("\\"):
+            clipped = clipped[:-1]
+        if clipped:
+            rendered.append(f"__{clipped}__" if changed else clipped)
+        break
+    return "".join(rendered)[:limit]
+
+
+def _modlog_diff_value(
+    before: str,
+    after: str,
+    *,
+    before_side: bool,
+    empty_text: str,
+) -> str:
+    if not before and before_side:
+        return empty_text
+    if not after and not before_side:
+        return empty_text
+    return _bounded_modlog_diff(
+        _modlog_diff_chunks(before, after, before_side=before_side)
+    ) or empty_text
+
+
+class ModerationLogView(discord.ui.View):
+    GET_USER_ID_CUSTOM_ID = "moderation_log:get_user_id"
+
+    def __init__(
+        self,
+        *,
+        lang: str = "en",
+        jump_url: str | None = None,
+        context_url: str | None = None,
+        deleted: bool = False,
+    ) -> None:
+        super().__init__(timeout=None)
+        get_user_id = discord.ui.Button(
+            label=tr(lang, "Get User ID", "Obtener ID de usuario"),
+            style=discord.ButtonStyle.secondary,
+            custom_id=self.GET_USER_ID_CUSTOM_ID,
+        )
+        get_user_id.callback = self._on_get_user_id
+        self.add_item(get_user_id)
+
+        if context_url is not None or deleted:
+            label = tr(lang, "Jump to Context", "Ir al contexto")
+            url = context_url
+        else:
+            label = tr(lang, "Jump to Message", "Ir al mensaje")
+            url = jump_url
+        jump_button = discord.ui.Button(
+            label=label,
+            style=discord.ButtonStyle.link if url else discord.ButtonStyle.secondary,
+            url=url,
+            custom_id=None if url else "moderation_log:jump_unavailable",
+            disabled=url is None,
+        )
+        self.add_item(jump_button)
+
+    async def _on_get_user_id(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        message = interaction.message
+        footer_text = ""
+        if message is not None and message.embeds:
+            footer = getattr(message.embeds[0], "footer", None)
+            footer_text = str(getattr(footer, "text", "") or "")
+        match = re.search(r"(?:^|\|)\s*Author:\s*(\d+)\b", footer_text)
+        if match is None and message is not None:
+            # Read only the card's final metadata display; body text cannot spoof IDs.
+            for component in getattr(message, "components", ()):
+                components = getattr(component, "children", ())
+                displays = [item for item in components if getattr(item, "type", None) == discord.ComponentType.text_display]
+                if displays:
+                    candidate = str(getattr(displays[-1], "content", "") or "")
+                    match = re.search(r"(?m)^-# .*?\bAuthor:\s*(\d+)\b", candidate)
+                    if match:
+                        break
+        if match is None:
+            await interaction.response.send_message("User ID unavailable.", ephemeral=True)
+            return
+        await interaction.response.send_message(match.group(1), ephemeral=True)
+
+
 class ModerationCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.admin_actions = AdminActionService(bot)
+        self._modlog_capture_tasks: dict[tuple[int, int], asyncio.Task] = {}
+        self._modlog_delete_locks: dict[tuple[int, int], asyncio.Lock] = {}
+        self._modlog_deleted_ids: set[tuple[int, int]] = set()
+        self._modlog_deleted_order: list[tuple[int, int]] = []
+        self._modlog_deleting_ids: set[tuple[int, int]] = set()
+        self.bot.add_view(ModerationLogView())
         self.temp_action_worker.start()
+        self.modlog_archive_worker.start()
 
     def cog_unload(self) -> None:
         self.temp_action_worker.cancel()
+        self.modlog_archive_worker.cancel()
+        for task in self._modlog_capture_tasks.values():
+            task.cancel()
+
+    @tasks.loop(hours=1)
+    async def modlog_archive_worker(self) -> None:
+        await self.bot.db.prune_modlog_images()
+
+    @modlog_archive_worker.before_loop
+    async def before_modlog_archive_worker(self) -> None:
+        await self.bot.wait_until_ready()
+        await self.bot.db.prune_modlog_images()
 
     @tasks.loop(seconds=30)
     async def temp_action_worker(self) -> None:
@@ -100,6 +241,385 @@ class ModerationCog(commands.Cog):
             return "en"
         settings = await self.bot.db.get_guild_settings(guild.id)
         return settings.language_code
+
+    @staticmethod
+    async def _deleted_message_context_url(
+        message: discord.Message | None,
+        *,
+        guild: discord.Guild | None = None,
+        channel_id: int | None = None,
+        message_id: int | None = None,
+    ) -> str | None:
+        channel = getattr(message, "channel", None)
+        if channel is None and guild is not None and channel_id is not None:
+            channel = guild.get_channel(channel_id)
+        history = getattr(channel, "history", None)
+        if history is None:
+            return None
+        try:
+            before = message if message is not None else discord.Object(id=message_id)
+            async for previous in history(limit=1, before=before):
+                return getattr(previous, "jump_url", None) or None
+        except Exception:
+            logger.debug("Could not resolve deleted-message context", exc_info=True)
+        return None
+
+    @staticmethod
+    def _is_modlog_image(attachment: discord.Attachment) -> bool:
+        content_type = (attachment.content_type or "").lower()
+        return content_type.startswith("image/") or attachment.filename.lower().endswith(
+            (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".avif")
+        )
+
+    @staticmethod
+    def _modlog_attachment_info(attachment: discord.Attachment, position: int) -> dict:
+        return {
+            "id": int(attachment.id),
+            "filename": attachment.filename,
+            "content_type": attachment.content_type,
+            "spoiler": attachment.is_spoiler(),
+            "position": position,
+            "size": int(attachment.size),
+            "url": attachment.url,
+            "proxy_url": attachment.proxy_url,
+            "is_image": ModerationCog._is_modlog_image(attachment),
+        }
+
+    def _modlog_snapshot(self, message: discord.Message) -> dict:
+        attachments = [self._modlog_attachment_info(item, position) for position, item in enumerate(message.attachments)]
+        return {
+            "text": message.content or "",
+            "author_id": int(message.author.id),
+            "author_name": str(message.author),
+            "channel_id": int(message.channel.id),
+            "channel_name": str(getattr(message.channel, "name", message.channel.id)),
+            "attachments": attachments,
+            "unavailable": [],
+        }
+
+    async def _capture_modlog_message(self, message: discord.Message) -> None:
+        guild = message.guild
+        if guild is None or message.author.bot:
+            return
+        settings = await self.bot.db.get_guild_settings(guild.id)
+        if settings.modlog_channel_id is None or message.channel.id == settings.modlog_channel_id:
+            return
+        existing = await self.bot.db.get_modlog_images(guild.id, message.id)
+        prior_images = {int(item["id"]): item for item in (existing[1] if existing is not None else [])}
+        snapshot = self._modlog_snapshot(message)
+        images: list[dict] = []
+        unavailable: list[str] = []
+        max_file_size = min(int(getattr(guild, "filesize_limit", 25 * 1024 * 1024)), 256 * 1024 * 1024)
+        has_images = any(item["is_image"] for item in snapshot["attachments"])
+        for info, attachment in zip(snapshot["attachments"], message.attachments):
+            if not info["is_image"]:
+                continue
+            prior = prior_images.get(int(info["id"]))
+            if prior is not None:
+                images.append({**{k: info[k] for k in ("id", "filename", "content_type", "spoiler", "position")}, "data": prior["data"]})
+                continue
+            if attachment.size > max_file_size:
+                unavailable.append(attachment.filename)
+                continue
+            try:
+                data = await asyncio.wait_for(attachment.read(use_cached=True), timeout=8)
+            except (discord.HTTPException, OSError):
+                try:
+                    data = await asyncio.wait_for(attachment.read(use_cached=False), timeout=8)
+                except (discord.HTTPException, OSError, asyncio.TimeoutError):
+                    unavailable.append(attachment.filename)
+                    continue
+            except asyncio.TimeoutError:
+                unavailable.append(attachment.filename)
+                continue
+            if not data or len(data) > max_file_size:
+                unavailable.append(attachment.filename)
+                continue
+            images.append({**{k: info[k] for k in ("id", "filename", "content_type", "spoiler", "position")}, "data": data})
+        snapshot["unavailable"] = unavailable
+        if has_images or existing is not None:
+            await self.bot.db.save_modlog_images(guild.id, message.id, snapshot, images)
+
+    def _schedule_modlog_capture(self, message: discord.Message) -> None:
+        key = (message.guild.id, message.id) if message.guild is not None else None
+        if key is None or key in self._modlog_deleted_ids or key in self._modlog_deleting_ids:
+            return
+        prior = self._modlog_capture_tasks.get(key)
+
+        async def capture_after_prior() -> None:
+            if prior is not None and not prior.done():
+                await asyncio.gather(prior, return_exceptions=True)
+            await self._capture_modlog_message(message)
+
+        task = asyncio.create_task(capture_after_prior())
+        self._modlog_capture_tasks[key] = task
+
+        def clear(done: asyncio.Task) -> None:
+            if self._modlog_capture_tasks.get(key) is done:
+                self._modlog_capture_tasks.pop(key, None)
+            if not done.cancelled():
+                error = done.exception()
+                if error is not None:
+                    logger.warning("Failed to archive message for modlog", exc_info=error)
+
+        task.add_done_callback(clear)
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        if message.guild is not None and not message.author.bot and any(
+            self._is_modlog_image(item) for item in message.attachments
+        ):
+            self._schedule_modlog_capture(message)
+
+    @commands.Cog.listener()
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
+        if payload.cached_message is not None:
+            return  # on_message_edit below has the complete updated message.
+        guild_id = getattr(payload, "guild_id", None)
+        guild = self.bot.get_guild(guild_id) if guild_id else None
+        if guild is None:
+            return
+        data = payload.data
+        key = (guild.id, payload.message_id)
+        if key in self._modlog_deleted_ids or key in self._modlog_deleting_ids:
+            return
+        prior_task = self._modlog_capture_tasks.get(key)
+
+        async def update_snapshot() -> None:
+            if prior_task is not None and not prior_task.done():
+                await asyncio.gather(prior_task, return_exceptions=True)
+            settings = await self.bot.db.get_guild_settings(guild.id)
+            if settings.modlog_channel_id is None or payload.channel_id == settings.modlog_channel_id:
+                return
+            saved = await self.bot.db.get_modlog_images(guild.id, payload.message_id)
+            if saved is None:
+                if "attachments" in data:
+                    channel = guild.get_channel(payload.channel_id)
+                    if channel is not None:
+                        try:
+                            message = await channel.fetch_message(payload.message_id)
+                        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                            return
+                        await self._capture_modlog_message(message)
+                return
+            snapshot, prior_images = saved
+            if "content" in data:
+                snapshot["text"] = data["content"] or ""
+            images = prior_images
+            if "attachments" in data:
+                images_by_id = {int(item["id"]): item for item in prior_images}
+                descriptors = []
+                images = []
+                unavailable = []
+                max_file_size = min(int(getattr(guild, "filesize_limit", 25 * 1024 * 1024)), 256 * 1024 * 1024)
+                for position, item in enumerate(data["attachments"]):
+                    attachment_id = int(item["id"])
+                    filename = str(item.get("filename") or "image")
+                    info = {
+                        "id": attachment_id, "filename": filename,
+                        "content_type": item.get("content_type"), "spoiler": filename.startswith("SPOILER_"),
+                        "position": position, "size": int(item.get("size") or 0),
+                        "url": item.get("url"), "proxy_url": item.get("proxy_url"),
+                        "is_image": str(item.get("content_type") or "").startswith("image/") or filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".avif")),
+                    }
+                    descriptors.append(info)
+                    if not info["is_image"]:
+                        continue
+                    prior = images_by_id.get(attachment_id)
+                    blob = prior.get("data") if prior else None
+                    if blob is None and info["size"] <= max_file_size:
+                        for url in (info["proxy_url"], info["url"]):
+                            if url:
+                                blob = await self._download_modlog_image(str(url), max_file_size)
+                                if blob:
+                                    break
+                    if blob:
+                        images.append({**{k: info[k] for k in ("id", "filename", "content_type", "spoiler", "position")}, "data": blob})
+                    else:
+                        unavailable.append(filename)
+                snapshot["attachments"] = descriptors
+                snapshot["unavailable"] = unavailable
+            await self.bot.db.save_modlog_images(guild.id, payload.message_id, snapshot, images)
+
+        task = asyncio.create_task(update_snapshot())
+        self._modlog_capture_tasks[key] = task
+
+        def clear_update(done: asyncio.Task) -> None:
+            if self._modlog_capture_tasks.get(key) is done:
+                self._modlog_capture_tasks.pop(key, None)
+            if not done.cancelled():
+                error = done.exception()
+                if error is not None:
+                    logger.warning("Failed to update archived message log", exc_info=(type(error), error, error.__traceback__))
+
+        task.add_done_callback(clear_update)
+        await task
+
+    async def _download_modlog_image(self, url: str, max_bytes: int = 256 * 1024 * 1024) -> bytes | None:
+        try:
+            timeout = aiohttp.ClientTimeout(total=8)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        return None
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        total += len(chunk)
+                        if total > max_bytes:
+                            return None
+                        chunks.append(chunk)
+                    return b"".join(chunks) if total else None
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return None
+
+    async def _process_deleted_modlog_message(
+        self,
+        guild: discord.Guild,
+        message_id: int,
+        message: discord.Message | None,
+        channel_id: int,
+    ) -> None:
+        key = (guild.id, message_id)
+        lock = self._modlog_delete_locks.setdefault(key, asyncio.Lock())
+        try:
+            async with lock:
+                if key in self._modlog_deleted_ids:
+                    return
+                self._modlog_deleting_ids.add(key)
+                task = self._modlog_capture_tasks.get(key)
+                if task is not None:
+                    await asyncio.gather(task, return_exceptions=True)
+                settings = await self.bot.db.get_guild_settings(guild.id)
+                if settings.modlog_channel_id is None or settings.modlog_channel_id == channel_id:
+                    return
+                saved = await self.bot.db.get_modlog_images(guild.id, message_id)
+                snapshot, archived = saved if saved is not None else ({}, [])
+                if message is not None and message.author.bot:
+                    return
+                author_id = int(snapshot.get("author_id") or getattr(getattr(message, "author", None), "id", 0))
+                if not author_id:
+                    return
+                channel_name = snapshot.get("channel_name") or getattr(getattr(message, "channel", None), "name", str(channel_id))
+                channel_mention = f"<#{channel_id}>"
+                text = str(snapshot.get("text") if saved is not None else getattr(message, "content", "") or "")
+                descriptors = snapshot.get("attachments", [])
+                if message is not None and not descriptors:
+                    descriptors = [self._modlog_attachment_info(item, position) for position, item in enumerate(message.attachments)]
+                by_id = {int(item["id"]): item for item in archived}
+                max_file_size = min(int(getattr(guild, "filesize_limit", 25 * 1024 * 1024)), 256 * 1024 * 1024)
+                images: list[dict] = []
+                unavailable: list[str] = []
+                other_attachments = [str(item.get("filename") or "attachment") for item in descriptors if not item.get("is_image")]
+                used_names: set[str] = set()
+                for descriptor in descriptors:
+                    if not descriptor.get("is_image"):
+                        continue
+                    item = by_id.get(int(descriptor["id"]))
+                    data = item.get("data") if item else None
+                    if data is None:
+                        cached_attachment = next((att for att in getattr(message, "attachments", ()) if att.id == int(descriptor["id"])), None) if message is not None else None
+                        tried_cached_attachment = cached_attachment is not None
+                        if int(descriptor.get("size") or 0) <= max_file_size and cached_attachment is not None:
+                            for use_cached in (True, False):
+                                try:
+                                    data = await asyncio.wait_for(cached_attachment.read(use_cached=use_cached), timeout=8)
+                                except (discord.HTTPException, OSError, asyncio.TimeoutError):
+                                    data = None
+                                if data:
+                                    break
+                        if data is None and not tried_cached_attachment and int(descriptor.get("size") or 0) <= max_file_size:
+                            for url in (descriptor.get("proxy_url"), descriptor.get("url")):
+                                if url:
+                                    data = await self._download_modlog_image(str(url), max_file_size)
+                                    if data and len(data) <= max_file_size:
+                                        break
+                                    data = None
+                    if not data or len(data) > max_file_size:
+                        if descriptor.get("filename") not in unavailable:
+                            unavailable.append(str(descriptor.get("filename") or "image"))
+                        continue
+                    filename = str(descriptor.get("filename") or "image")
+                    spoiler = bool(descriptor.get("spoiler"))
+                    suffix_id = int(descriptor["id"])
+                    attempt = 0
+                    while True:
+                        candidate = filename
+                        if attempt:
+                            stem, dot, extension = filename.rpartition(".")
+                            extra = f"-{suffix_id}" + (f"-{attempt}" if attempt > 1 else "")
+                            candidate = f"{stem or filename}{extra}{dot}{extension}" if dot else f"{filename}{extra}"
+                        file = discord.File(BytesIO(data), filename=candidate, spoiler=spoiler)
+                        if file.filename not in used_names:
+                            break
+                        attempt += 1
+                    used_names.add(file.filename)
+                    images.append({"file": file, "url": f"attachment://{file.filename}"})
+                lang = await self._lang(guild)
+                logged_at = datetime.now(timezone.utc)
+                embed = discord.Embed(
+                    title=tr(lang, "Message Deleted", "Mensaje eliminado"),
+                    color=discord.Color.from_rgb(255, 74, 34),
+                    timestamp=logged_at,
+                )
+                embed.description = f"{tr(lang, 'From', 'De')}: <@{author_id}>    {tr(lang, 'In', 'En')}: {channel_mention}"
+                embed.set_footer(text=f"Author: {author_id} | Message ID: {message_id}")
+                if other_attachments:
+                    names = ", ".join(dict.fromkeys(other_attachments))[:500]
+                    text = (text + "\n\n" if text else "") + tr(lang, f"Attachments: {names}", f"Archivos adjuntos: {names}")
+                if unavailable:
+                    names = ", ".join(dict.fromkeys(unavailable))[:500]
+                    text = (text + "\n\n" if text else "") + tr(lang, f"[Unavailable image: {names}]", f"[Imagen no disponible: {names}]")
+                view = ModerationLogView(lang=lang, context_url=await self._deleted_message_context_url(
+                    message, guild=guild, channel_id=channel_id, message_id=message_id
+                ), deleted=True)
+                sent = await send_modlog_embed(guild, self.bot.db, embed, view=view,
+                    files=[item["file"] for item in images], image_urls=[item["url"] for item in images], body=text)
+                self._modlog_deleted_ids.add(key)
+                self._modlog_deleted_order.append(key)
+                if len(self._modlog_deleted_order) > 1024:
+                    expired = self._modlog_deleted_order.pop(0)
+                    self._modlog_deleted_ids.discard(expired)
+                if sent is not None:
+                    await self.bot.db.delete_modlog_images(guild.id, message_id)
+        finally:
+            self._modlog_deleting_ids.discard(key)
+            if self._modlog_delete_locks.get(key) is lock and not lock.locked():
+                self._modlog_delete_locks.pop(key, None)
+
+    @commands.Cog.listener()
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
+        guild = self.bot.get_guild(payload.guild_id) if payload.guild_id else None
+        if guild is None:
+            return
+        await self._process_deleted_modlog_message(guild, payload.message_id, payload.cached_message, payload.channel_id)
+
+    @commands.Cog.listener()
+    async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent) -> None:
+        guild = self.bot.get_guild(payload.guild_id) if payload.guild_id else None
+        if guild is None:
+            return
+        for message_id in payload.message_ids:
+            cached = guild.get_channel(payload.channel_id)
+            message = getattr(payload, "cached_messages", ())
+            cached_message = next((item for item in message if item.id == message_id), None)
+            await self._process_deleted_modlog_message(guild, message_id, cached_message, payload.channel_id)
+
+    @commands.Cog.listener()
+    async def on_guild_channel_create(self, channel: discord.abc.GuildChannel) -> None:
+        lang = await self._lang(channel.guild)
+        embed = discord.Embed(title=tr(lang, "Channel created", "Canal creado"), color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
+        embed.description = tr(lang, f"Channel created: {channel.mention}", f"Canal creado: {channel.mention}")
+        embed.set_footer(text=f"Channel ID: {channel.id}")
+        await send_modlog_embed(channel.guild, self.bot.db, embed)
+
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
+        lang = await self._lang(channel.guild)
+        embed = discord.Embed(title=tr(lang, "Channel deleted", "Canal eliminado"), color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
+        embed.description = tr(lang, f"Channel deleted: #{channel.name}", f"Canal eliminado: #{channel.name}")
+        embed.set_footer(text=f"Channel ID: {channel.id}")
+        await send_modlog_embed(channel.guild, self.bot.db, embed)
 
     async def _maybe_defer(self, ctx: commands.Context) -> None:
         if ctx.interaction is None:
@@ -292,109 +812,6 @@ class ModerationCog(commands.Cog):
         return True, ""
 
     @staticmethod
-    def _member_name_variants(member: discord.Member) -> list[str]:
-        variants: list[str] = []
-        if member.name:
-            variants.append(member.name)
-        if member.display_name:
-            variants.append(member.display_name)
-        global_name = getattr(member, "global_name", None)
-        if isinstance(global_name, str) and global_name:
-            variants.append(global_name)
-        discriminator = getattr(member, "discriminator", None)
-        if isinstance(discriminator, str) and discriminator not in {"", "0"}:
-            variants.append(f"{member.name}#{discriminator}")
-        return variants
-
-    async def _resolve_target_member(
-        self,
-        guild: discord.Guild,
-        user_query: str,
-        lang: str,
-    ) -> tuple[discord.Member | None, str | None]:
-        query = user_query.strip()
-        if not query:
-            return None, tr(
-                lang,
-                "Provide a user mention, ID, username, or display name.",
-                "Proporciona una mención, ID, nombre de usuario o nombre visible.",
-            )
-
-        user_id = parse_user_id_from_text(query)
-        if user_id is not None:
-            member = guild.get_member(user_id)
-            if member is not None:
-                return member, None
-            try:
-                member = await guild.fetch_member(user_id)
-                return member, None
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                return None, tr(
-                    lang,
-                    "I couldn't find a server member with that ID.",
-                    "No pude encontrar un miembro del servidor con esa ID.",
-                )
-
-        query_cf = query.casefold()
-
-        def matches_exact(member: discord.Member) -> bool:
-            return any(name.casefold() == query_cf for name in self._member_name_variants(member))
-
-        def matches_prefix(member: discord.Member) -> bool:
-            return any(name.casefold().startswith(query_cf) for name in self._member_name_variants(member))
-
-        exact_cached = [m for m in guild.members if matches_exact(m)]
-        if len(exact_cached) == 1:
-            return exact_cached[0], None
-        if len(exact_cached) > 1:
-            return None, tr(
-                lang,
-                "More than one member matches that name. Use @mention or user ID.",
-                "Más de un miembro coincide con ese nombre. Usa @mención o ID de usuario.",
-            )
-
-        prefix_cached = [m for m in guild.members if matches_prefix(m)]
-        if len(prefix_cached) == 1:
-            return prefix_cached[0], None
-        if len(prefix_cached) > 1:
-            return None, tr(
-                lang,
-                "More than one member matches that name. Use @mention or user ID.",
-                "Más de un miembro coincide con ese nombre. Usa @mención o ID de usuario.",
-            )
-
-        try:
-            queried = await guild.query_members(query=query, limit=25)
-        except (discord.Forbidden, discord.HTTPException):
-            queried = []
-
-        exact_queried = [m for m in queried if matches_exact(m)]
-        if len(exact_queried) == 1:
-            return exact_queried[0], None
-        if len(exact_queried) > 1:
-            return None, tr(
-                lang,
-                "More than one member matches that name. Use @mention or user ID.",
-                "Más de un miembro coincide con ese nombre. Usa @mención o ID de usuario.",
-            )
-
-        prefix_queried = [m for m in queried if matches_prefix(m)]
-        if len(prefix_queried) == 1:
-            return prefix_queried[0], None
-        if len(prefix_queried) > 1:
-            return None, tr(
-                lang,
-                "More than one member matches that name. Use @mention or user ID.",
-                "Más de un miembro coincide con ese nombre. Usa @mención o ID de usuario.",
-            )
-
-        return None, tr(
-            lang,
-            "User not found in this server. Use @mention, user ID, username, or display name.",
-            "No encontré al usuario en este servidor. Usa @mención, ID, nombre de usuario o nombre visible.",
-        )
-
-    @staticmethod
     def _parse_channel_id_from_text(text: str) -> int | None:
         cleaned = text.strip()
         if not cleaned:
@@ -474,7 +891,7 @@ class ModerationCog(commands.Cog):
         if isinstance(channel_query, discord.TextChannel):
             return channel_query, None
         if isinstance(channel_query, str) and channel_query.strip():
-            return await self._resolve_target_channel(ctx.guild, channel_query, lang)  # type: ignore[arg-type]
+            return await self._resolve_target_channel(ctx.guild, channel_query, lang)
         if isinstance(ctx.channel, discord.TextChannel):
             return ctx.channel, None
         return None, tr(
@@ -710,16 +1127,16 @@ class ModerationCog(commands.Cog):
             hue = (60 * ((r - g) / diff) + 240) % 360
 
         if hue < 15 or hue >= 345:
-            return "\U0001F7E5"  # red
+            return "\U0001F7E5"
         if hue < 45:
-            return "\U0001F7E7"  # orange
+            return "\U0001F7E7"
         if hue < 70:
-            return "\U0001F7E8"  # yellow
+            return "\U0001F7E8"
         if hue < 165:
-            return "\U0001F7E9"  # green
+            return "\U0001F7E9"
         if hue < 255:
-            return "\U0001F7E6"  # blue
-        return "\U0001F7EA"  # purple/pink/magenta
+            return "\U0001F7E6"
+        return "\U0001F7EA"
 
     async def _collect_valid_color_roles(
         self,
@@ -916,6 +1333,438 @@ class ModerationCog(commands.Cog):
         await self.bot.db.upsert_color_panel(guild.id, channel.id, panel_message.id)
         return panel_message
 
+    # Color roles, shared by the /color commands and the typed ADMIN operations.  Each method checks Administrator (the commands' decorator)
+    # and writes its own modlog entry.  ``strict`` (typed callers only) also has the bot's own permissions and the role hierarchy verified
+    # before anything is created, deleted or replaced, which the commands never did and keep not doing.
+    async def color_setup(self, guild: discord.Guild, actor: discord.Member, *, strict: bool = False, lang: str = "en") -> AdminActionResult:
+        denied = self.admin_actions.color_denied(actor, lang)
+        if denied is not None:
+            return denied
+        me = guild.me
+        if me is None or not me.guild_permissions.manage_roles:
+            return AdminActionResult(
+                False,
+                tr(
+                    lang,
+                    "I need `Manage Roles` permission to set up color roles.",
+                    "Necesito el permiso `Gestionar roles` para configurar los roles de color.",
+                ),
+                "bot_missing_manage_roles",
+            )
+        if strict:
+            # Setup adopts an existing role named like a default color (recolouring it and making it self-assignable through the panel):
+            # a typed caller may only adopt roles the actor and the bot could manage themselves, checked before anything is created or edited.
+            for color_name, _hex in DEFAULT_COLOR_ROLES:
+                existing = discord.utils.find(lambda r, n=color_name: r.name.casefold() == n.casefold(), guild.roles)
+                if existing is not None:
+                    denied = self.admin_actions._can_manage_role(guild, actor, existing, lang)
+                    if denied is not None:
+                        return denied
+
+        configured: list[str] = []
+        created = 0
+
+        def progress() -> dict[str, object]:
+            return {"configured_count": len(configured), "created_count": created, "configured": configured[:MAX_COLOR_ROLES]}
+
+        try:
+            for order, (color_name, hex_code) in enumerate(DEFAULT_COLOR_ROLES, start=1):
+                role = discord.utils.find(
+                    lambda r, n=color_name: r.name.casefold() == n.casefold(),
+                    guild.roles,
+                )
+                color_obj = discord.Color(int(hex_code[1:], 16))
+                if role is None:
+                    role = await guild.create_role(
+                        name=color_name,
+                        color=color_obj,
+                        mentionable=False,
+                        reason=f"Default color role setup by {actor}",
+                    )
+                    created += 1
+                else:
+                    if role < me.top_role and role.color.value != color_obj.value:
+                        try:
+                            await role.edit(
+                                color=color_obj,
+                                reason=f"Default color role sync by {actor}",
+                            )
+                        except (discord.Forbidden, discord.HTTPException):
+                            pass
+
+                await self.bot.db.upsert_color_role(
+                    guild.id,
+                    role.id,
+                    color_name,
+                    hex_code,
+                    display_order=order,
+                )
+                configured.append(color_name)
+        except discord.Forbidden:
+            return AdminActionResult(
+                False,
+                tr(
+                    lang,
+                    "I do not have permission to create or edit roles.",
+                    "No tengo permisos para crear o editar roles.",
+                ),
+                "color_setup_forbidden",
+                data=progress(),
+            )
+        except discord.HTTPException as exc:
+            return AdminActionResult(
+                False,
+                tr(
+                    lang,
+                    f"Failed to set up color roles: {exc}",
+                    f"No se pudieron configurar los roles de color: {exc}",
+                ),
+                "color_setup_http_error",
+                data=progress(),
+            )
+
+        if not await self._collect_valid_color_roles(guild):
+            return AdminActionResult(
+                False,
+                tr(
+                    lang,
+                    "Color setup finished, but no valid color roles were found.",
+                    "La configuracion de colores termino, pero no se encontraron roles validos.",
+                ),
+                "color_roles_none_valid",
+                data=progress(),
+            )
+        await self.admin_actions._log_action(
+            guild,
+            title="Color Roles Setup",
+            moderator=actor,
+            target=f"{guild.name} ({guild.id})",
+            reason="Default color role setup",
+            details=f"Configured colors: {len(configured)}",
+        )
+        return AdminActionResult(
+            True,
+            tr(lang, f"Configured {len(configured)} color roles.", f"Se configuraron {len(configured)} roles de color."),
+            "color_setup",
+            data=progress(),
+        )
+
+    async def color_list(self, guild: discord.Guild, actor: discord.Member, *, lang: str = "en") -> AdminActionResult:
+        denied = self.admin_actions.color_denied(actor, lang)
+        if denied is not None:
+            return denied
+        role_entries = await self._collect_valid_color_roles(guild)
+        if not role_entries:
+            return AdminActionResult(
+                False,
+                tr(
+                    lang,
+                    "No color roles are configured yet. Use `/color setup` first.",
+                    "Aun no hay colores configurados. Usa `/color setup` primero.",
+                ),
+                "color_roles_none",
+            )
+        colors = [
+            {"name": str(entry["color_name"]), "hex": self._normalize_hex_color(str(entry["hex_code"])) or str(entry["hex_code"]).upper()}
+            for _role, entry in role_entries[:MAX_COLOR_ROLES]
+        ]
+        return AdminActionResult(
+            True,
+            tr(lang, "Configured colors", "Colores configurados"),
+            "colors_listed",
+            data={"color_count": len(role_entries), "colors": colors},
+        )
+
+    async def publish_color_panel(
+        self,
+        guild: discord.Guild,
+        actor: discord.Member,
+        channel: discord.TextChannel | None,
+        *,
+        reload: bool = False,
+        strict: bool = False,
+        lang: str = "en",
+    ) -> AdminActionResult:
+        """With ``reload`` the panel is republished where it is stored and ``channel`` is ignored."""
+
+        denied = self.admin_actions.color_denied(actor, lang)
+        if denied is not None:
+            return denied
+        if reload:
+            panel_state = await self.bot.db.get_color_panel(guild.id)
+            if panel_state is None:
+                return AdminActionResult(
+                    False,
+                    tr(
+                        lang,
+                        "No color channel configured yet. Use `/color channel` first.",
+                        "Aun no hay canal de colores configurado. Usa `/color channel` primero.",
+                    ),
+                    "color_panel_not_set",
+                )
+            channel = guild.get_channel(int(panel_state["channel_id"]))
+            if not isinstance(channel, discord.TextChannel):
+                await self.bot.db.clear_color_panel(guild.id)
+                return AdminActionResult(
+                    False,
+                    tr(
+                        lang,
+                        "The configured color channel no longer exists. Set it again with `/color channel`.",
+                        "El canal de colores configurado ya no existe. Configuralo de nuevo con `/color channel`.",
+                    ),
+                    "color_channel_missing",
+                )
+        elif not await self.bot.db.count_color_roles(guild.id):
+            return AdminActionResult(
+                False,
+                tr(
+                    lang,
+                    "No color roles are configured yet. Use `/color setup` first.",
+                    "Aun no hay colores configurados. Usa `/color setup` primero.",
+                ),
+                "color_roles_none",
+            )
+        if strict:
+            denied = self.admin_actions.color_panel_bot_denied(guild, channel, lang)
+            if denied is not None:
+                return denied
+
+        panel_message = await self._publish_color_panel(guild, channel, lang)
+        if panel_message is None:
+            return AdminActionResult(
+                False,
+                tr(
+                    lang,
+                    "Failed to reload the color panel. Check my send-message and add-reaction permissions.",
+                    "No se pudo recargar el panel de colores. Revisa mis permisos para enviar mensajes y agregar reacciones.",
+                )
+                if reload
+                else tr(
+                    lang,
+                    "Failed to publish the color panel. Check my send-message and add-reaction permissions.",
+                    "No se pudo publicar el panel de colores. Revisa mis permisos para enviar mensajes y agregar reacciones.",
+                ),
+                "color_panel_publish_failed",
+            )
+
+        await self.admin_actions._log_action(
+            guild,
+            title="Color Panel Reloaded" if reload else "Color Panel Published",
+            moderator=actor,
+            target=f"{channel.mention} ({channel.id})",
+            reason="Color panel reload" if reload else "Color panel publish/update",
+            details=f"Message ID: {panel_message.id}",
+        )
+        return AdminActionResult(
+            True,
+            tr(
+                lang,
+                f"Color panel reloaded in {channel.mention}.",
+                f"Panel de colores recargado en {channel.mention}.",
+            )
+            if reload
+            else tr(
+                lang,
+                f"Color panel published in {channel.mention}.",
+                f"Panel de colores publicado en {channel.mention}.",
+            ),
+            "color_panel_reloaded" if reload else "color_panel_published",
+            data={"channel_id": channel.id, "message_id": panel_message.id},
+        )
+
+    async def color_add(
+        self,
+        guild: discord.Guild,
+        actor: discord.Member,
+        hex_code: str,
+        name: str | None = None,
+        *,
+        strict: bool = False,
+        lang: str = "en",
+    ) -> AdminActionResult:
+        denied = self.admin_actions.color_denied(actor, lang)
+        if denied is not None:
+            return denied
+        normalized_hex = self._normalize_hex_color(hex_code)
+        if normalized_hex is None:
+            return AdminActionResult(
+                False,
+                tr(
+                    lang,
+                    "Invalid color format. Use a 6-digit hex color like `#1abc9c`.",
+                    "Formato de color invalido. Usa un color hexadecimal de 6 digitos como `#1abc9c`.",
+                ),
+                "invalid_color",
+            )
+
+        role_name = (name or normalized_hex).strip()
+        if len(role_name) > 100:
+            return AdminActionResult(
+                False,
+                tr(
+                    lang,
+                    "Role name cannot exceed 100 characters.",
+                    "El nombre del rol no puede exceder 100 caracteres.",
+                ),
+                "color_name_too_long",
+            )
+        if strict and not self.admin_actions._has_perm(guild.me, "manage_roles"):
+            return AdminActionResult(
+                False,
+                tr(lang, "I need Manage Roles permission to do that.", "Necesito Gestionar roles para hacer eso."),
+                "bot_missing_manage_roles",
+            )
+
+        existing_colors = await self.bot.db.list_color_roles(guild.id)
+        if len(existing_colors) >= MAX_COLOR_ROLES:
+            return AdminActionResult(
+                False,
+                tr(
+                    lang,
+                    f"You can only configure up to {MAX_COLOR_ROLES} color roles for the reaction panel.",
+                    f"Solo puedes configurar hasta {MAX_COLOR_ROLES} roles de color para el panel por reacciones.",
+                ),
+                "color_limit_reached",
+            )
+
+        if any(str(item["color_name"]).casefold() == role_name.casefold() for item in existing_colors):
+            return AdminActionResult(
+                False,
+                tr(
+                    lang,
+                    "A color with that name already exists.",
+                    "Ya existe un color con ese nombre.",
+                ),
+                "color_name_exists",
+            )
+
+        try:
+            created_role = await guild.create_role(
+                name=role_name,
+                color=discord.Color(int(normalized_hex[1:], 16)),
+                mentionable=False,
+                reason=f"Color role created by {actor}",
+            )
+        except discord.Forbidden:
+            return AdminActionResult(
+                False,
+                tr(
+                    lang,
+                    "I do not have permission to create roles.",
+                    "No tengo permisos para crear roles.",
+                ),
+                "color_add_forbidden",
+            )
+        except discord.HTTPException as exc:
+            return AdminActionResult(
+                False,
+                tr(
+                    lang,
+                    f"Failed to create color role: {exc}",
+                    f"No se pudo crear el rol de color: {exc}",
+                ),
+                "color_add_http_error",
+            )
+
+        await self.bot.db.upsert_color_role(
+            guild.id,
+            created_role.id,
+            role_name,
+            normalized_hex,
+        )
+        await self.admin_actions._log_action(
+            guild,
+            title="Color Role Added",
+            moderator=actor,
+            target=f"{created_role.name} ({created_role.id})",
+            reason="Manual color role add",
+            details=f"Hex: {normalized_hex}",
+        )
+        return AdminActionResult(
+            True,
+            tr(
+                lang,
+                f"Color role added: {created_role.mention} (`{normalized_hex}`). Run `/color reload` to refresh the public panel.",
+                f"Rol de color agregado: {created_role.mention} (`{normalized_hex}`). Usa `/color reload` para refrescar el panel publico.",
+            ),
+            "color_added",
+            data={"color_name": role_name, "hex": normalized_hex, "role_id": created_role.id},
+        )
+
+    async def color_remove(
+        self,
+        guild: discord.Guild,
+        actor: discord.Member,
+        color_name: str,
+        *,
+        strict: bool = False,
+        lang: str = "en",
+    ) -> AdminActionResult:
+        denied = self.admin_actions.color_denied(actor, lang)
+        if denied is not None:
+            return denied
+        existing = await self.bot.db.get_color_role_by_name(guild.id, color_name)
+        if existing is None:
+            return AdminActionResult(
+                False,
+                tr(
+                    lang,
+                    "Color name not found.",
+                    "No se encontro ese nombre de color.",
+                ),
+                "color_not_found",
+            )
+
+        role_id = int(existing["role_id"])
+        role_name = str(existing["color_name"])
+        role = guild.get_role(role_id)
+        if role is not None:
+            if strict:
+                denied = self.admin_actions._can_manage_role(guild, actor, role, lang)
+                if denied is not None:
+                    return denied
+            try:
+                await role.delete(reason=f"Color role removed by {actor}")
+            except discord.Forbidden:
+                return AdminActionResult(
+                    False,
+                    tr(
+                        lang,
+                        "I do not have permission to delete that role.",
+                        "No tengo permisos para eliminar ese rol.",
+                    ),
+                    "color_remove_forbidden",
+                )
+            except discord.HTTPException as exc:
+                return AdminActionResult(
+                    False,
+                    tr(
+                        lang,
+                        f"Failed to remove color role: {exc}",
+                        f"No se pudo eliminar el rol de color: {exc}",
+                    ),
+                    "color_remove_http_error",
+                )
+
+        await self.bot.db.delete_color_role_by_name(guild.id, role_name)
+        await self.admin_actions._log_action(
+            guild,
+            title="Color Role Removed",
+            moderator=actor,
+            target=f"{role_name} ({role_id})",
+            reason="Manual color role removal",
+        )
+        return AdminActionResult(
+            True,
+            tr(
+                lang,
+                f"Color role `{role_name}` removed. Run `/color reload` to refresh the public panel.",
+                f"Rol de color `{role_name}` eliminado. Usa `/color reload` para refrescar el panel publico.",
+            ),
+            "color_removed",
+            data={"color_name": role_name, "role_id": role_id},
+        )
+
     async def _assign_color_role_from_reaction(
         self,
         guild: discord.Guild,
@@ -974,7 +1823,7 @@ class ModerationCog(commands.Cog):
             return
 
         try:
-            panel_message = await channel.fetch_message(payload.message_id)  # type: ignore[attr-defined]
+            panel_message = await channel.fetch_message(payload.message_id)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return
 
@@ -1008,7 +1857,7 @@ class ModerationCog(commands.Cog):
             return
 
         try:
-            panel_message = await channel.fetch_message(payload.message_id)  # type: ignore[attr-defined]
+            panel_message = await channel.fetch_message(payload.message_id)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return
 
@@ -1095,118 +1944,53 @@ class ModerationCog(commands.Cog):
         )
 
     @commands.Cog.listener()
-    async def on_message_delete(self, message: discord.Message) -> None:
-        if message.guild is None or message.author.bot:
-            return
-
-        lang = await self._lang(message.guild)
-        logged_at = datetime.now(timezone.utc)
-        channel_mention = (
-            message.channel.mention
-            if isinstance(message.channel, (discord.TextChannel, discord.Thread))
-            else f"`{message.channel.id}`"
-        )
-        content = (message.content or "").strip()
-        first_image = None
-        for attachment in message.attachments:
-            content_type = (attachment.content_type or "").lower()
-            if content_type.startswith("image/") or attachment.filename.lower().endswith(
-                (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".avif")
-            ):
-                first_image = attachment
-                break
-
-        embed = discord.Embed(
-            color=discord.Color.from_rgb(255, 74, 34),
-            timestamp=logged_at,
-        )
-        embed.set_author(
-            name=str(message.author),
-            icon_url=message.author.display_avatar.url,
-        )
-
-        if first_image is not None:
-            headline = tr(
-                lang,
-                f"Image sent by {message.author.mention} Deleted in {channel_mention}",
-                f"Imagen enviada por {message.author.mention} Eliminada en {channel_mention}",
-            )
-        else:
-            headline = tr(
-                lang,
-                f"Message sent by {message.author.mention} Deleted in {channel_mention}",
-                f"Mensaje enviado por {message.author.mention} Eliminado en {channel_mention}",
-            )
-
-        body_lines: list[str] = [headline]
-        if content:
-            body_lines.append(content)
-        elif first_image is None:
-            if message.attachments:
-                files_text = ", ".join(att.filename for att in message.attachments[:5])
-                body_lines.append(
-                    tr(
-                        lang,
-                        f"[Attachment-only message] {files_text}",
-                        f"[Mensaje solo con archivo adjunto] {files_text}",
-                    )
-                )
-            else:
-                body_lines.append(tr(lang, "[No text content]", "[Sin contenido de texto]"))
-
-        embed.description = "\n".join(body_lines)[:4096]
-        if first_image is not None:
-            embed.set_image(url=first_image.proxy_url or first_image.url)
-        embed.set_footer(text=f"Author: {message.author.id} | Message ID: {message.id}")
-        await send_modlog_embed(message.guild, self.bot.db, embed)
-
-    @commands.Cog.listener()
     async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
         if before.guild is None or before.author.bot:
             return
+        if any(self._is_modlog_image(item) for item in (*before.attachments, *after.attachments)):
+            self._schedule_modlog_capture(after)
         if before.content == after.content:
-            return
+            before_images = {item.id for item in before.attachments}
+            if before_images == {item.id for item in after.attachments}:
+                return
 
         lang = await self._lang(before.guild)
         logged_at = datetime.now(timezone.utc)
         embed = discord.Embed(
-            color=discord.Color.from_rgb(128, 128, 128),
+            title=tr(lang, "Message Edited", "Mensaje editado"),
+            color=discord.Color.blue(),
             timestamp=logged_at,
         )
-        embed.set_author(
-            name=str(before.author),
-            icon_url=before.author.display_avatar.url,
-        )
+        channel_mention = getattr(before.channel, "mention", f"`{before.channel.id}`")
+        author_mention = getattr(before.author, "mention", f"<@{before.author.id}>")
         embed.description = tr(
             lang,
-            f"Sent by {before.author.mention}",
-            f"Enviado por {before.author.mention}",
+            f"From: {author_mention}    In: {channel_mention}",
+            f"De: {author_mention}    En: {channel_mention}",
         )
         embed.add_field(
-            name=tr(lang, "Original message", "Mensaje original"),
-            value=(before.content or tr(lang, "[No text content]", "[Sin contenido de texto]"))[:1024],
+            name=tr(lang, "Before", "Antes"),
+            value=_modlog_diff_value(
+                before.content or "",
+                after.content or "",
+                before_side=True,
+                empty_text=tr(lang, "[No text content]", "[Sin contenido de texto]"),
+            ),
             inline=False,
         )
         embed.add_field(
-            name=tr(lang, "New message", "Nuevo mensaje"),
-            value=(after.content or tr(lang, "[No text content]", "[Sin contenido de texto]"))[:1024],
+            name=tr(lang, "After", "Después"),
+            value=_modlog_diff_value(
+                before.content or "",
+                after.content or "",
+                before_side=False,
+                empty_text=tr(lang, "[No text content]", "[Sin contenido de texto]"),
+            ),
             inline=False,
-        )
-        channel_value: str
-        if isinstance(before.channel, (discord.TextChannel, discord.Thread)):
-            if after.jump_url:
-                channel_value = f"[#{before.channel.name}]({after.jump_url})"
-            else:
-                channel_value = before.channel.mention
-        else:
-            channel_value = str(before.channel.id)
-        embed.add_field(
-            name=tr(lang, "Channel", "Canal"),
-            value=channel_value,
-            inline=True,
         )
         embed.set_footer(text=f"Author: {before.author.id} | Message ID: {before.id}")
-        await send_modlog_embed(before.guild, self.bot.db, embed)
+        view = ModerationLogView(lang=lang, jump_url=getattr(after, "jump_url", None))
+        await send_modlog_embed(before.guild, self.bot.db, embed, view=view)
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
@@ -1539,6 +2323,7 @@ class ModerationCog(commands.Cog):
 
     @message.command(name="delete", description="Delete the last N messages.")
     @owner_or_has_permissions(manage_messages=True)
+    @discord.app_commands.describe(amount="Number of recent messages to delete (1-500)")
     async def delete(self, ctx: commands.Context, amount: int) -> None:
         lang = await self._lang(ctx.guild)
         await self._maybe_defer(ctx)
@@ -1716,13 +2501,6 @@ class ModerationCog(commands.Cog):
                 f"Canal creado {created.mention}.",
             ),
         )
-        await self._log_action(
-            ctx.guild,
-            title="Channel Created",
-            moderator=ctx.author,
-            target=f"#{created.name}",
-            reason="",
-        )
 
     async def _channel_delete_impl(
         self,
@@ -1785,13 +2563,6 @@ class ModerationCog(commands.Cog):
                 f"Canal eliminado `#{deleted_name}`.",
             ),
         )
-        await self._log_action(
-            ctx.guild,
-            title="Channel Deleted",
-            moderator=ctx.author,
-            target=deleted_name,
-            reason="",
-        )
 
     @commands.hybrid_group(
         name="channel",
@@ -1851,70 +2622,17 @@ class ModerationCog(commands.Cog):
                 return
             target_channel = ctx.channel
 
-        original_name = target_channel.name
-        original_id = target_channel.id
-        deleted_count = 0
-        recent_cutoff = datetime.now(timezone.utc) - timedelta(days=14)
-        recent_batch: list[discord.Message] = []
-
-        async def flush_recent_batch() -> None:
-            nonlocal deleted_count
-            if not recent_batch:
-                return
-            if len(recent_batch) == 1:
-                await recent_batch[0].delete()
-            else:
-                await target_channel.delete_messages(recent_batch)
-            deleted_count += len(recent_batch)
-            recent_batch.clear()
-
-        try:
-            async for message in target_channel.history(limit=None, oldest_first=False):
-                if message.created_at >= recent_cutoff:
-                    recent_batch.append(message)
-                    if len(recent_batch) >= 100:
-                        await flush_recent_batch()
-                    continue
-                await flush_recent_batch()
-                await message.delete()
-                deleted_count += 1
-            await flush_recent_batch()
-        except discord.Forbidden:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "I do not have permission to clear that channel.",
-                    "No tengo permisos para limpiar ese canal.",
-                ),
-            )
-            return
-        except discord.HTTPException as exc:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    f"Failed to clear channel: {exc}",
-                    f"No se pudo limpiar el canal: {exc}",
-                ),
-            )
-            return
-
-        success_text = tr(
-            lang,
-            f"Cleared messages in {target_channel.mention}.",
-            f"Mensajes limpiados en {target_channel.mention}.",
-        )
-        await self._send_success(ctx, success_text)
-
-        await self._log_action(
+        result = await self.admin_actions.clear_channel(
             ctx.guild,
-            title="Channel Cleared",
-            moderator=ctx.author,
-            target=f"#{original_name} ({original_id})",
+            ctx.author,
+            target_channel,
             reason="Manual channel clear",
-            details=f"Deleted messages: {deleted_count}",
+            lang=lang,
         )
+        if result.success:
+            await self._send_success(ctx, result.message)
+        else:
+            await self._safe_send(ctx, result.message)
 
     @channel.command(
         name="clear",
@@ -1971,64 +2689,29 @@ class ModerationCog(commands.Cog):
                 return
             target_channel = ctx.channel
 
-        try:
-            cloned = await target_channel.clone(
-                reason=f"Channel cloned by {ctx.author}",
-            )
-            await cloned.edit(
-                category=target_channel.category,
-                position=min(
-                    target_channel.position + 1,
-                    max(0, len(ctx.guild.channels) - 1),
-                ),
-            )
-        except discord.Forbidden:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "I do not have permission to clone that channel.",
-                    "No tengo permisos para clonar ese canal.",
-                ),
-            )
-            return
-        except discord.HTTPException as exc:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    f"Failed to clone channel: {exc}",
-                    f"No se pudo clonar el canal: {exc}",
-                ),
-            )
-            return
-
-        await self._send_success(
-            ctx,
-            tr(
-                lang,
-                f"Cloned channel {target_channel.mention} into {cloned.mention}.",
-                f"Canal clonado {target_channel.mention} en {cloned.mention}.",
-            ),
-        )
-        await self._log_action(
+        result = await self.admin_actions.clone_channel(
             ctx.guild,
-            title="Channel Cloned",
-            moderator=ctx.author,
-            target=f"#{target_channel.name} ({target_channel.id})",
+            ctx.author,
+            target_channel,
             reason="Manual channel clone",
-            details=f"Clone created: #{cloned.name} ({cloned.id})",
+            lang=lang,
         )
+        if result.success:
+            await self._send_success(ctx, result.message)
+        else:
+            await self._safe_send(ctx, result.message)
 
     @channel.command(name="add", description="Create a new text channel.")
     @owner_or_has_permissions(manage_channels=True)
     @discord.app_commands.rename(channel_name="name")
+    @discord.app_commands.describe(channel_name="Name for the new text channel")
     async def channel_add(self, ctx: commands.Context, *, channel_name: str) -> None:
         await self._maybe_defer(ctx)
         await self._channel_add_impl(ctx, channel_name)
 
     @channel.command(name="delete", description="Delete a text channel.")
     @owner_or_has_permissions(manage_channels=True)
+    @discord.app_commands.describe(channel="Text channel to delete")
     async def channel_delete(self, ctx: commands.Context, channel: discord.TextChannel) -> None:
         await self._maybe_defer(ctx)
         await self._channel_delete_impl(ctx, channel)
@@ -2068,72 +2751,15 @@ class ModerationCog(commands.Cog):
             await self._safe_send(ctx, msg)
             return
 
-        normalized_nick = nickname.strip()
-        if not normalized_nick:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "Provide a nickname to set.",
-                    "Proporciona un apodo para establecer.",
-                ),
-            )
-            return
-        if len(normalized_nick) > 32:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "Nickname must be 32 characters or fewer.",
-                    "El apodo debe tener 32 caracteres o menos.",
-                ),
-            )
-            return
-
-        try:
-            await member.edit(
-                nick=normalized_nick,
-                reason=f"Nickname changed by {ctx.author}",
-            )
-        except discord.Forbidden:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "I do not have permission to change that nickname.",
-                    "No tengo permisos para cambiar ese apodo.",
-                ),
-            )
-            return
-        except discord.HTTPException as exc:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    f"Failed to change nickname: {exc}",
-                    f"No se pudo cambiar el apodo: {exc}",
-                ),
-            )
-            return
-
-        await self._send_success(
-            ctx,
-            tr(
-                lang,
-                f"Nickname updated for {member.mention}: `{normalized_nick}`.",
-                f"Apodo actualizado para {member.mention}: `{normalized_nick}`.",
-            ),
-        )
-        await self._log_action(
-            ctx.guild,
-            title="Nickname Updated",
-            moderator=ctx.author,
-            target=member.mention,
-            reason=f"New nickname: {normalized_nick}",
-        )
+        result = await self.admin_actions.set_nickname(ctx.guild, ctx.author, member, nickname, lang=lang)
+        if result.success:
+            await self._send_success(ctx, result.message)
+        else:
+            await self._safe_send(ctx, result.message)
 
     @channel.command(name="lock", description="Lock a text channel.")
     @owner_or_has_permissions(manage_channels=True)
+    @discord.app_commands.describe(channel="Text channel to lock (default: this channel)")
     async def lock(
         self,
         ctx: commands.Context,
@@ -2235,6 +2861,7 @@ class ModerationCog(commands.Cog):
 
     @channel.command(name="unlock", description="Unlock a text channel.")
     @owner_or_has_permissions(manage_channels=True)
+    @discord.app_commands.describe(channel="Text channel to unlock (default: this channel)")
     async def unlock(
         self,
         ctx: commands.Context,
@@ -2375,67 +3002,22 @@ class ModerationCog(commands.Cog):
             )
             return
 
-        if seconds < 0 or seconds > 21600:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "Slowmode must be between 0 and 21600 seconds.",
-                    "El modo lento debe estar entre 0 y 21600 segundos.",
-                ),
-            )
-            return
-
-        try:
-            await channel.edit(
-                slowmode_delay=seconds,
-                reason=f"Slowmode changed by {ctx.author}",
-            )
-        except discord.Forbidden:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "I do not have permission to change slowmode.",
-                    "No tengo permisos para cambiar el modo lento.",
-                ),
-            )
-            return
-        except discord.HTTPException as exc:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    f"Failed to change slowmode: {exc}",
-                    f"No se pudo cambiar el modo lento: {exc}",
-                ),
-            )
-            return
-
-        if seconds == 0:
-            response = tr(
-                lang,
-                f"Slowmode disabled in {channel.mention}.",
-                f"Modo lento desactivado en {channel.mention}.",
-            )
-        else:
-            response = tr(
-                lang,
-                f"Slowmode set to `{seconds}s` in {channel.mention}.",
-                f"Modo lento establecido en `{seconds}s` en {channel.mention}.",
-            )
-        await self._send_success(ctx, response)
-        await self._log_action(
+        result = await self.admin_actions.set_slowmode(
             ctx.guild,
-            title="Slowmode Updated",
-            moderator=ctx.author,
-            target=channel.mention,
+            ctx.author,
+            channel,
+            seconds,
             reason="Manual slowmode update",
-            details=f"Slowmode: {seconds}s",
+            lang=lang,
         )
+        if result.success:
+            await self._send_success(ctx, result.message)
+        else:
+            await self._safe_send(ctx, result.message)
 
     @message.command(name="purgeuser", description="Delete messages from one user in this channel.")
     @owner_or_has_permissions(manage_messages=True)
+    @discord.app_commands.describe(user="Member whose messages to delete", amount="Number of messages to delete (1-500)")
     async def purgeuser(
         self,
         ctx: commands.Context,
@@ -2484,73 +3066,24 @@ class ModerationCog(commands.Cog):
             except (discord.Forbidden, discord.HTTPException):
                 pass
 
-        candidates: list[discord.Message] = []
-        try:
-            async for msg in ctx.channel.history(limit=2000):
-                if command_id is not None and msg.id == command_id:
-                    continue
-                if msg.author.id == member.id:
-                    candidates.append(msg)
-                    if len(candidates) >= amount:
-                        break
-        except discord.HTTPException as exc:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    f"Failed to read message history: {exc}",
-                    f"No se pudo leer el historial de mensajes: {exc}",
-                ),
-            )
-            return
-
-        if not candidates:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    f"No recent messages found for {member.mention}.",
-                    f"No se encontraron mensajes recientes de {member.mention}.",
-                ),
-            )
-            return
-
-        deleted_count = 0
-        for msg in candidates:
-            try:
-                await msg.delete()
-                deleted_count += 1
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                continue
-
-        if deleted_count == 0:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "No messages could be deleted due to permissions or age limits.",
-                    "No se pudo eliminar ningún mensaje por permisos o límites de antigüedad.",
-                ),
-            )
-            return
-
-        if ctx.interaction is None:
-            await self._send_success(
-                ctx,
-                tr(lang, "Messages deleted.", "Mensajes eliminados."),
-                delete_after=2,
-            )
-        await self._log_action(
+        result = await self.admin_actions.purge_user_messages(
             ctx.guild,
-            title="User Messages Purged",
-            moderator=ctx.author,
-            target=f"{member.mention} in #{ctx.channel.name}",
+            ctx.author,
+            ctx.channel,
+            member,
+            amount,
+            exclude_message_id=command_id,
             reason="Manual user purge",
-            details=f"Requested: {amount} | Deleted: {deleted_count}",
+            lang=lang,
         )
+        if not result.success:
+            await self._safe_send(ctx, result.message)
+        elif ctx.interaction is None:
+            await self._send_success(ctx, result.message, delete_after=2)
 
     @role.command(name="add", description="Add a role to a user.")
     @owner_or_has_permissions(manage_roles=True)
+    @discord.app_commands.describe(user="Member to give the role to", role="Role mention, ID or name")
     async def roleadd(
         self,
         ctx: commands.Context,
@@ -2635,6 +3168,7 @@ class ModerationCog(commands.Cog):
 
     @role.command(name="remove", description="Remove a role from a user.")
     @owner_or_has_permissions(manage_roles=True)
+    @discord.app_commands.describe(user="Member to remove the role from", role="Role mention, ID or name")
     async def roleremove(
         self,
         ctx: commands.Context,
@@ -2720,6 +3254,7 @@ class ModerationCog(commands.Cog):
     @role.command(name="create", description="Create a role (optional hex color).")
     @owner_or_has_permissions(manage_roles=True)
     @discord.app_commands.rename(role_name="name", color_hex="color")
+    @discord.app_commands.describe(role_name="Name for the new role", color_hex="Hex color such as #00ffaa (optional)")
     async def createrole(
         self,
         ctx: commands.Context,
@@ -2858,82 +3393,10 @@ class ModerationCog(commands.Cog):
             )
             return
 
-        me = ctx.guild.me
-        if me is None or not me.guild_permissions.manage_roles:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "I need `Manage Roles` permission to set up color roles.",
-                    "Necesito el permiso `Gestionar roles` para configurar los roles de color.",
-                ),
-            )
-            return
-
-        created_or_updated: list[str] = []
-        try:
-            for order, (color_name, hex_code) in enumerate(DEFAULT_COLOR_ROLES, start=1):
-                role = discord.utils.find(
-                    lambda r, n=color_name: r.name.casefold() == n.casefold(),
-                    ctx.guild.roles,
-                )
-                color_obj = discord.Color(int(hex_code[1:], 16))
-                if role is None:
-                    role = await ctx.guild.create_role(
-                        name=color_name,
-                        color=color_obj,
-                        mentionable=False,
-                        reason=f"Default color role setup by {ctx.author}",
-                    )
-                else:
-                    if role < me.top_role and role.color.value != color_obj.value:
-                        try:
-                            await role.edit(
-                                color=color_obj,
-                                reason=f"Default color role sync by {ctx.author}",
-                            )
-                        except (discord.Forbidden, discord.HTTPException):
-                            pass
-
-                await self.bot.db.upsert_color_role(
-                    ctx.guild.id,
-                    role.id,
-                    color_name,
-                    hex_code,
-                    display_order=order,
-                )
-                created_or_updated.append(f"{color_name} ({hex_code})")
-        except discord.Forbidden:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "I do not have permission to create or edit roles.",
-                    "No tengo permisos para crear o editar roles.",
-                ),
-            )
-            return
-        except discord.HTTPException as exc:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    f"Failed to set up color roles: {exc}",
-                    f"No se pudieron configurar los roles de color: {exc}",
-                ),
-            )
-            return
-
-        panel_payload = await self._build_color_panel_embed(ctx.guild, lang)
+        result = await self.color_setup(ctx.guild, ctx.author, lang=lang)
+        panel_payload = await self._build_color_panel_embed(ctx.guild, lang) if result.success else None
         if panel_payload is None:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "Color setup finished, but no valid color roles were found.",
-                    "La configuracion de colores termino, pero no se encontraron roles validos.",
-                ),
-            )
+            await self._safe_send(ctx, result.message)
             return
         panel_embed, panel_file = panel_payload
         panel_embed.title = tr(
@@ -2950,15 +3413,6 @@ class ModerationCog(commands.Cog):
             await self._safe_send(ctx, embed=panel_embed, file=panel_file)
         else:
             await self._safe_send(ctx, embed=panel_embed)
-
-        await self._log_action(
-            ctx.guild,
-            title="Color Roles Setup",
-            moderator=ctx.author,
-            target=f"{ctx.guild.name} ({ctx.guild.id})",
-            reason="Default color role setup",
-            details=f"Configured colors: {len(created_or_updated)}",
-        )
 
     @color.command(
         name="list",
@@ -3002,6 +3456,7 @@ class ModerationCog(commands.Cog):
         description="Set channel and publish the numbered color selector panel.",
     )
     @owner_or_has_permissions(administrator=True)
+    @discord.app_commands.describe(channel="Text channel where the color selector panel is published")
     async def colorchannel(self, ctx: commands.Context, channel: discord.TextChannel) -> None:
         lang = await self._lang(ctx.guild)
         await self._maybe_defer(ctx)
@@ -3016,45 +3471,11 @@ class ModerationCog(commands.Cog):
             )
             return
 
-        if not await self.bot.db.count_color_roles(ctx.guild.id):
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "No color roles are configured yet. Use `/color setup` first.",
-                    "Aun no hay colores configurados. Usa `/color setup` primero.",
-                ),
-            )
+        result = await self.publish_color_panel(ctx.guild, ctx.author, channel, lang=lang)
+        if not result.success:
+            await self._safe_send(ctx, result.message)
             return
-
-        panel_message = await self._publish_color_panel(ctx.guild, channel, lang)
-        if panel_message is None:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "Failed to publish the color panel. Check my send-message and add-reaction permissions.",
-                    "No se pudo publicar el panel de colores. Revisa mis permisos para enviar mensajes y agregar reacciones.",
-                ),
-            )
-            return
-
-        await self._send_success(
-            ctx,
-            tr(
-                lang,
-                f"Color panel published in {channel.mention}.",
-                f"Panel de colores publicado en {channel.mention}.",
-            ),
-        )
-        await self._log_action(
-            ctx.guild,
-            title="Color Panel Published",
-            moderator=ctx.author,
-            target=f"{channel.mention} ({channel.id})",
-            reason="Color panel publish/update",
-            details=f"Message ID: {panel_message.id}",
-        )
+        await self._send_success(ctx, result.message)
 
     @color.command(
         name="reload",
@@ -3075,59 +3496,11 @@ class ModerationCog(commands.Cog):
             )
             return
 
-        panel_state = await self.bot.db.get_color_panel(ctx.guild.id)
-        if panel_state is None:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "No color channel configured yet. Use `/color channel` first.",
-                    "Aun no hay canal de colores configurado. Usa `/color channel` primero.",
-                ),
-            )
+        result = await self.publish_color_panel(ctx.guild, ctx.author, None, reload=True, lang=lang)
+        if not result.success:
+            await self._safe_send(ctx, result.message)
             return
-
-        channel = ctx.guild.get_channel(int(panel_state["channel_id"]))
-        if not isinstance(channel, discord.TextChannel):
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "The configured color channel no longer exists. Set it again with `/color channel`.",
-                    "El canal de colores configurado ya no existe. Configuralo de nuevo con `/color channel`.",
-                ),
-            )
-            await self.bot.db.clear_color_panel(ctx.guild.id)
-            return
-
-        panel_message = await self._publish_color_panel(ctx.guild, channel, lang)
-        if panel_message is None:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "Failed to reload the color panel. Check my send-message and add-reaction permissions.",
-                    "No se pudo recargar el panel de colores. Revisa mis permisos para enviar mensajes y agregar reacciones.",
-                ),
-            )
-            return
-
-        await self._send_success(
-            ctx,
-            tr(
-                lang,
-                f"Color panel reloaded in {channel.mention}.",
-                f"Panel de colores recargado en {channel.mention}.",
-            ),
-        )
-        await self._log_action(
-            ctx.guild,
-            title="Color Panel Reloaded",
-            moderator=ctx.author,
-            target=f"{channel.mention} ({channel.id})",
-            reason="Color panel reload",
-            details=f"Message ID: {panel_message.id}",
-        )
+        await self._send_success(ctx, result.message)
 
     @color.command(
         name="add",
@@ -3135,6 +3508,7 @@ class ModerationCog(commands.Cog):
     )
     @owner_or_has_permissions(administrator=True)
     @discord.app_commands.rename(hex_code="color")
+    @discord.app_commands.describe(hex_code="Hex color such as #00ffaa", name="Name for the color (optional)")
     async def coloradd(
         self,
         ctx: commands.Context,
@@ -3155,103 +3529,11 @@ class ModerationCog(commands.Cog):
             )
             return
 
-        normalized_hex = self._normalize_hex_color(hex_code)
-        if normalized_hex is None:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "Invalid color format. Use a 6-digit hex color like `#1abc9c`.",
-                    "Formato de color invalido. Usa un color hexadecimal de 6 digitos como `#1abc9c`.",
-                ),
-            )
+        result = await self.color_add(ctx.guild, ctx.author, hex_code, name, lang=lang)
+        if not result.success:
+            await self._safe_send(ctx, result.message)
             return
-
-        role_name = (name or normalized_hex).strip()
-        if len(role_name) > 100:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "Role name cannot exceed 100 characters.",
-                    "El nombre del rol no puede exceder 100 caracteres.",
-                ),
-            )
-            return
-
-        existing_colors = await self.bot.db.list_color_roles(ctx.guild.id)
-        if len(existing_colors) >= MAX_COLOR_ROLES:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    f"You can only configure up to {MAX_COLOR_ROLES} color roles for the reaction panel.",
-                    f"Solo puedes configurar hasta {MAX_COLOR_ROLES} roles de color para el panel por reacciones.",
-                ),
-            )
-            return
-
-        if any(str(item["color_name"]).casefold() == role_name.casefold() for item in existing_colors):
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "A color with that name already exists.",
-                    "Ya existe un color con ese nombre.",
-                ),
-            )
-            return
-
-        try:
-            created_role = await ctx.guild.create_role(
-                name=role_name,
-                color=discord.Color(int(normalized_hex[1:], 16)),
-                mentionable=False,
-                reason=f"Color role created by {ctx.author}",
-            )
-        except discord.Forbidden:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "I do not have permission to create roles.",
-                    "No tengo permisos para crear roles.",
-                ),
-            )
-            return
-        except discord.HTTPException as exc:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    f"Failed to create color role: {exc}",
-                    f"No se pudo crear el rol de color: {exc}",
-                ),
-            )
-            return
-
-        await self.bot.db.upsert_color_role(
-            ctx.guild.id,
-            created_role.id,
-            role_name,
-            normalized_hex,
-        )
-        await self._send_success(
-            ctx,
-            tr(
-                lang,
-                f"Color role added: {created_role.mention} (`{normalized_hex}`). Run `/color reload` to refresh the public panel.",
-                f"Rol de color agregado: {created_role.mention} (`{normalized_hex}`). Usa `/color reload` para refrescar el panel publico.",
-            ),
-        )
-        await self._log_action(
-            ctx.guild,
-            title="Color Role Added",
-            moderator=ctx.author,
-            target=f"{created_role.name} ({created_role.id})",
-            reason="Manual color role add",
-            details=f"Hex: {normalized_hex}",
-        )
+        await self._send_success(ctx, result.message)
 
     @color.command(
         name="remove",
@@ -3259,6 +3541,7 @@ class ModerationCog(commands.Cog):
     )
     @owner_or_has_permissions(administrator=True)
     @discord.app_commands.rename(color_name="name")
+    @discord.app_commands.describe(color_name="Configured name of the color to remove")
     async def colorremove(self, ctx: commands.Context, *, color_name: str) -> None:
         lang = await self._lang(ctx.guild)
         await self._maybe_defer(ctx)
@@ -3273,64 +3556,15 @@ class ModerationCog(commands.Cog):
             )
             return
 
-        existing = await self.bot.db.get_color_role_by_name(ctx.guild.id, color_name)
-        if existing is None:
-            await self._safe_send(
-                ctx,
-                tr(
-                    lang,
-                    "Color name not found.",
-                    "No se encontro ese nombre de color.",
-                ),
-            )
+        result = await self.color_remove(ctx.guild, ctx.author, color_name, lang=lang)
+        if not result.success:
+            await self._safe_send(ctx, result.message)
             return
-
-        role_id = int(existing["role_id"])
-        role_name = str(existing["color_name"])
-        role = ctx.guild.get_role(role_id)
-        if role is not None:
-            try:
-                await role.delete(reason=f"Color role removed by {ctx.author}")
-            except discord.Forbidden:
-                await self._safe_send(
-                    ctx,
-                    tr(
-                        lang,
-                        "I do not have permission to delete that role.",
-                        "No tengo permisos para eliminar ese rol.",
-                    ),
-                )
-                return
-            except discord.HTTPException as exc:
-                await self._safe_send(
-                    ctx,
-                    tr(
-                        lang,
-                        f"Failed to remove color role: {exc}",
-                        f"No se pudo eliminar el rol de color: {exc}",
-                    ),
-                )
-                return
-
-        await self.bot.db.delete_color_role_by_name(ctx.guild.id, role_name)
-        await self._send_success(
-            ctx,
-            tr(
-                lang,
-                f"Color role `{role_name}` removed. Run `/color reload` to refresh the public panel.",
-                f"Rol de color `{role_name}` eliminado. Usa `/color reload` para refrescar el panel publico.",
-            ),
-        )
-        await self._log_action(
-            ctx.guild,
-            title="Color Role Removed",
-            moderator=ctx.author,
-            target=f"{role_name} ({role_id})",
-            reason="Manual color role removal",
-        )
+        await self._send_success(ctx, result.message)
 
     @user.command(name="info", description="Show user info in this server.")
     @owner_or_has_permissions(moderate_members=True)
+    @discord.app_commands.describe(user="Member to show information about")
     async def userinfo(self, ctx: commands.Context, user: discord.Member) -> None:
         lang = await self._lang(ctx.guild)
         await self._maybe_defer(ctx)
@@ -3347,14 +3581,14 @@ class ModerationCog(commands.Cog):
 
         member = user
 
-        roles = [role.mention for role in sorted(member.roles, key=lambda r: r.position, reverse=True) if not role.is_default()]
+        result = await self.admin_actions.user_info(ctx.guild, ctx.author, member, lang=lang)
+        if not result.success:
+            await self._safe_send(ctx, result.message)
+            return
+        roles = [f"<@&{role['id']}>" for role in result.data["roles"]]
         roles_text = ", ".join(roles) if roles else tr(lang, "None", "Ninguno")
 
-        permissions = [
-            permission_name.replace("_", " ").title()
-            for permission_name, enabled in member.guild_permissions
-            if enabled
-        ]
+        permissions = result.data["permissions"]
         permissions_text = ", ".join(permissions) if permissions else tr(lang, "None", "Ninguno")
         if len(permissions_text) > 1024:
             permissions_text = permissions_text[:1021] + "..."
@@ -3389,16 +3623,10 @@ class ModerationCog(commands.Cog):
             tr(lang, "User information", "Información del usuario"),
             embed=embed,
         )
-        await self._log_action(
-            ctx.guild,
-            title="User Info Lookup",
-            moderator=ctx.author,
-            target=f"{member.mention} ({member.id})",
-            reason="",
-        )
 
     @user.command(name="mute", description="Mute a user by assigning the Muted role.")
     @owner_or_has_permissions(moderate_members=True)
+    @discord.app_commands.describe(user="Member to mute", reason="Reason for the action (optional)")
     async def mute(
         self,
         ctx: commands.Context,
@@ -3486,6 +3714,7 @@ class ModerationCog(commands.Cog):
 
     @user.command(name="unmute", description="Remove Muted role from a user.")
     @owner_or_has_permissions(moderate_members=True)
+    @discord.app_commands.describe(user="Member to unmute", reason="Reason for the action (optional)")
     async def unmute(
         self,
         ctx: commands.Context,
@@ -3567,6 +3796,7 @@ class ModerationCog(commands.Cog):
 
     @user.command(name="kick", description="Kick a member from the server.")
     @owner_or_has_permissions(kick_members=True)
+    @discord.app_commands.describe(user="Member to kick", reason="Reason for the action (optional)")
     async def kick(
         self,
         ctx: commands.Context,
@@ -3615,6 +3845,7 @@ class ModerationCog(commands.Cog):
 
     @user.command(name="ban", description="Ban a member from the server.")
     @owner_or_has_permissions(ban_members=True)
+    @discord.app_commands.describe(user="Member to ban", reason="Reason for the action (optional)")
     async def ban(
         self,
         ctx: commands.Context,
@@ -3665,6 +3896,7 @@ class ModerationCog(commands.Cog):
         name="unban", description="Unban a user by ID or mention format."
     )
     @owner_or_has_permissions(ban_members=True)
+    @discord.app_commands.describe(user="User ID or mention of the banned user", reason="Reason for the action (optional)")
     async def unban(
         self,
         ctx: commands.Context,
@@ -3729,6 +3961,7 @@ class ModerationCog(commands.Cog):
 
     @user.command(name="tempmute", description="Temporarily mute a user.")
     @owner_or_has_permissions(moderate_members=True)
+    @discord.app_commands.describe(user="Member to mute", duration="Duration such as 10m, 2h, 3d", reason="Reason for the action (optional)")
     async def tempmute(
         self,
         ctx: commands.Context,
@@ -3834,6 +4067,7 @@ class ModerationCog(commands.Cog):
 
     @user.command(name="tempban", description="Temporarily ban a user.")
     @owner_or_has_permissions(ban_members=True)
+    @discord.app_commands.describe(user="Member to ban", duration="Duration such as 10m, 2h, 3d", reason="Reason for the action (optional)")
     async def tempban(
         self,
         ctx: commands.Context,
@@ -3910,6 +4144,7 @@ class ModerationCog(commands.Cog):
 
     @user.command(name="warn", description="Warn a user.")
     @owner_or_has_permissions(moderate_members=True)
+    @discord.app_commands.describe(user="Member to warn", reason="Reason for the action (optional)")
     async def warn(
         self,
         ctx: commands.Context,
@@ -3980,6 +4215,7 @@ class ModerationCog(commands.Cog):
     )
     @owner_or_has_permissions(moderate_members=True)
     @discord.app_commands.rename(warning_number="number")
+    @discord.app_commands.describe(user="Member whose warning to remove", warning_number="Warning to remove (1, 2 or 3)")
     async def unwarn(
         self,
         ctx: commands.Context,
@@ -4076,6 +4312,7 @@ class ModerationCog(commands.Cog):
 
     @user.command(name="warnings", description="List warnings for a user.")
     @owner_or_has_permissions(moderate_members=True)
+    @discord.app_commands.describe(user="Member whose warnings to list")
     async def warnings(self, ctx: commands.Context, user: discord.Member) -> None:
         lang = await self._lang(ctx.guild)
         await self._maybe_defer(ctx)
@@ -4123,6 +4360,7 @@ class ModerationCog(commands.Cog):
 
     @user.command(name="clearwarnings", description="Clear all warnings for a user.")
     @owner_or_has_permissions(moderate_members=True)
+    @discord.app_commands.describe(user="Member whose warnings to clear", reason="Reason for the action (optional)")
     async def clearwarnings(
         self,
         ctx: commands.Context,
@@ -4281,4 +4519,3 @@ class ModerationCog(commands.Cog):
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(ModerationCog(bot))
-

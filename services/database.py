@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
+import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiosqlite
@@ -12,6 +13,8 @@ AI_CHANNEL_ALL_MARKER = 0
 AI_CHANNEL_NONE_MARKER = -1
 AI_INTERACTIONS_CONTEXT_CHANNEL_ID = -2
 BIRTHDAY_EVENT_TYPES = {"birthday", "member_anniversary", "server_anniversary"}
+MODLOG_IMAGE_RETENTION = timedelta(hours=24)
+MODLOG_IMAGE_MAX_BYTES = 256 * 1024 * 1024
 
 
 @dataclass
@@ -177,6 +180,7 @@ class Database:
                 )
                 """
             )
+            await conn.execute("DELETE FROM server_memories WHERE status = 'archived'")
             await conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_server_memories_guild_status
@@ -417,7 +421,40 @@ class Database:
                 """
             )
 
-            # Backward-compatible migration for existing databases.
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS modlog_message_archive (
+                    guild_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    PRIMARY KEY(guild_id, message_id)
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS modlog_image_archive (
+                    guild_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    attachment_id INTEGER NOT NULL,
+                    filename TEXT NOT NULL,
+                    content_type TEXT,
+                    spoiler INTEGER NOT NULL DEFAULT 0,
+                    position INTEGER NOT NULL DEFAULT 0,
+                    data BLOB NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    PRIMARY KEY(guild_id, message_id, attachment_id),
+                    FOREIGN KEY(guild_id, message_id)
+                        REFERENCES modlog_message_archive(guild_id, message_id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_modlog_images_capture ON modlog_image_archive(captured_at)"
+            )
+
             for alter_sql in (
                 "ALTER TABLE birthday_event_settings ADD COLUMN message_mode TEXT NOT NULL DEFAULT 'embed'",
                 "ALTER TABLE birthday_event_settings ADD COLUMN embed_title TEXT NOT NULL DEFAULT ''",
@@ -431,6 +468,8 @@ class Database:
                 except aiosqlite.OperationalError:
                     pass
 
+            conn.row_factory = aiosqlite.Row
+            await self._prune_modlog_images_conn(conn, self._modlog_time(None))
             await conn.commit()
 
     @asynccontextmanager
@@ -446,6 +485,127 @@ class Database:
     @staticmethod
     def _now_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _modlog_time(now: datetime | None) -> datetime:
+        value = now or datetime.now(timezone.utc)
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+    async def save_modlog_images(
+        self,
+        guild_id: int,
+        message_id: int,
+        snapshot: dict[str, Any],
+        images: list[dict[str, Any]],
+        now: datetime | None = None,
+    ) -> None:
+        captured = self._modlog_time(now).isoformat()
+        async with self._connect() as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            await self._prune_modlog_images_conn(conn, self._modlog_time(now))
+            await conn.execute(
+                """INSERT OR IGNORE INTO modlog_message_archive
+                   (guild_id, message_id, snapshot_json, captured_at) VALUES (?, ?, ?, ?)""",
+                (guild_id, message_id, json.dumps(snapshot, ensure_ascii=False), captured),
+            )
+            await conn.execute(
+                "UPDATE modlog_message_archive SET snapshot_json = ? WHERE guild_id = ? AND message_id = ?",
+                (json.dumps(snapshot, ensure_ascii=False), guild_id, message_id),
+            )
+            prior = await conn.execute_fetchall(
+                "SELECT attachment_id, captured_at FROM modlog_image_archive WHERE guild_id = ? AND message_id = ?",
+                (guild_id, message_id),
+            )
+            prior_times = {int(row["attachment_id"]): str(row["captured_at"]) for row in prior}
+            await conn.execute(
+                "DELETE FROM modlog_image_archive WHERE guild_id = ? AND message_id = ?",
+                (guild_id, message_id),
+            )
+            for image in images:
+                data = bytes(image["data"])
+                if not data or len(data) > MODLOG_IMAGE_MAX_BYTES:
+                    continue
+                attachment_id = int(image["id"])
+                await conn.execute(
+                    """INSERT INTO modlog_image_archive
+                       (guild_id, message_id, attachment_id, filename, content_type, spoiler,
+                        position, data, captured_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        guild_id, message_id, attachment_id, str(image.get("filename") or "image"),
+                        image.get("content_type"), int(bool(image.get("spoiler"))),
+                        int(image.get("position", 0)), data, prior_times.get(attachment_id, captured),
+                    ),
+                )
+            await self._prune_modlog_images_conn(conn, self._modlog_time(now))
+            await conn.commit()
+
+    async def get_modlog_images(
+        self, guild_id: int, message_id: int, now: datetime | None = None
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+        async with self._connect() as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            await self._prune_modlog_images_conn(conn, self._modlog_time(now))
+            row = await (await conn.execute(
+                "SELECT snapshot_json FROM modlog_message_archive WHERE guild_id = ? AND message_id = ?",
+                (guild_id, message_id),
+            )).fetchone()
+            if row is None:
+                await conn.commit()
+                return None
+            rows = await conn.execute_fetchall(
+                """SELECT attachment_id, filename, content_type, spoiler, position, data, captured_at
+                   FROM modlog_image_archive WHERE guild_id = ? AND message_id = ? ORDER BY position, attachment_id""",
+                (guild_id, message_id),
+            )
+            images = [
+                {"id": int(item["attachment_id"]), "filename": str(item["filename"]),
+                 "content_type": item["content_type"], "spoiler": bool(item["spoiler"]),
+                 "position": int(item["position"]), "data": bytes(item["data"]),
+                 "captured_at": str(item["captured_at"])}
+                for item in rows
+            ]
+            await conn.commit()
+            return json.loads(row["snapshot_json"]), images
+
+    async def delete_modlog_images(self, guild_id: int, message_id: int) -> None:
+        async with self._connect() as conn:
+            await conn.execute(
+                "DELETE FROM modlog_message_archive WHERE guild_id = ? AND message_id = ?",
+                (guild_id, message_id),
+            )
+            await conn.commit()
+
+    async def _prune_modlog_images_conn(self, conn: aiosqlite.Connection, now: datetime) -> None:
+        cutoff = (now - MODLOG_IMAGE_RETENTION).isoformat()
+        await conn.execute("DELETE FROM modlog_image_archive WHERE captured_at <= ?", (cutoff,))
+        await conn.execute(
+            """DELETE FROM modlog_message_archive WHERE captured_at <= ?
+               AND NOT EXISTS (SELECT 1 FROM modlog_image_archive i
+                               WHERE i.guild_id = modlog_message_archive.guild_id
+                                 AND i.message_id = modlog_message_archive.message_id)""",
+            (cutoff,),
+        )
+        row = await (await conn.execute("SELECT COALESCE(SUM(length(data)), 0) AS total FROM modlog_image_archive")).fetchone()
+        excess = int(row["total"]) - MODLOG_IMAGE_MAX_BYTES
+        if excess <= 0:
+            return
+        rows = await conn.execute_fetchall(
+            "SELECT guild_id, message_id, attachment_id, length(data) AS size FROM modlog_image_archive ORDER BY captured_at, guild_id, message_id, attachment_id"
+        )
+        for item in rows:
+            await conn.execute(
+                "DELETE FROM modlog_image_archive WHERE guild_id = ? AND message_id = ? AND attachment_id = ?",
+                (item["guild_id"], item["message_id"], item["attachment_id"]),
+            )
+            excess -= int(item["size"])
+            if excess <= 0:
+                break
+
+    async def prune_modlog_images(self, now: datetime | None = None) -> None:
+        async with self._connect() as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            await self._prune_modlog_images_conn(conn, self._modlog_time(now))
+            await conn.commit()
 
     @staticmethod
     def _row_to_settings(row: aiosqlite.Row) -> GuildSettings:
@@ -840,24 +1000,6 @@ class Database:
                 )
                 await conn.commit()
         return await self.get_or_create_birthday_event_settings(guild_id, normalized)
-
-    async def list_birthday_event_settings(self, guild_id: int) -> list[dict[str, Any]]:
-        for event_type in sorted(BIRTHDAY_EVENT_TYPES):
-            await self.get_or_create_birthday_event_settings(guild_id, event_type)
-        async with self._connect() as conn:
-            cursor = await conn.execute(
-                """
-                SELECT guild_id, event_type, enabled, message_hour, ping_setting, image_format,
-                       message_mode, embed_title, embed_color, embed_image_url,
-                       birthday_message_no_year, birthday_message_with_age
-                FROM birthday_event_settings
-                WHERE guild_id = ?
-                ORDER BY event_type ASC
-                """,
-                (guild_id,),
-            )
-            rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
 
     async def count_birthday_templates(self, guild_id: int, event_type: str) -> int:
         normalized = self._validate_birthday_event_type(event_type)
@@ -1323,32 +1465,6 @@ class Database:
             await conn.commit()
             return cursor.rowcount > 0
 
-    async def update_server_memory_value(
-        self,
-        memory_id: int,
-        *,
-        guild_id: int,
-        value: str,
-        key: str | None = None,
-        metadata_json: str | None = None,
-    ) -> bool:
-        updates = ["value = ?", "updated_at = ?"]
-        values: list[Any] = [value, self._now_iso()]
-        if key is not None:
-            updates.append("key = ?")
-            values.append(key)
-        if metadata_json is not None:
-            updates.append("metadata_json = ?")
-            values.append(metadata_json)
-        values.extend([memory_id, guild_id])
-        async with self._connect() as conn:
-            cursor = await conn.execute(
-                f"UPDATE server_memories SET {', '.join(updates)} WHERE id = ? AND guild_id = ?",
-                tuple(values),
-            )
-            await conn.commit()
-            return cursor.rowcount > 0
-
     async def get_server_memory(self, guild_id: int, memory_id: int) -> dict[str, Any] | None:
         async with self._connect() as conn:
             cursor = await conn.execute(
@@ -1414,16 +1530,18 @@ class Database:
             await conn.commit()
             return int(cursor.rowcount or 0)
 
+    async def delete_server_memory(self, memory_id: int, *, guild_id: int) -> bool:
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                "DELETE FROM server_memories WHERE id = ? AND guild_id = ?",
+                (memory_id, guild_id),
+            )
+            await conn.commit()
+            return cursor.rowcount > 0
+
     async def clear_server_memories(self, guild_id: int) -> None:
         async with self._connect() as conn:
-            await conn.execute(
-                """
-                UPDATE server_memories
-                SET status = 'archived', updated_at = ?
-                WHERE guild_id = ? AND status IN ('active', 'pending')
-                """,
-                (self._now_iso(), guild_id),
-            )
+            await conn.execute("DELETE FROM server_memories WHERE guild_id = ?", (guild_id,))
             await conn.commit()
 
     async def count_server_memories_by_status(self, guild_id: int) -> list[dict[str, Any]]:
@@ -1641,33 +1759,6 @@ class Database:
                 return None
             row_dict = dict(row)
             await conn.execute("DELETE FROM warnings WHERE id = ?", (warning_id,))
-            await conn.commit()
-            return row_dict
-
-    async def delete_warning_by_reason(
-        self,
-        guild_id: int,
-        reason_query: str,
-    ) -> dict[str, Any] | None:
-        normalized = reason_query.strip()
-        if not normalized:
-            return None
-        async with self._connect() as conn:
-            cursor = await conn.execute(
-                """
-                SELECT id, guild_id, user_id, moderator_id, reason, created_at
-                FROM warnings
-                WHERE guild_id = ? AND LOWER(reason) LIKE '%' || LOWER(?) || '%'
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (guild_id, normalized),
-            )
-            row = await cursor.fetchone()
-            if row is None:
-                return None
-            row_dict = dict(row)
-            await conn.execute("DELETE FROM warnings WHERE id = ?", (int(row_dict["id"]),))
             await conn.commit()
             return row_dict
 
@@ -2050,11 +2141,6 @@ class Database:
             await conn.commit()
             return bool(cursor.rowcount)
 
-    async def clear_color_roles(self, guild_id: int) -> None:
-        async with self._connect() as conn:
-            await conn.execute("DELETE FROM color_roles WHERE guild_id = ?", (guild_id,))
-            await conn.commit()
-
     async def get_color_panel(self, guild_id: int) -> dict[str, Any] | None:
         async with self._connect() as conn:
             cursor = await conn.execute(
@@ -2199,7 +2285,6 @@ class Database:
             rows = await cursor.fetchall()
             existing_ids = {int(row["channel_id"]) for row in rows}
             if not existing_ids or AI_CHANNEL_ALL_MARKER in existing_ids:
-                # Unrestricted mode: keep unrestricted semantics.
                 return
 
             await conn.execute(
@@ -2501,4 +2586,3 @@ class Database:
             await conn.execute(
                 "ALTER TABLE ai_conversation_turns ADD COLUMN resolved_request TEXT"
             )
-
