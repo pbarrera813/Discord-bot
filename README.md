@@ -1,28 +1,33 @@
 # Nitori Discord Bot
 
 ## Why This Bot Exists
-Nitori was built as a single, no-paywall Discord bot for communities that want basically an all in one bot. Nitori can chat with you via AI, moderate your server, run your code, check several football leagues, minecraft server status and remind everyone in the server of birthdays, join and server anniversaries. All of this without the need to pay for any of the functions and be able to use them, just add it to your server (or run it yourself), run the /setup command to know what to do and you are on!
+Nitori was built as a single, no-paywall Discord bot for communities that want basically an all in one bot. Nitori can chat with you via AI and, just by asking in plain language, moderate your server, run your code, make memes, draw and edit images, read links, check several football leagues and minecraft server status, and remind everyone in the server of birthdays, join and server anniversaries. Every feature also keeps its normal slash/prefix command, so nothing depends on talking to the AI. All of this without the need to pay for any of the functions and be able to use them, just add it to your server (or run it yourself), run the /setup command to know what to do and you are on!
 
 ## Core Idea
 - One bot, all-in-one workflow.
 - No premium feature locks inside the bot itself.
-- AI only where needed: chat, translation, image understanding/generation/editing, natural football answers, web lookup, and server context.
-- Moderation/API features run as native command logic unless a natural-language AI request explicitly needs routing.
+- The AI is a natural-language front door, not a replacement for commands. Slash and prefix commands keep working on their own, and when you ask in plain words the AI runs the same features, including several steps in one message.
+- xAI understands the request, deterministic code checks it. A router model returns a strict, typed plan: which capabilities to run, with which inputs and in which order. The bot validates authorization, identity, scope and dependencies from live Discord state (never from what a message claims), runs the features, and the final reply is written only from those trusted results. If the validator refuses a plan, the router gets one chance to correct it.
+- Anything that changes the server or your data (moderation, settings, memory, reminders, birthdays) needs the real Discord permission for it, is checked as a whole before it runs, and is never retried or rolled back automatically. Without the permission Nitori says which one is missing and does nothing.
+- Nitori replies in the server's configured language (`/language`).
+- Calls to xAI are built for prompt caching and every call logs its token use and cost (see Logging and Persistence).
 
 ## Main Features
-- Moderation toolkit (message, user, channel, role, and color-role panel management).
+- Moderation toolkit (message, user, channel, role, and color-role panel management), also available by asking Nitori when you hold the matching permission.
 - Natural AI conversation with explicit mention/reply/name anchors, same-user continuation leases, replied-message awareness, pending interaction tracking, reaction-only requests, and safe noisy-channel replies.
 - Native Discord voice-message responses when a user explicitly asks for the current AI response as audio/voice. Voice is one-turn only and returns to text on the next turn unless requested again.
-- AI image generation, image analysis, and image editing from current or replied image messages.
-- AI football answers grounded in API-Football data, including teams, players, leagues, fixtures, standings, scorers, injuries, transfers, match events, stats, lineups, summaries, previews, current score/status, and live-watch updates.
-- Optional xAI web search for current external information and API-Football gaps.
-- Structured server memory and trusted owner/admin behavior rules for server-specific style and context.
-- Translation command with multiple target languages.
-- Memes via Memegen API + local speech meme generator.
+- One AI capability set behind natural language: chat, football, Minecraft status, API Ninjas lookups, code runs, reminders, birthdays, translation, memes, web research, link reading, image generation/editing/analysis, reactions, server administration and server memory.
+- AI image generation, image analysis, and image editing from current or replied image messages, including follow-ups on the image Nitori just made ("now make it blue").
+- AI football answers grounded in API-Football data, including teams, players, coaches, venues, leagues, fixtures, standings, scorers, injuries, transfers, match events, statistics (including half-time), lineups, pre-match and live odds, predictions, shootouts, squads, career and trophy history, summaries, previews, current score/status, and live-watch updates.
+- Link reading: summarize, explain, compare, extract or verify the content of links you send or reply to (public pages and images only; private or unsafe addresses are refused).
+- Optional xAI web search for current external information and API-Football gaps (off by default).
+- Structured server memory and trusted owner/admin behavior rules for server-specific style and context, managed with commands or in plain words. A fact about a member is linked to that member and only comes up in chat when they are talking, mentioned, replied to or part of the recent conversation, with a cooldown so a joke is not repeated.
+- Translation command with preset target languages; in chat Nitori translates into any language you name.
+- Memes via Memegen API (template, random, or a caption on your own picture), by command or by asking in chat, + local speech meme generator.
 - API Ninjas commands: joke, dadjoke, advice, whois, unit conversion.
 - Minecraft status checks (mcsrvstat.us).
 - Football stats and match data from API-Football.
-- Code execution (Glot API) for common languages.
+- Code execution through a self-hosted `docker-run` runner (Glot images) for common languages.
 - Reminder system with DM and optional channel mention.
 - Welcome/Goodbye configurable announcement modules.
 - Birthday + anniversary module (community self-service + admin automation controls).
@@ -31,10 +36,11 @@ Nitori was built as a single, no-paywall Discord bot for communities that want b
 ## Requirements
 - Python 3.11+
 - Discord bot token
-- xAI API key (chat/translate/context/image analysis/image generation/image editing/optional web search)
+- xAI API key (router, replies, translation, context, image analysis/generation/editing, voice, optional web search)
 - API Ninjas key (joke/dadjoke/advice/whois/convert)
 - API-Football key (supported football leagues)
-- Glot API token (/code)
+- Code runner access token (`GLOT_API_TOKEN`, the runner's `API_ACCESS_TOKEN`) (/code)
+- Optional: Playwright with Chromium (`playwright install chromium`) so Nitori can read JavaScript-heavy pages when you ask about a link
 
 ## Environment Variables
 Use `.env.example` as base.
@@ -48,19 +54,21 @@ Required for full feature set:
 - `GLOT_API_TOKEN`
 
 Common optional settings:
-- `XAI_MODEL` (default model)
+- `XAI_MODEL` (default `grok-4.3`; model used by the router and the replies, and the one Nitori is developed and tested with)
 - `XAI_VISION_MODEL` (optional image-capable model for AI chat attachments; defaults to `XAI_MODEL`)
 - `XAI_IMAGE_MODEL` (optional image generation/editing model; defaults to `grok-imagine-image-quality`)
 - `XAI_TTS_VOICE` (voice used for native Discord voice messages; defaults to `iris`)
 - `XAI_TTS_LANGUAGE` (language used for native Discord voice messages; defaults to `es-MX`)
-- `XAI_WEB_SEARCH_ENABLED` (default `false`; enable only when deployed bot should use xAI web search)
+- `XAI_WEB_SEARCH_ENABLED` (default `false`; web lookups, including the football web fallback, run only when this is `true`)
 - `XAI_X_SEARCH_ENABLED` (default `false`; reserved for explicit X/social search support)
 - `XAI_WEB_SEARCH_MAX_SOURCES` (default `3`)
 - `XAI_WEB_SEARCH_COOLDOWN_SECONDS` (default `30`)
+- `XAI_ROUTER_OUTPUT_TOKEN_CEILING` (default `0`, which keeps the router's computed output budget; set a number only to cap it)
+- `BOT_OWNER_IDS` (comma-separated Discord user IDs treated as bot owners for trusted behavior rules)
+- `NITORI_LOG_LEVEL` (default `INFO`; `DEBUG` for more detail)
 - `DB_PATH`
 - `DEFAULT_PREFIX`
-- `GLOT_BASE_URL`
-- `GLOT_API_MODE`
+- `GLOT_BASE_URL` (URL of the self-hosted `docker-run` code runner, default `http://127.0.0.1:8088`)
 - `API_FOOTBALL_BASE_URL`
 
 ## Local Run
@@ -72,6 +80,8 @@ python -m venv .venv
 # source .venv/bin/activate
 
 pip install -r requirements.txt
+# optional, to read JavaScript-heavy linked pages
+# playwright install chromium
 python bot.py
 ```
 
@@ -83,11 +93,16 @@ python bot.py
 - `/setup`
 - `/translate <language> [text]`
 - Mention the bot, reply to one of its AI messages, or continue a same-user conversation while the lease is fresh. Nitori avoids channel-wide passive listening, command traffic, slash-command output replies, and side conversations.
-- Nitori can read supported image attachments (`jpg`, `jpeg`, `png`) from the current message or replied-to message, understand replied text/embed context when directly addressed, and react with a relevant emoji when requested.
-- Ask Nitori directly to draw/create/generate an image, edit an attached/replied image, or analyze an image. Generated and edited images are uploaded directly in Discord.
+- Nitori can read supported image attachments (`jpg`, `jpeg`, `png`, `webp`) from the current message or replied-to message, understand replied text/embed context when directly addressed, and react with a relevant emoji when requested.
+- Ask Nitori directly to draw/create/generate an image, edit an attached/replied image (or the one it just made), or analyze an image. Generated and edited images are uploaded directly in Discord.
 - Ask Nitori natural football questions. It plans the request, validates teams/leagues/players/fixtures through API-Football, and answers with grounded data instead of raw model guesses.
 - Ask Nitori to follow a live match with minute-by-minute updates. One AI-started watch can run per channel; updates are compact and stop at full time or timeout.
-- Ask current web/freshness questions only when web search is enabled. Normal chat never uses web tools automatically.
+- Ask current web/freshness questions. Nitori plans a web lookup only when the question needs current information, and only when `XAI_WEB_SEARCH_ENABLED` is `true`.
+- Send a link (or reply to one) and ask Nitori to summarize, explain, compare, extract or verify it.
+- Ask for memes in plain words: a named template, a random one, or a caption on a picture you attach or reply to. Nitori writes the caption unless you dictate it, and tells you when a template name does not exist instead of guessing one.
+- Ask Nitori to translate text into any language, run code you give it, set or remove your own reminders and birthday, check a Minecraft server address, or tell a joke, dad joke, advice, a whois lookup or a unit conversion.
+- Ask Nitori for server administration in plain words (roles, kick/ban/unban/temporary bans, mute/unmute, warnings, deleting or purging messages, creating/deleting/locking/unlocking/clearing/cloning channels, slowmode, nicknames, join/leave stats, `say`, mod-log, prefix, language, anti-spam/anti-link, AI channel scope, color roles, server context). Nitori checks your real Discord permissions first; some actions ask you to confirm.
+- Ask Nitori to remember, look up, list or forget structured server memory; members can approve or reject only their own pending nickname/alias/preference entries.
 - Trusted bot owners/guild admins can naturally update Nitori's server behavior and style rules; authority is checked from runtime Discord/config state, not from claims in message text.
 - `/setservercontext <#channel>` (admin/manage guild)
 - `/resetservercontext [summaries|memory|ai_history|all]` (admin/manage guild)
@@ -188,7 +203,7 @@ Temp time format:
 ### Voice
 - Any normal user can explicitly ask Nitori to deliver the current AI response as a native Discord voice message.
 - Voice delivery is per-turn only. The next conversation turn returns to text unless voice/audio is requested again in that current message.
-- Conversational voice uses the normal AI/football/web/tool pipeline first, then converts the final response through xAI TTS.
+- Conversational voice uses the normal AI capability pipeline first, then converts the final response through xAI TTS.
 - `/say mensaje:<text> modo:<text|voice>` is still restricted by its existing Manage Messages permission; `modo=voice` sends a native Discord voice message.
 - Native voice means a Discord voice-message upload, not Discord `tts=true` and not voice-channel playback.
 - Default TTS configuration is Iris with `es-MX`, configurable through `XAI_TTS_VOICE` and `XAI_TTS_LANGUAGE`.
@@ -201,11 +216,15 @@ Temp time format:
 Reminder units:
 - `m`, `h`, `d`, `w`, `mo`, `y`
 
+In chat: ask Nitori to remind you, list your reminders or remove one. Reminders are always your own.
+
 ### Birthdays / Anniversaries
 Community commands:
 - `/birthday set <MM-DD|DD/MM> [birth_year]`
 - `/birthday remove`
 - `/birthday next [count]`
+
+In chat: "set my birthday to March 3", "remove my birthday", "when are the next birthdays". Setting or removing a birthday only ever changes your own; the settings below are admin-only.
 
 Schedule note:
 - Birthday/member/server anniversary events are targeted for `12:00 AM` in the configured server timezone.
@@ -229,6 +248,7 @@ Admin commands (slash-visible for admins only):
 
 ### Minecraft
 - `/srvstatus <ip-or-domain>`
+- In chat, give Nitori the address; it never guesses one.
 
 ### Sports (Football)
 - `/football live <league>`
@@ -268,6 +288,8 @@ The AI football pipeline also supports typed follow-ups from validated football 
 - `/whois <domain>`
 - `/convert <amount> <from_unit> <to_unit>`
 
+All five also work by asking Nitori in plain words.
+
 ### Memes
 - `/meme help`
 - `/meme templates [query]`
@@ -278,11 +300,14 @@ The AI football pipeline also supports typed follow-ups from validated football 
 - `/meme custom <top_text> [bottom_text]` + attach image
 - `/speech <user>`
 
+In chat, Nitori attaches the finished meme as an image. It can also combine steps, for example translating a phrase and putting the result on a template.
+
 ### Code Runner
 - `/code code:<code> language:<language> [file]`
 - `<prefix>code <language> <code>`
 - `/codelangs`
 - Supports Discord fenced blocks (example: ```python ...```) with language auto-detection.
+- In chat, ask Nitori to run the code you paste; it runs exactly what you supplied.
 
 Supported code languages:
 - `c`, `c#`, `cpp`, `python`, `java`, `javascript`, `rust`
@@ -295,6 +320,7 @@ Supported source files:
 - AI responses, structured server memories, trusted behavior rules, and football/image context metadata are persisted where needed for replies and future context.
 - Live football watches are in-memory only; bot restart clears active watches.
 - Modlog channel receives moderation and selected API/command events.
+- Every xAI call writes one journal line such as `AI xAI usage role=nitori-router input=15356 cached=13952 output=1077 reasoning=300 cost_usd=0.0072`, so token use, prompt-cache hits and cost per call are visible. Requests keep their stable parts first and send a per-role cache key so repeated prompt prefixes are billed at the cached rate.
 - Data is persistent across bot restarts.
 
 ## Deployment (systemd example)
