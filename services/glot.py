@@ -1,34 +1,38 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import re
 from typing import Any
-from urllib.parse import urlparse
 
 import aiohttp
 
 
+# Languages whose Docker Hub image is not named after them: Glot ships C and C++ together as glot/clang.
+_IMAGE_NAMES = {"c": "clang", "cpp": "clang"}
+
+
 class GlotRequestError(RuntimeError):
     def __init__(self, *, status: int, message: str, path: str) -> None:
-        super().__init__(f"Glot API error ({status}) on `{path}`: {message}")
+        super().__init__(f"The code runner returned an error ({status}): {message}")
         self.status = status
         self.path = path
         self.message = message
 
 
 class GlotClient:
+    """POST /run with an X-Access-Token header (self-hosted glotcode/docker-run)."""
+
     def __init__(
-        self,
-        api_token: str,
-        base_url: str = "https://run.glot.io",
-        *,
-        mode: str = "run_api",
+        self, api_token: str, base_url: str = "http://127.0.0.1:8088", *, max_concurrent_runs: int = 2
     ) -> None:
         self.api_token = api_token.strip()
         self.base_url = base_url.rstrip("/")
-        self.mode = (mode or "run_api").strip().lower()
         self._timeout = aiohttp.ClientTimeout(total=45)
         self._session: aiohttp.ClientSession | None = None
+        # One burst of messages must not flood the runner; the rest wait their turn.
+        self._slots = asyncio.Semaphore(max_concurrent_runs)
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
@@ -47,39 +51,48 @@ class GlotClient:
         json_payload: dict[str, Any] | None = None,
     ) -> Any:
         if not self.api_token:
-            raise RuntimeError("Glot API token is not configured.")
+            raise RuntimeError("The code runner token is not configured.")
 
         session = await self._get_session()
-        headers = {"Authorization": f"Token {self.api_token}"}
+        headers = {"X-Access-Token": self.api_token}
         url = f"{self.base_url}{path}"
 
-        async with session.request(method, url, headers=headers, json=json_payload) as resp:
-            raw_text = await resp.text()
-            try:
-                data = json.loads(raw_text)
-            except json.JSONDecodeError:
-                data = raw_text
-            if resp.status >= 400:
-                if isinstance(data, dict):
-                    message = str(
-                        data.get("error")
-                        or data.get("message")
-                        or data
+        try:
+            async with session.request(method, url, headers=headers, json=json_payload) as resp:
+                raw_text = await resp.text()
+                try:
+                    data = json.loads(raw_text)
+                except json.JSONDecodeError:
+                    data = raw_text
+                if resp.status >= 400:
+                    if isinstance(data, dict):
+                        # docker-run answers a program that hit one of its limits (time, output size) with a 400 and
+                        # "limits.*"; that is the program's result, not a broken runner.
+                        if str(data.get("error", "")).startswith("limits."):
+                            return {
+                                "stdout": "",
+                                "stderr": "",
+                                "error": self._sanitize_error_message(str(data.get("message") or data["error"])),
+                            }
+                        message = str(data.get("error") or data.get("message") or data)
+                    else:
+                        message = str(data)
+                    raise GlotRequestError(
+                        status=resp.status,
+                        message=self._sanitize_error_message(message),
+                        path=path,
                     )
-                else:
-                    message = str(data)
-                raise GlotRequestError(
-                    status=resp.status,
-                    message=self._sanitize_error_message(message),
-                    path=path,
-                )
-            return data
+                return data
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            # The address and socket details stay in the log, not in the Discord reply.
+            logging.warning("Code runner unreachable url=%s error=%s: %s", url, type(exc).__name__, exc)
+            raise RuntimeError("The code runner is unreachable.") from exc
 
     @staticmethod
     def _sanitize_error_message(message: str) -> str:
         if not message:
             return "Unknown error"
-        # Drop HTML tags/scripts if provider returns full HTML error pages.
+        # Drop HTML tags/scripts if the runner returns a full HTML error page.
         cleaned = message.replace("\r", " ").replace("\n", " ")
         cleaned = cleaned.strip()
         cleaned = cleaned.replace("<script", " <script")
@@ -90,29 +103,6 @@ class GlotClient:
             return f"{cleaned[:217]}..."
         return cleaned or "Unknown error"
 
-    def _effective_mode(self) -> str:
-        mode = self.mode
-        if mode in {"run_api", "docker_run", "glot_io"}:
-            return mode
-
-        # Auto-detect for unknown values.
-        parsed = urlparse(self.base_url)
-        host = (parsed.hostname or "").lower()
-        path = (parsed.path or "").rstrip("/")
-        if host.endswith("glot.io") and path.endswith("/api"):
-            return "glot_io"
-        return "run_api"
-
-    async def list_languages(self) -> list[dict[str, Any]]:
-        mode = self._effective_mode()
-        if mode == "glot_io":
-            data = await self._request(method="GET", path="/run")
-        else:
-            data = await self._request(method="GET", path="/languages")
-        if not isinstance(data, list):
-            raise RuntimeError("Unexpected language list response from Glot API.")
-        return [item for item in data if isinstance(item, dict)]
-
     async def run_code(
         self,
         *,
@@ -120,63 +110,49 @@ class GlotClient:
         code: str,
         filename: str,
         stdin: str | None = None,
-        command: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
+            "language": language,
             "files": [{"name": filename, "content": code}],
             "stdin": (stdin or ""),
         }
-        if command and command.strip():
-            payload["command"] = command.strip()
-
-        mode = self._effective_mode()
-        attempts: list[tuple[str, dict[str, Any]]] = []
-        if mode == "docker_run":
-            run_payload = {"language": language, **payload}
-            attempts = [
-                ("/run", run_payload),
-                ("/run/", run_payload),
-            ]
-        elif mode == "glot_io":
-            run_payload = {"language": language, **payload}
-            attempts = [
-                (f"/run/{language}", payload),
-                (f"/run/{language}/", payload),
-                ("/run", run_payload),
-                ("/run/", run_payload),
-                (f"/run/{language}/latest", payload),
-                (f"/languages/{language}/latest", payload),
-            ]
-        else:
-            attempts = [(f"/languages/{language}/latest", payload)]
-
-        errors: list[GlotRequestError] = []
-        data: dict[str, Any] | None = None
-        for index, (path, body) in enumerate(attempts):
-            try:
-                response = await self._request(
-                    method="POST",
-                    path=path,
-                    json_payload=body,
-                )
-                if not isinstance(response, dict):
-                    raise RuntimeError("Unexpected run response from Glot API.")
-                data = response
-                break
-            except GlotRequestError as exc:
-                errors.append(exc)
-                # Retry only for endpoint-shape related statuses.
-                should_retry = exc.status in {404, 405} and index < (len(attempts) - 1)
-                if should_retry:
-                    continue
-                raise RuntimeError(str(exc)) from exc
-
-        if data is None:
-            attempted = ", ".join(exc.path for exc in errors) or "unknown"
-            last_error = errors[-1].message if errors else "no response"
-            raise RuntimeError(
-                f"Glot run failed after trying: {attempted}. Last error: {last_error}"
+        async with self._slots:
+            data = await self._request(
+                method="POST",
+                path="/run",
+                json_payload={"image": f"glot/{_IMAGE_NAMES.get(language, language)}:latest", "payload": payload},
             )
         if not isinstance(data, dict):
-            raise RuntimeError("Unexpected run response from Glot API.")
+            raise RuntimeError("Unexpected run response from the code runner.")
         return data
+
+
+# Language slug -> source filename for the remote runner (nothing runs locally).
+RUN_FILENAMES = {
+    "c": "main.c",
+    "csharp": "Program.cs",
+    "cpp": "main.cpp",
+    "python": "main.py",
+    "java": "Main.java",
+    "javascript": "main.js",
+    "rust": "main.rs",
+}
+
+
+def truncate_output(value: str, limit: int = 1400) -> str:
+    return value if len(value) <= limit else f"{value[:limit]}..."
+
+
+async def execute_run(
+    client: Any, language_slug: str, code: str, filename: str | None = None
+) -> dict[str, Any]:
+    """Provider failures raise; a program that ran and failed is a normal result."""
+
+    filename = filename or RUN_FILENAMES[language_slug]
+    # The runner's own image compiles and runs every language (clang serves C and C++), so one call is enough.
+    result = await client.run_code(language=language_slug, code=code, filename=filename)
+    return {
+        "stdout": str(result.get("stdout", "") or ""),
+        "stderr": str(result.get("stderr", "") or ""),
+        "error": str(result.get("error", "") or ""),
+    }
