@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 import logging
-import re
 from typing import Any, Final
 
 import discord
@@ -27,6 +26,11 @@ LEAGUE_CHOICES: Final[list[app_commands.Choice[str]]] = [
 LEAGUE_CODES: Final[tuple[str, ...]] = tuple(choice.value for choice in LEAGUE_CHOICES)
 LEAGUE_HELP_TEXT: Final[str] = f"League: {', '.join(LEAGUE_CODES)}"
 LEAGUE_INVALID_TEXT_EN: Final[str] = f"Invalid league. Use one of: {', '.join(LEAGUE_CODES)}."
+ODDS_REFERENCE_CHOICES: Final[list[app_commands.Choice[str]]] = [
+    app_commands.Choice(name="bookmakers", value="bookmakers"),
+    app_commands.Choice(name="pre-match markets", value="bets"),
+    app_commands.Choice(name="live markets", value="live_bets"),
+]
 LEAGUE_INVALID_TEXT_ES: Final[str] = f"Liga inválida. Usa una de estas: {', '.join(LEAGUE_CODES)}."
 
 
@@ -265,8 +269,8 @@ class FootballCog(commands.Cog):
                 return
             league_key, league_id, _season = context
             operation = compile_football_operation(
-                "FOOTBALL_FIXTURE_QUERY",
-                "live fixtures",
+                "FOOTBALL_WATCH_TODAY",
+                "",
                 {"data_focus": "live_fixtures", "league_candidates": [raw_league]},
             )
             result = await FootballOperationService(client).execute(
@@ -1055,9 +1059,135 @@ class FootballCog(commands.Cog):
             embed.add_field(name=tr(lang, "Stats", "Estadisticas"), value=self._format_statistics(stats), inline=False)
         await ctx.send(embed=embed)
 
-    @football.command(name="schedule", description="Show next or last fixtures for a team or league.")
-    @app_commands.describe(target="Team name or 'league'", mode="next, last, or season", league=LEAGUE_HELP_TEXT)
+    @football.command(name="odds", description="Show pre-match odds for a fixture, league, or date.")
+    @app_commands.describe(
+        fixture_id="Fixture ID",
+        league="League",
+        date="Date in YYYY-MM-DD format",
+        bookmaker="Optional bookmaker name",
+        bet="Optional pre-match market name",
+        page="Provider page number",
+    )
     @app_commands.choices(league=LEAGUE_CHOICES)
+    async def football_odds(
+        self,
+        ctx: commands.Context,
+        fixture_id: int | None = None,
+        league: str = "",
+        date: str = "",
+        bookmaker: str = "",
+        bet: str = "",
+        page: int = 1,
+    ) -> None:
+        lang = await self._lang(ctx.guild)
+        client = await self._client_or_message(ctx, lang)
+        if client is None:
+            return
+        if fixture_id is None and not league.strip() and not date.strip():
+            await ctx.send(tr(lang, "Provide a fixture, league, or date scope.", "Indica un partido, liga o fecha."))
+            return
+        await self._defer_if_needed(ctx)
+        operation = compile_football_operation(
+            "FOOTBALL_LOOKUP",
+            "pre-match odds",
+            {
+                "data_focus": "pre_match_odds",
+                "fixture_focus": str(fixture_id) if fixture_id is not None else None,
+                "league_candidates": [league] if league.strip() else [],
+                "bookmaker_candidates": [bookmaker] if bookmaker.strip() else [],
+                "bet_candidates": [bet] if bet.strip() else [],
+                "date_hint": date.strip() or None,
+                "reference_page": page,
+            },
+        )
+        try:
+            result = await FootballOperationService(client).execute(operation, league_id=None, season=None, data_focus="pre_match_odds")
+        except Exception as exc:
+            await ctx.send(tr(lang, f"Failed to get odds: {exc}", f"No se pudieron obtener las cuotas: {exc}"))
+            return
+        if result.outcome != FootballOutcome.SELECTED:
+            await ctx.send(self._football_result_message(result, lang))
+            return
+        await ctx.send(embed=self._build_odds_embed(result.odds, result.requested_scope.get("paging"), lang=lang, live=False))
+
+    @football.command(name="live-odds", description="Show in-play odds for a fixture, league, or market.")
+    @app_commands.describe(fixture_id="Fixture ID", league="League", bet="Optional live market name")
+    @app_commands.choices(league=LEAGUE_CHOICES)
+    async def football_live_odds(
+        self,
+        ctx: commands.Context,
+        fixture_id: int | None = None,
+        league: str = "",
+        bet: str = "",
+    ) -> None:
+        lang = await self._lang(ctx.guild)
+        client = await self._client_or_message(ctx, lang)
+        if client is None:
+            return
+        if fixture_id is None and not league.strip() and not bet.strip():
+            await ctx.send(tr(lang, "Provide a fixture, league, or live market scope.", "Indica un partido, liga o mercado en vivo."))
+            return
+        await self._defer_if_needed(ctx)
+        operation = compile_football_operation(
+            "FOOTBALL_LOOKUP",
+            "live odds",
+            {
+                "data_focus": "live_odds",
+                "fixture_focus": str(fixture_id) if fixture_id is not None else None,
+                "league_candidates": [league] if league.strip() else [],
+                "bet_candidates": [bet] if bet.strip() else [],
+            },
+        )
+        try:
+            result = await FootballOperationService(client).execute(operation, league_id=None, season=None, data_focus="live_odds")
+        except Exception as exc:
+            await ctx.send(tr(lang, f"Failed to get live odds: {exc}", f"No se pudieron obtener las cuotas en vivo: {exc}"))
+            return
+        if result.outcome != FootballOutcome.SELECTED:
+            await ctx.send(self._football_result_message(result, lang))
+            return
+        await ctx.send(embed=self._build_odds_embed(result.odds, None, lang=lang, live=True))
+
+    @football.command(name="odds-reference", description="List or search bookmakers and odds markets.")
+    @app_commands.describe(scope="bookmakers, pre-match markets, or live markets", query="Optional reference search")
+    @app_commands.choices(scope=ODDS_REFERENCE_CHOICES)
+    async def football_odds_reference(self, ctx: commands.Context, scope: str = "bookmakers", query: str = "") -> None:
+        focus = {
+            "bookmakers": "odds_bookmakers",
+            "bets": "odds_bets",
+            "live_bets": "odds_live_bets",
+        }.get(scope.casefold(), "odds_bookmakers")
+        await self._send_football_reference(ctx, focus=focus, query=query)
+
+    @football.command(name="odds-mapping", description="Show fixtures currently available for pre-match odds.")
+    @app_commands.describe(page="Provider page number")
+    async def football_odds_mapping(self, ctx: commands.Context, page: int = 1) -> None:
+        await self._send_football_reference(ctx, focus="odds_mapping", page=page)
+
+    @football.command(name="timezones", description="List API-Football timezones.")
+    async def football_timezones(self, ctx: commands.Context) -> None:
+        await self._send_football_reference(ctx, focus="football_timezones")
+
+    @football.command(name="countries", description="List or search API-Football countries.")
+    @app_commands.describe(filter="name, code, or search", query="Optional country value")
+    @app_commands.choices(filter=[
+        app_commands.Choice(name="name", value="name"),
+        app_commands.Choice(name="code", value="code"),
+        app_commands.Choice(name="search", value="search"),
+    ])
+    async def football_countries(self, ctx: commands.Context, filter: str = "search", query: str = "") -> None:
+        await self._send_football_reference(ctx, focus="football_countries", query=query, country_filter=filter)
+
+    @football.command(name="seasons", description="List seasons available from API-Football.")
+    async def football_seasons(self, ctx: commands.Context) -> None:
+        await self._send_football_reference(ctx, focus="league_seasons")
+
+    @football.command(name="schedule", description="Show next or last fixtures for a team or league.")
+    @app_commands.describe(target="Team name or 'league'", mode="next or last", league=LEAGUE_HELP_TEXT)
+    @app_commands.choices(
+        league=LEAGUE_CHOICES,
+        mode=[app_commands.Choice(name="next", value="next"), app_commands.Choice(name="last", value="last")],
+    )
     async def football_schedule(self, ctx: commands.Context, target: str = "league", mode: str = "next", league: str = "ligamx") -> None:
         lang = await self._lang(ctx.guild)
         client = await self._client_or_message(ctx, lang)
@@ -1146,10 +1276,12 @@ class FootballCog(commands.Cog):
         await ctx.send(embed=self._build_player_embed(result.player_context_row, lang=lang))
 
     @football.command(name="lineup", description="Show confirmed lineups for a fixture ID.")
+    @app_commands.describe(fixture_id="Fixture ID, for example from /football today")
     async def football_lineup(self, ctx: commands.Context, fixture_id: int) -> None:
         await self._send_fixture_detail(ctx, fixture_id=fixture_id, kind="lineup")
 
     @football.command(name="stats", description="Show fixture statistics for a fixture ID.")
+    @app_commands.describe(fixture_id="Fixture ID, for example from /football today")
     async def football_stats(self, ctx: commands.Context, fixture_id: int) -> None:
         await self._send_fixture_detail(ctx, fixture_id=fixture_id, kind="stats")
 
@@ -1233,7 +1365,15 @@ class FootballCog(commands.Cog):
 
     @football.command(name="top", description="Show top scorers, assists, or cards.")
     @app_commands.describe(category="scorers, assists, yellowcards, redcards", league=LEAGUE_HELP_TEXT)
-    @app_commands.choices(league=LEAGUE_CHOICES)
+    @app_commands.choices(
+        league=LEAGUE_CHOICES,
+        category=[
+            app_commands.Choice(name="scorers", value="scorers"),
+            app_commands.Choice(name="assists", value="assists"),
+            app_commands.Choice(name="yellowcards", value="yellowcards"),
+            app_commands.Choice(name="redcards", value="redcards"),
+        ],
+    )
     async def football_top(self, ctx: commands.Context, category: str = "scorers", league: str = "ligamx") -> None:
         lang = await self._lang(ctx.guild)
         client = await self._client_or_message(ctx, lang)
@@ -1267,10 +1407,12 @@ class FootballCog(commands.Cog):
         await ctx.send(embed=self._build_player_leaderboard_embed(rows, title=f"{self._league_label(league_key, lang)} - {label}", lang=lang))
 
     @football.command(name="preview", description="Show data-only preview for a fixture ID.")
+    @app_commands.describe(fixture_id="Fixture ID, for example from /football today")
     async def football_preview(self, ctx: commands.Context, fixture_id: int) -> None:
         await self._send_fixture_detail(ctx, fixture_id=fixture_id, kind="preview")
 
     @football.command(name="summary", description="Show data-only summary for a fixture ID.")
+    @app_commands.describe(fixture_id="Fixture ID, for example from /football today")
     async def football_summary(self, ctx: commands.Context, fixture_id: int) -> None:
         await self._send_fixture_detail(ctx, fixture_id=fixture_id, kind="summary")
 
@@ -1300,64 +1442,6 @@ class FootballCog(commands.Cog):
             return []
         return result.fixtures[:1]
 
-    async def _resolve_team(
-        self,
-        ctx: commands.Context,
-        *,
-        client: Any,
-        lang: str,
-        league_id: int,
-        season: int,
-        query: str,
-    ) -> tuple[int, str] | None:
-        operation = compile_football_operation(
-            "FOOTBALL_LOOKUP",
-            query,
-            {"data_focus": "team", "team_candidates": [query]},
-        )
-        if not operation.team_slots:
-            await ctx.send(tr(lang, "I need a clearer team name.", "Necesito un nombre de equipo mas claro."))
-            return None
-        normalized = football_resolver.canonical_team_query(operation.team_slots[0].name)
-        service = FootballOperationService(client)
-        team_row, outcome = await service.resolve_team(operation, league_id=league_id, season=season)
-        self._log_football_diagnostic(
-            command="team_resolver",
-            resolver_input=query,
-            normalized_query=normalized,
-            explicit_context=True,
-            endpoint="/teams",
-            params={"league": league_id, "season": season},
-            response_count=1 if team_row else 0,
-            top_candidates=self._team_candidate_names([team_row] if team_row else []),
-            final_decision="ambiguous" if outcome == FootballOutcome.AMBIGUOUS else ("selected" if team_row else "not_found"),
-            fallback_reason=None if team_row else "no_team_match",
-        )
-        if outcome == FootballOutcome.AMBIGUOUS:
-            await ctx.send(tr(lang, "Multiple teams matched. Please be more specific.", "Varios equipos coinciden. Se mas especifico."))
-            return None
-        if team_row is None:
-            await ctx.send(tr(lang, "Team not found in that league.", "No se encontro ese equipo en esa liga."))
-            return None
-        team = team_row.get("team") if isinstance(team_row, dict) else {}
-        team_id = team.get("id") if isinstance(team, dict) else None
-        team_name = str(team.get("name", query)) if isinstance(team, dict) else query
-        if not isinstance(team_id, int):
-            await ctx.send(tr(lang, "Could not resolve a valid team ID.", "No se pudo resolver un ID valido."))
-            return None
-        return team_id, team_name
-
-    @staticmethod
-    def _team_candidate_names(rows: list[dict[str, Any]]) -> list[str]:
-        names = []
-        for item in rows[:5]:
-            team = item.get("team") if isinstance(item, dict) else {}
-            if isinstance(team, dict):
-                value = team.get("name")
-                team_id = team.get("id")
-                names.append(f"{value}#{team_id}"[:120])
-        return names
-
     @staticmethod
     def _player_candidate_names(rows: list[dict[str, Any]]) -> list[str]:
         names = []
@@ -1382,16 +1466,6 @@ class FootballCog(commands.Cog):
             names.append(f"{name} ({team_name})")
         joined = ", ".join(names) or "Unknown"
         return tr(lang, f"Multiple players matched: {joined}", f"Varios jugadores coinciden: {joined}")
-
-    @staticmethod
-    def _football_today_iso(client: Any) -> str:
-        method = getattr(client, "today_iso", None)
-        if callable(method):
-            try:
-                return str(method())
-            except Exception:
-                logging.warning("API-Football timezone date helper failed; falling back to local date")
-        return date.today().isoformat()
 
     @staticmethod
     def _log_football_diagnostic(
@@ -1516,6 +1590,119 @@ class FootballCog(commands.Cog):
             lines.append(f"`{index:>2}.` {player.get('name', 'Unknown') if isinstance(player, dict) else 'Unknown'} ({team.get('name', 'N/A') if isinstance(team, dict) else 'N/A'}) - {total}")
         return discord.Embed(title=title, description=("\n".join(lines) or tr(lang, "No data.", "Sin datos."))[:4000], color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
 
+    async def _send_football_reference(
+        self,
+        ctx: commands.Context,
+        *,
+        focus: str,
+        query: str = "",
+        page: int | None = None,
+        country_filter: str | None = None,
+    ) -> None:
+        lang = await self._lang(ctx.guild)
+        client = await self._client_or_message(ctx, lang)
+        if client is None:
+            return
+        await self._defer_if_needed(ctx)
+        operation = compile_football_operation(
+            "FOOTBALL_LOOKUP",
+            query or focus,
+            {
+                "data_focus": focus,
+                "reference_query": query.strip() or None,
+                "country_filter": country_filter.strip().casefold() if isinstance(country_filter, str) else None,
+                "reference_page": page,
+            },
+        )
+        try:
+            result = await FootballOperationService(client).execute(operation, league_id=None, season=None, data_focus=focus)
+        except Exception as exc:
+            await ctx.send(tr(lang, f"Failed to get football reference data: {exc}", f"No se pudo obtener la referencia: {exc}"))
+            return
+        if result.outcome != FootballOutcome.SELECTED:
+            await ctx.send(self._football_result_message(result, lang))
+            return
+        if focus == "odds_mapping":
+            embed = self._build_reference_embed("Odds Mapping", result.reference_rows, result.requested_scope.get("paging"), lang)
+        else:
+            title = {
+                "odds_bookmakers": "Odds Bookmakers",
+                "odds_bets": "Pre-match Odds Markets",
+                "odds_live_bets": "Live Odds Markets",
+                "football_timezones": "Football Timezones",
+                "football_countries": "Football Countries",
+                "league_seasons": "League Seasons",
+            }.get(focus, "Football Reference")
+            embed = self._build_reference_embed(title, result.reference_rows, None, lang)
+        await ctx.send(embed=embed)
+
+    @staticmethod
+    def _football_result_message(result: Any, lang: str) -> str:
+        if result.outcome == FootballOutcome.AMBIGUOUS:
+            return tr(lang, "The provider returned multiple exact matches; use the reference command to choose an ID.", "El proveedor devolvio varias coincidencias exactas; usa el comando de referencia para elegir un ID.")
+        if result.outcome == FootballOutcome.NOT_FOUND:
+            return tr(lang, "No matching provider data was found.", "No se encontraron datos del proveedor.")
+        if result.outcome == FootballOutcome.NO_DATA_FOR_SCOPE:
+            return tr(lang, "No data is available for that scope right now.", "No hay datos disponibles para ese alcance ahora.")
+        return tr(lang, "The requested football data could not be resolved.", "No se pudo resolver la informacion de futbol solicitada.")
+
+    @staticmethod
+    def _build_odds_embed(
+        rows: list[dict[str, Any]],
+        paging: Any,
+        *,
+        lang: str,
+        live: bool,
+    ) -> discord.Embed:
+        lines: list[str] = []
+        for row in rows[:10]:
+            fixture = row.get("fixture") if isinstance(row.get("fixture"), dict) else {}
+            fixture_id = fixture.get("id", "?")
+            league = row.get("league") if isinstance(row.get("league"), dict) else {}
+            fixture_name = row.get("fixture_name") or league.get("name") or f"Fixture {fixture_id}"
+            bookmakers = row.get("bookmakers") if isinstance(row.get("bookmakers"), list) else []
+            for bookmaker in bookmakers[:3]:
+                if not isinstance(bookmaker, dict):
+                    continue
+                bookmaker_name = bookmaker.get("name") or f"Bookmaker {bookmaker.get('id', '?')}"
+                bets = bookmaker.get("bets") if isinstance(bookmaker.get("bets"), list) else []
+                for bet in bets[:4]:
+                    if not isinstance(bet, dict):
+                        continue
+                    bet_name = bet.get("name") or f"Market {bet.get('id', '?')}"
+                    values = bet.get("values") if isinstance(bet.get("values"), list) else []
+                    selections = []
+                    for value in values[:6]:
+                        if isinstance(value, dict):
+                            label = value.get("value") or value.get("name") or "?"
+                            odd = value.get("odd", "?")
+                            selections.append(f"{label}: {odd}")
+                    if selections:
+                        lines.append(f"**{fixture_name}** | {bookmaker_name} | {bet_name}\n" + " · ".join(selections))
+        title = "Live Odds" if live else "Pre-match Odds"
+        description = "\n\n".join(lines) or tr(lang, "No odds data.", "No hay datos de cuotas.")
+        if isinstance(paging, dict) and paging.get("total"):
+            description += f"\n\nPage {paging.get('current', 1)} of {paging['total']}"
+        return discord.Embed(title=title, description=description[:4000], color=discord.Color.green() if live else discord.Color.gold(), timestamp=datetime.now(timezone.utc))
+
+    @staticmethod
+    def _build_reference_embed(title: str, rows: list[dict[str, Any]], paging: Any, lang: str) -> discord.Embed:
+        lines: list[str] = []
+        for row in rows[:25]:
+            if not isinstance(row, dict):
+                continue
+            item_id = row.get("id", row.get("value", "?"))
+            name = row.get("name", row.get("label", ""))
+            if title == "Odds Mapping":
+                fixture = row.get("fixture") if isinstance(row.get("fixture"), dict) else {}
+                league = row.get("league") if isinstance(row.get("league"), dict) else {}
+                lines.append(f"{fixture.get('id', item_id)} - {league.get('name', name or 'Fixture')}")
+            else:
+                lines.append(f"`{item_id}` - {name or 'Unknown'}")
+        if isinstance(paging, dict) and paging.get("total"):
+            lines.append(f"Page {paging.get('current', 1)} of {paging['total']}")
+        return discord.Embed(title=title, description=("\n".join(lines) or tr(lang, "No data.", "Sin datos."))[:4000], color=discord.Color.dark_teal(), timestamp=datetime.now(timezone.utc))
+
     def _build_simple_rows_embed(self, *, title: str, rows: list[dict[str, Any]], lang: str) -> discord.Embed:
         lines = []
         for item in rows[:10]:
@@ -1558,25 +1745,6 @@ class FootballCog(commands.Cog):
             coach = item.get("coach") if isinstance(item.get("coach"), dict) else {}
             lines.append(f"**{team.get('name', 'Team')}** - {item.get('formation', 'N/A')} | {coach.get('name', 'N/A')}")
         return ("\n".join(lines) or "N/A")[:1024]
-    @staticmethod
-    def _extract_table_rows(standings_response: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if not standings_response:
-            return []
-        first = standings_response[0]
-        league = first.get("league") if isinstance(first, dict) else None
-        if not isinstance(league, dict):
-            return []
-        standings = league.get("standings")
-        if not isinstance(standings, list) or not standings:
-            return []
-
-        if isinstance(standings[0], list):
-            rows: list[dict[str, Any]] = []
-            for group in standings:
-                if isinstance(group, list):
-                    rows.extend(row for row in group if isinstance(row, dict))
-            return rows
-        return [row for row in standings if isinstance(row, dict)]
 
     @staticmethod
     def _team_name_from_row(row: dict[str, Any]) -> str:
@@ -1587,47 +1755,6 @@ class FootballCog(commands.Cog):
                 return name.strip()
         return "Unknown"
 
-    @staticmethod
-    def _find_team_row(rows: list[dict[str, Any]], team_id: int | None) -> dict[str, Any] | None:
-        if not isinstance(team_id, int):
-            return None
-        for row in rows:
-            team = row.get("team")
-            if not isinstance(team, dict):
-                continue
-            if team.get("id") == team_id:
-                return row
-        return None
-
-    @staticmethod
-    def _pick_team(teams: list[dict[str, Any]], query: str) -> dict[str, Any] | None:
-        normalized = query.strip().casefold()
-        if not normalized:
-            return None
-
-        exact: list[dict[str, Any]] = []
-        partial: list[dict[str, Any]] = []
-        for item in teams:
-            team = item.get("team") if isinstance(item, dict) else None
-            if not isinstance(team, dict):
-                continue
-            name = str(team.get("name", "")).strip()
-            lowered = name.casefold()
-            if lowered == normalized:
-                exact.append(item)
-            elif normalized in lowered:
-                partial.append(item)
-
-        if exact:
-            return exact[0]
-        if partial:
-            return partial[0]
-        return teams[0] if teams else None
-
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(FootballCog(bot))
-
-
-
-

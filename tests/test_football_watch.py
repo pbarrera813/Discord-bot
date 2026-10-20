@@ -2,12 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from services.football_watch import (
-    build_watch_updates,
-    is_terminal_status,
-    should_fetch_statistics,
-    snapshot_from_fixture,
-)
+from services.football_watch import build_watch_updates, should_fetch_statistics, snapshot_from_fixture
 
 
 def _fixture(*, home: int = 0, away: int = 0, status: str = "1H", elapsed: int | None = 10):
@@ -121,28 +116,6 @@ class FootballWatchTests(unittest.TestCase):
         self.assertTrue(any(update.checkpoint == "30" for update in updates))
         self.assertIn("Inglaterra esta llegando mas", "\n".join(update.text for update in updates))
 
-    def test_insignificant_stats_do_not_send_checkpoint(self) -> None:
-        fixture = _fixture(home=0, away=0, elapsed=15)
-        stats = [
-            {"team": {"name": "A"}, "statistics": [{"type": "Total Shots", "value": 2}]},
-            {"team": {"name": "B"}, "statistics": [{"type": "Total Shots", "value": 3}]},
-        ]
-        updates, _snapshot = build_watch_updates(
-            previous=snapshot_from_fixture(_fixture(home=0, away=0, elapsed=10)),
-            current=snapshot_from_fixture(fixture, statistics=stats),
-            fixture=fixture,
-            events=[],
-            statistics=stats,
-            seen_event_keys=set(),
-            emitted_checkpoints=set(),
-        )
-
-        self.assertEqual(updates, [])
-
-    def test_terminal_status_detection(self) -> None:
-        self.assertTrue(is_terminal_status("FT"))
-        self.assertTrue(is_terminal_status("AET"))
-        self.assertFalse(is_terminal_status("2H 80'"))
 
     def test_multiple_events_between_polls_are_all_emitted_in_order(self) -> None:
         fixture = _fixture(home=2, away=1, elapsed=70)

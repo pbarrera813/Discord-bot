@@ -7,8 +7,7 @@ import re
 import unicodedata
 from typing import Any
 
-from services.football_formatter import fixture_datetime, fixture_score, fixture_status, fixture_teams
-from services import football_resolver
+from services.football_formatter import fixture_datetime, fixture_score, fixture_status
 
 
 TERMINAL_STATUS_SHORTS = {"FT", "AET", "PEN"}
@@ -718,7 +717,7 @@ class FootballLiveMatchService:
             endpoints.append("/fixtures/statistics")
         if include_half_stats and hasattr(self.client, "get_fixture_statistics"):
             half_stats = await self.client.get_fixture_statistics(fixture_id=fixture_id, half=True)
-            endpoints.append("/fixtures/statistics?half=true")
+            endpoints.append("/fixtures/statistics?half=1")
         if include_lineups and not lineups and hasattr(self.client, "get_fixture_lineups"):
             lineups = await self.client.get_fixture_lineups(fixture_id=fixture_id)
             endpoints.append("/fixtures/lineups")
@@ -871,6 +870,13 @@ def compact_match_data(data: MatchData, *, stat_key: str | None = None) -> dict[
         ]
         if rendered:
             selected_stats[str(team_key)] = rendered
+    fixture_payload = data.fixture.get("fixture") if isinstance(data.fixture, dict) else None
+    venue = fixture_payload.get("venue") if isinstance(fixture_payload, dict) else None
+    compact_venue = {
+        "id": venue.get("id"),
+        "name": venue.get("name"),
+        "city": venue.get("city"),
+    } if isinstance(venue, dict) else None
     return {
         "time_scope": data.time_scope,
         "fixture": {
@@ -883,6 +889,7 @@ def compact_match_data(data: MatchData, *, stat_key: str | None = None) -> dict[
             "status": data.status,
             "status_short": data.status_short,
             "date": data.fixture_date,
+            "venue": compact_venue,
             "lifecycle": data.lifecycle.__dict__ if data.lifecycle is not None else None,
         },
         "selected_team_id": data.selected_team_id,

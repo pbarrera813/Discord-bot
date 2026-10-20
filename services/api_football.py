@@ -17,6 +17,7 @@ from services.football_api_request_compiler import (
     FixturePlayersRequest,
     FixtureRoundsRequest,
     FixtureStatisticsRequest,
+    FootballCatalogRequest,
     InjuryRequest,
     InvalidFootballApiRequest,
     LeagueSearchRequest,
@@ -50,6 +51,13 @@ class FootballApiError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.retryable = retryable
+
+
+@dataclass(frozen=True)
+class FootballApiPage:
+    rows: list[dict[str, Any]]
+    current: int | None = None
+    total: int | None = None
 
 
 @dataclass(frozen=True)
@@ -100,9 +108,15 @@ def _optional_season_int(value: int | None) -> int | None:
     return _season_int(value) if value is not None else None
 
 
-def _season_required_for_league_scope(league_id: int | None, season: int | None, label: str) -> None:
-    if league_id is not None and season is None:
-        raise InvalidFootballApiRequest(f"{label} with league scope requires season.")
+def _season_required_for_league_scope(
+    league_id: int | None,
+    season: int | None,
+    label: str,
+    *,
+    team_id: int | None = None,
+) -> None:
+    if (league_id is not None or team_id is not None) and season is None:
+        raise InvalidFootballApiRequest(f"{label} with league or team scope requires season.")
 
 
 def _bounded_count(value: int, label: str, *, max_value: int) -> int:
@@ -123,8 +137,6 @@ def _date_string(value: str) -> str:
     except ValueError as exc:
         raise InvalidFootballApiRequest("date is invalid.") from exc
     return cleaned
-
-
 
 
 class ApiFootballClient:
@@ -192,6 +204,11 @@ class ApiFootballClient:
         self._season_cache: dict[int, tuple[float, int]] = {}
         self._live_cache: dict[int, tuple[float, list[dict[str, Any]]]] = {}
         self._response_cache: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[float, list[dict[str, Any]]]] = {}
+        self._page_cache: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[float, FootballApiPage]] = {}
+
+    @property
+    def display_timezone(self) -> timezone:
+        return self._display_timezone
 
     def today_iso(self) -> str:
         return datetime.now(self._display_timezone).date().isoformat()
@@ -199,7 +216,7 @@ class ApiFootballClient:
     @staticmethod
     def _local_timezone(timezone_name: str) -> timezone:
         try:
-            return ZoneInfo(timezone_name)  # type: ignore[return-value]
+            return ZoneInfo(timezone_name)
         except ZoneInfoNotFoundError:
             if timezone_name == "America/Mexico_City":
                 return timezone(timedelta(hours=-6), "CST")
@@ -218,7 +235,9 @@ class ApiFootballClient:
     async def _request(
         self,
         request: _CompiledApiFootballRequest,
-    ) -> list[dict[str, Any]]:
+        *,
+        include_paging: bool = False,
+    ) -> list[dict[str, Any]] | FootballApiPage:
         if not isinstance(request, _CompiledApiFootballRequest):
             raise InvalidFootballApiRequest("API-Football transport requires a compiled request envelope.")
         if not self.api_key:
@@ -229,7 +248,11 @@ class ApiFootballClient:
         cache_ttl_seconds = request.cache_ttl_seconds
         cache_key = self._cache_key(endpoint, clean_params)
         now = time.monotonic()
-        if cache_ttl_seconds > 0:
+        if include_paging and cache_ttl_seconds > 0:
+            cached_page = self._page_cache.get(cache_key)
+            if cached_page and now - cached_page[0] <= cache_ttl_seconds:
+                return cached_page[1]
+        if cache_ttl_seconds > 0 and not include_paging:
             cached = self._response_cache.get(cache_key)
             if cached and now - cached[0] <= cache_ttl_seconds:
                 logging.info(
@@ -250,17 +273,45 @@ class ApiFootballClient:
                     payload = await resp.json(content_type=None)
                     if resp.status >= 400:
                         retryable = resp.status == 429 or resp.status >= 500
+                        logging.warning(
+                            "API-Football application-error diagnostic endpoint=%s params=%s "
+                            "http_status=%s retryable=%s error=%s",
+                            endpoint,
+                            self._safe_log_params(clean_params),
+                            resp.status,
+                            retryable,
+                            "API-Football error (%s)" % resp.status,
+                        )
                         raise FootballApiError(f"API-Football error ({resp.status})", status=resp.status, retryable=retryable)
                     errors = self._extract_errors(payload)
                     if errors:
-                        raise FootballApiError(errors)
+                        logging.warning(
+                            "API-Football application-error diagnostic endpoint=%s params=%s "
+                            "http_status=%s retryable=%s error=%s",
+                            endpoint,
+                            self._safe_log_params(clean_params),
+                            resp.status,
+                            False,
+                            str(errors)[:160],
+                        )
+                        raise FootballApiError(errors, status=resp.status, retryable=False)
                     rows = self._extract_response(payload)
+                    paging = payload.get("paging") if isinstance(payload, dict) else None
+                    page = FootballApiPage(
+                        rows=rows,
+                        current=paging.get("current") if isinstance(paging, dict) and isinstance(paging.get("current"), int) else None,
+                        total=paging.get("total") if isinstance(paging, dict) and isinstance(paging.get("total"), int) else None,
+                    )
                     logging.info(
                         "API-Football request endpoint=%s params=%s response_count=%s cache_hit=false",
                         endpoint,
                         self._safe_log_params(clean_params),
                         len(rows),
                     )
+                    if include_paging:
+                        if cache_ttl_seconds > 0:
+                            self._page_cache[cache_key] = (time.monotonic(), page)
+                        return page
                     if cache_ttl_seconds > 0:
                         self._response_cache[cache_key] = (time.monotonic(), rows)
                     return rows
@@ -358,6 +409,7 @@ class ApiFootballClient:
             "name": request.name.value if request.name is not None else None,
             "country": request.country.value if request.country is not None else None,
             "search": request.search.value if request.search is not None else None,
+            "team": request.team_id,
         }
         if request.current is not None:
             params["current"] = "true" if request.current else "false"
@@ -409,10 +461,6 @@ class ApiFootballClient:
             if isinstance(league_id, int):
                 return league_id
         return None
-
-    @classmethod
-    def _pick_ligamx_league_id(cls, leagues: list[dict[str, Any]]) -> int | None:
-        return cls._pick_league_id(leagues, "ligamx")
 
     async def get_current_season(self, league_id: int) -> int:
         now = time.monotonic()
@@ -481,8 +529,8 @@ class ApiFootballClient:
     ) -> list[dict[str, Any]]:
         league_id = _optional_positive_int(league_id, "league_id")
         season = _optional_season_int(season)
-        _season_required_for_league_scope(league_id, season, "fixture date lookup")
         team_id = _optional_positive_int(team_id, "team_id")
+        _season_required_for_league_scope(league_id, season, "fixture date lookup", team_id=team_id)
         date_iso = _date_string(date_iso)
         return await self._request(
             _envelope(
@@ -502,8 +550,8 @@ class ApiFootballClient:
     ) -> list[dict[str, Any]]:
         league_id = _optional_positive_int(league_id, "league_id")
         season = _optional_season_int(season)
-        _season_required_for_league_scope(league_id, season, "next fixtures lookup")
         team_id = _optional_positive_int(team_id, "team_id")
+        _season_required_for_league_scope(league_id, season, "next fixtures lookup")
         next_count = _bounded_count(next_count, "next_count", max_value=50)
         params: dict[str, object | None] = {
             "league": league_id,
@@ -525,8 +573,8 @@ class ApiFootballClient:
     ) -> list[dict[str, Any]]:
         league_id = _optional_positive_int(league_id, "league_id")
         season = _optional_season_int(season)
-        _season_required_for_league_scope(league_id, season, "last fixtures lookup")
         team_id = _optional_positive_int(team_id, "team_id")
+        _season_required_for_league_scope(league_id, season, "last fixtures lookup")
         last_count = _bounded_count(last_count, "last_count", max_value=50)
         params: dict[str, object | None] = {
             "league": league_id,
@@ -599,7 +647,7 @@ class ApiFootballClient:
         team_id: int | None = None,
         stat_type: str | None = None,
     ) -> list[dict[str, Any]]:
-        compiled = request if request is not None else build_fixture_statistics_request(fixture_id=fixture_id, half=half, team_id=team_id, stat_type=stat_type)  # type: ignore[arg-type]
+        compiled = request if request is not None else build_fixture_statistics_request(fixture_id=fixture_id, half=half, team_id=team_id, stat_type=stat_type)
         if not isinstance(compiled, FixtureStatisticsRequest):
             raise InvalidFootballApiRequest("get_fixture_statistics requires a compiled fixture statistics request.")
         return await self._request(
@@ -609,7 +657,7 @@ class ApiFootballClient:
                     "fixture": compiled.fixture_id,
                     "team": compiled.team_id,
                     "type": compiled.stat_type,
-                    "half": "true" if compiled.half else None,
+                    "half": "1" if compiled.half else None,
                 },
                 cache_ttl_seconds=60,
             )
@@ -622,7 +670,7 @@ class ApiFootballClient:
         request: FixturePlayersRequest | None = None,
         team_id: int | None = None,
     ) -> list[dict[str, Any]]:
-        compiled = request if request is not None else build_fixture_players_request(fixture_id=fixture_id, team_id=team_id)  # type: ignore[arg-type]
+        compiled = request if request is not None else build_fixture_players_request(fixture_id=fixture_id, team_id=team_id)
         if not isinstance(compiled, FixturePlayersRequest):
             raise InvalidFootballApiRequest("get_fixture_players requires a compiled fixture players request.")
         return await self._request(
@@ -732,7 +780,7 @@ class ApiFootballClient:
         date_iso: str | None = None,
         request: TeamStatisticsRequest | None = None,
     ) -> list[dict[str, Any]]:
-        compiled = request if request is not None else build_team_statistics_request(league_id=league_id, season=season, team_id=team_id, date_iso=date_iso)  # type: ignore[arg-type]
+        compiled = request if request is not None else build_team_statistics_request(league_id=league_id, season=season, team_id=team_id, date_iso=date_iso)
         if not isinstance(compiled, TeamStatisticsRequest):
             raise InvalidFootballApiRequest("get_team_statistics requires a compiled team statistics request.")
         return await self._request(
@@ -759,7 +807,6 @@ class ApiFootballClient:
                     "season": request.season.value,
                     "current": "true" if request.current is True else "false" if request.current is False else None,
                     "dates": "true" if request.include_dates else None,
-                    "timezone": self.timezone_name,
                 },
                 cache_ttl_seconds=21600,
             )
@@ -780,6 +827,29 @@ class ApiFootballClient:
 
     async def get_team_countries(self) -> list[dict[str, Any]]:
         return await self._request(_envelope("/teams/countries", cache_ttl_seconds=86400))
+
+    async def get_timezones(self) -> list[dict[str, Any]]:
+        return await self._request(_envelope("/timezone", cache_ttl_seconds=86400))
+
+    async def get_countries(self, request: FootballCatalogRequest | None = None) -> list[dict[str, Any]]:
+        compiled = request or FootballCatalogRequest()
+        if not isinstance(compiled, FootballCatalogRequest):
+            raise InvalidFootballApiRequest("get_countries requires a compiled catalog request.")
+        return await self._request(
+            _envelope(
+                "/countries",
+                {
+                    "name": compiled.search.value if compiled.filter == "name" and compiled.search is not None else None,
+                    "code": compiled.search.value if compiled.filter == "code" and compiled.search is not None else None,
+                    "search": compiled.search.value if compiled.filter in {None, "search"} and compiled.search is not None else None,
+                },
+                cache_ttl_seconds=86400,
+            )
+        )
+
+    async def get_league_seasons(self) -> list[dict[str, Any]]:
+        rows = await self._request(_envelope("/leagues/seasons", cache_ttl_seconds=86400))
+        return [{"season": row.get("value")} for row in rows if isinstance(row.get("value"), int)]
 
     async def search_venues(self, request: VenueSearchRequest) -> list[dict[str, Any]]:
         if not isinstance(request, VenueSearchRequest):
@@ -858,11 +928,42 @@ class ApiFootballClient:
                     "date": request.date.value if request.date is not None else None,
                     "bookmaker": request.bookmaker_id,
                     "bet": request.bet_id,
+                    "page": request.page,
                     "timezone": self.timezone_name,
                 },
                 cache_ttl_seconds=10800,
             )
         )
+
+    async def get_odds_page(self, request: OddsRequest) -> FootballApiPage:
+        if not isinstance(request, OddsRequest) or request.live:
+            raise InvalidFootballApiRequest("get_odds_page requires a compiled pre-match odds request.")
+        page = await self._request(
+            _envelope(
+                "/odds",
+                {
+                    "fixture": request.fixture_id,
+                    "league": request.league_id,
+                    "season": request.season.value if request.season is not None else None,
+                    "date": request.date.value if request.date is not None else None,
+                    "bookmaker": request.bookmaker_id,
+                    "bet": request.bet_id,
+                    "page": request.page,
+                    "timezone": self.timezone_name,
+                },
+                cache_ttl_seconds=10800,
+            ),
+            include_paging=True,
+        )
+        return page if isinstance(page, FootballApiPage) else FootballApiPage(page)
+
+    async def get_odds_mapping(self, *, page: int = 1) -> FootballApiPage:
+        page = validate_positive_int(page, "page")
+        result = await self._request(
+            _envelope("/odds/mapping", {"page": page}, cache_ttl_seconds=86400),
+            include_paging=True,
+        )
+        return result if isinstance(result, FootballApiPage) else FootballApiPage(result)
 
     async def get_live_odds(self, request: OddsRequest) -> list[dict[str, Any]]:
         if not isinstance(request, OddsRequest) or not request.live:
