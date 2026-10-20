@@ -14,7 +14,7 @@ from utils.i18n import tr
 
 try:
     from PIL import Image, ImageDraw, ImageFont
-except ImportError:  # pragma: no cover - optional runtime dependency
+except ImportError:
     Image = None
     ImageDraw = None
     ImageFont = None
@@ -456,7 +456,6 @@ class MemesCog(commands.Cog):
         except Exception:
             return None
 
-        # Match the reference composition: wide canvas, high bubble area, avatar panel below.
         width = 760
         top_section_height = 323
 
@@ -482,7 +481,6 @@ class MemesCog(commands.Cog):
 
         image.paste(avatar_panel, (0, top_section_height), avatar_panel)
 
-        # Draw bubble after avatar: a clipped large oval plus a short seam tail.
         bubble_bottom_y = top_section_height - 70
         bubble_rect = (-120, -250, width + 120, bubble_bottom_y)
         draw.rounded_rectangle(
@@ -532,6 +530,7 @@ class MemesCog(commands.Cog):
         name="templates",
         description="List available meme templates (optional query).",
     )
+    @discord.app_commands.describe(query="Text to search template names (optional)")
     async def memetemplates(self, ctx: commands.Context, *, query: str | None = None) -> None:
         lang = await self._lang(ctx.guild)
         client = await self._client_or_message(ctx, lang)
@@ -643,6 +642,7 @@ class MemesCog(commands.Cog):
         description="Generate a meme with a template id.",
     )
     @discord.app_commands.rename(top_text="top", bottom_text="bottom")
+    @discord.app_commands.describe(template="Template ID from /meme templates", top_text="Text for the top of the meme", bottom_text="Text for the bottom of the meme (optional)")
     async def meme_create(
         self,
         ctx: commands.Context,
@@ -720,6 +720,7 @@ class MemesCog(commands.Cog):
         description="Generate a meme using a random template.",
     )
     @discord.app_commands.rename(top_text="top", bottom_text="bottom")
+    @discord.app_commands.describe(top_text="Text for the top of the meme", bottom_text="Text for the bottom of the meme (optional)")
     async def memerandom(
         self,
         ctx: commands.Context,
@@ -996,6 +997,7 @@ class MemesCog(commands.Cog):
         name="fonts",
         description="List available meme fonts.",
     )
+    @discord.app_commands.describe(query="Text to search font names (optional)")
     async def memefonts(self, ctx: commands.Context, *, query: str | None = None) -> None:
         lang = await self._lang(ctx.guild)
         client = await self._client_or_message(ctx, lang)

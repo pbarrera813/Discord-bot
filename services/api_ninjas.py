@@ -1,8 +1,74 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 import aiohttp
+
+from utils.unit_conversion import collect_conversion_units, extract_target_conversion
+
+
+class NinjasOperandError(ValueError):
+    pass
+
+
+def _readable_date(value: Any) -> Any:
+    """The provider returns whois dates as epoch seconds, or a list of them."""
+
+    if isinstance(value, list):
+        return [_readable_date(item) for item in value]
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return datetime.fromtimestamp(value, timezone.utc).date().isoformat()
+        except (OverflowError, OSError, ValueError):
+            return value
+    return value
+
+
+async def execute_operation(
+    client: Any,
+    operation: str,
+    *,
+    domain: str | None = None,
+    amount: float | None = None,
+    from_unit: str | None = None,
+    to_unit: str | None = None,
+) -> dict[str, Any]:
+    """Operands are used exactly as given: callers own any input normalization."""
+
+    if operation in {"joke", "dadjoke", "advice"}:
+        fetch = {"joke": client.get_joke, "dadjoke": client.get_dadjoke, "advice": client.get_advice}[operation]
+        return {"operation": operation, "text": await fetch()}
+    if operation == "whois":
+        domain = (domain or "").strip()
+        if not domain:
+            raise NinjasOperandError("domain_required")
+        data = await client.whois(domain)
+        servers = data.get("name_servers")
+        return {
+            "operation": operation,
+            "domain": domain,
+            "registrar": data.get("registrar"),
+            "creation_date": _readable_date(data.get("creation_date")),
+            "expiration_date": _readable_date(data.get("expiration_date")),
+            "country": data.get("country"),
+            "name_servers": [str(item) for item in servers[:12]] if isinstance(servers, list) else [],
+        }
+    if operation == "unit_conversion":
+        if amount is None or not (from_unit or "").strip() or not (to_unit or "").strip():
+            raise NinjasOperandError("conversion_operands_required")
+        data = await client.unit_conversion(amount, from_unit.strip())
+        converted, matched = extract_target_conversion(data, to_unit.strip())
+        return {
+            "operation": operation,
+            "amount": amount,
+            "from_unit": from_unit.strip(),
+            "to_unit": to_unit.strip(),
+            "converted_value": converted,
+            "matched_unit": matched,
+            "available_units": [] if converted is not None else collect_conversion_units(data)[:12],
+        }
+    raise NinjasOperandError("unknown_ninjas_operation")
 
 
 class ApiNinjasClient:
@@ -65,7 +131,6 @@ class ApiNinjasClient:
                 params={"amount": value, "unit": unit},
             )
         except RuntimeError:
-            # Compatibility fallback for older param naming.
             return await self._get(
                 "/unitconversion",
                 params={"value": value, "unit": unit},

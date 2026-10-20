@@ -6,13 +6,9 @@ from typing import Any
 import discord
 from discord.ext import commands
 
+from services.api_ninjas import execute_operation
 from utils.i18n import tr
-from utils.unit_conversion import (
-    collect_conversion_units,
-    cleanup_target_unit_input,
-    extract_target_conversion,
-    normalize_requested_unit,
-)
+from utils.unit_conversion import cleanup_target_unit_input, normalize_requested_unit
 
 
 class NinjasCog(commands.Cog):
@@ -58,7 +54,7 @@ class NinjasCog(commands.Cog):
         await self._maybe_defer(ctx)
 
         try:
-            joke_text = await client.get_joke()
+            joke_text = (await execute_operation(client, "joke"))["text"]
         except Exception as exc:
             await ctx.send(
                 tr(
@@ -80,7 +76,7 @@ class NinjasCog(commands.Cog):
         await self._maybe_defer(ctx)
 
         try:
-            joke_text = await client.get_dadjoke()
+            joke_text = (await execute_operation(client, "dadjoke"))["text"]
         except Exception as exc:
             await ctx.send(
                 tr(
@@ -102,7 +98,7 @@ class NinjasCog(commands.Cog):
         await self._maybe_defer(ctx)
 
         try:
-            advice_text = await client.get_advice()
+            advice_text = (await execute_operation(client, "advice"))["text"]
         except Exception as exc:
             await ctx.send(
                 tr(
@@ -116,6 +112,7 @@ class NinjasCog(commands.Cog):
         await ctx.send(advice_text)
 
     @commands.hybrid_command(name="whois", description="Get domain WHOIS info.")
+    @discord.app_commands.describe(domain="Domain name, for example example.com")
     async def whois(self, ctx: commands.Context, domain: str) -> None:
         client = await self._client_or_message(ctx)
         if client is None:
@@ -135,7 +132,7 @@ class NinjasCog(commands.Cog):
             return
 
         try:
-            data = await client.whois(domain)
+            data = await execute_operation(client, "whois", domain=domain)
         except Exception as exc:
             await ctx.send(
                 tr(
@@ -152,10 +149,14 @@ class NinjasCog(commands.Cog):
             timestamp=datetime.now(timezone.utc),
         )
 
-        registrar = str(data.get("registrar", "N/A"))
-        creation_date = str(data.get("creation_date", "N/A"))
-        expiration_date = str(data.get("expiration_date", "N/A"))
-        country = str(data.get("country", "N/A"))
+        def field(name: str) -> str:
+            value = data.get(name)
+            return "N/A" if value is None else str(value)
+
+        registrar = field("registrar")
+        creation_date = field("creation_date")
+        expiration_date = field("expiration_date")
+        country = field("country")
 
         embed.add_field(name=tr(lang, "Registrar", "Registrador"), value=registrar[:1024], inline=False)
         embed.add_field(
@@ -170,9 +171,9 @@ class NinjasCog(commands.Cog):
         )
         embed.add_field(name=tr(lang, "Country", "Pais"), value=country[:1024], inline=True)
 
-        nameservers = data.get("name_servers")
-        if isinstance(nameservers, list) and nameservers:
-            joined = ", ".join(str(ns) for ns in nameservers[:12])
+        nameservers = data["name_servers"]
+        if nameservers:
+            joined = ", ".join(nameservers)
             embed.add_field(
                 name=tr(lang, "Name Servers", "Servidores de nombres"),
                 value=joined[:1024],
@@ -186,6 +187,7 @@ class NinjasCog(commands.Cog):
         description="Convert units. Example: /convert 1000 meter kilometer",
     )
     @discord.app_commands.rename(from_unit="from", to_unit="to")
+    @discord.app_commands.describe(amount="Number to convert", from_unit="Unit to convert from, for example meter", to_unit="Unit to convert to, for example kilometer")
     async def convert(
         self,
         ctx: commands.Context,
@@ -215,7 +217,9 @@ class NinjasCog(commands.Cog):
             return
 
         try:
-            data = await client.unit_conversion(amount, source_unit)
+            conversion = await execute_operation(
+                client, "unit_conversion", amount=amount, from_unit=source_unit, to_unit=target_unit,
+            )
         except Exception as exc:
             await ctx.send(
                 tr(
@@ -226,10 +230,9 @@ class NinjasCog(commands.Cog):
             )
             return
 
-        converted_value, matched_unit = extract_target_conversion(data, target_unit)
+        converted_value, matched_unit = conversion["converted_value"], conversion["matched_unit"]
         if converted_value is None:
-            available_units = collect_conversion_units(data)
-            available_preview = ", ".join(available_units[:12])
+            available_preview = ", ".join(conversion["available_units"])
             await ctx.send(
                 tr(
                     lang,

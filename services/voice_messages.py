@@ -7,7 +7,6 @@ import math
 import re
 import struct
 import tempfile
-import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 from io import BytesIO
@@ -67,39 +66,6 @@ ALLOWED_TTS_TAGS: frozenset[str] = frozenset(
 )
 
 _TAG_RE = re.compile(r"\[([a-z][a-z-]{1,40})\]", flags=re.IGNORECASE)
-_QUOTED_TEXT_RE = re.compile(
-    "\"(?:\\\\.|[^\"])*\"|'(?:\\\\.|[^'])*'|\\u201c[^\\u201d]*\\u201d|\\u2018[^\\u2019]*\\u2019|\\u00ab[^\\u00bb]*\\u00bb",
-    flags=re.DOTALL,
-)
-
-
-def _normalize_text(text: str) -> str:
-    decomposed = unicodedata.normalize("NFD", text.casefold())
-    without_marks = "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
-    return re.sub(r"\s+", " ", without_marks).strip()
-
-
-def voice_response_decision(text: str) -> VoiceResponseDecision:
-    unquoted = _QUOTED_TEXT_RE.sub(" ", str(text or ""))
-    normalized = _normalize_text(unquoted)
-    if not normalized:
-        return VoiceResponseDecision(ResponseModality.TEXT, False, reason="empty_current_message")
-    medium = r"(mensaje de voz|nota de voz|mensaje de audio|audio message|voice message|voice note|audio|voz|voice)"
-    direct_patterns = (
-        rf"\b(responde|respondeme|contestame|contesta|dime|dimelo|mandame|manda|enviame|envia)\b.{{0,80}}\b(con|como|en|por)\s+(?:un|una|el|la)?\s*{medium}\b",
-        rf"\b(envia|enviame|manda|mandame|graba|haz|crea)\b.{{0,45}}\b(?:un|una|el|la|mi|tu)?\s*{medium}\b",
-        rf"\b(send|answer|reply|tell me|say)\b.{{0,80}}\b(as|with|in)\s+(an?\s+)?{medium}\b",
-        rf"\b(send|record|make|create)\b.{{0,45}}\b(an?\s+)?{medium}\b",
-        rf"\b(tu|your)\s+(respuesta|response|reply)\b.{{0,60}}\b(como|as|en|in)\s+(an?\s+)?{medium}\b",
-        rf"\b{medium}\b.{{0,80}}\b(respuesta|response|reply)\b",
-    )
-    if any(re.search(pattern, normalized) for pattern in direct_patterns):
-        return VoiceResponseDecision(ResponseModality.VOICE, True, reason="explicit_voice_output_request")
-    return VoiceResponseDecision(ResponseModality.TEXT, False)
-
-
-def detect_voice_response_intent(text: str) -> bool:
-    return voice_response_decision(text).modality == ResponseModality.VOICE
 
 
 def sanitize_tts_text(text: str, *, limit: int = 1800) -> str:

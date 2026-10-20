@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import random
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
@@ -89,8 +89,7 @@ class BirthdaysCog(commands.Cog):
     async def _is_module_enabled(self, guild: discord.Guild | None) -> bool:
         if guild is None:
             return False
-        settings = await self.bot.db.get_or_create_birthday_guild_settings(guild.id)
-        return int(settings.get("enabled", 0)) == 1
+        return await birthday_module_enabled(self.bot.db, guild.id)
 
     @staticmethod
     def _event_label(event_type: str, lang: str) -> str:
@@ -100,52 +99,6 @@ class BirthdaysCog(commands.Cog):
             "server_anniversary": tr(lang, "Server Anniversary", "Aniversario del servidor"),
         }
         return labels.get(event_type, event_type)
-
-    @staticmethod
-    def _validate_timezone(raw: str | None) -> str | None:
-        if raw is None:
-            return None
-        value = raw.strip()
-        if not value:
-            return None
-        try:
-            ZoneInfo(value)
-        except ZoneInfoNotFoundError:
-            return None
-        return value
-
-    @staticmethod
-    def _normalize_message_mode(raw: str | None) -> str | None:
-        if raw is None:
-            return None
-        value = raw.strip().lower()
-        if value in {"", "clear", "reset", "none", "-"}:
-            return "embed"
-        if value in {"text", "embed", "both"}:
-            return value
-        return None
-
-    @staticmethod
-    def _normalize_hex_color(raw: str | None) -> str | None:
-        if raw is None:
-            return None
-        value = raw.strip()
-        if value.lower() in {"", "clear", "reset", "none", "-"}:
-            return ""
-        if not re.fullmatch(r"#?[0-9a-fA-F]{6}", value):
-            return None
-        if not value.startswith("#"):
-            value = f"#{value}"
-        return value.lower()
-
-    @staticmethod
-    def _normalize_optional_text(raw: str | None) -> str | None:
-        if raw is None:
-            return None
-        value = raw.strip()
-        if value.lower() in {"", "clear", "reset", "none", "-"}:
-            return ""
-        return value
 
     @staticmethod
     def _parse_date_input(raw: str) -> tuple[int, int] | None:
@@ -174,8 +127,8 @@ class BirthdaysCog(commands.Cog):
                 month = a
                 day = b
         try:
-            datetime(2000, month, day)
-        except ValueError:
+            validate_birthday(month, day, None)
+        except BirthdayError:
             return None
         return month, day
 
@@ -407,8 +360,8 @@ class BirthdaysCog(commands.Cog):
             allowed_mentions=mentions,
         )
 
+    @staticmethod
     async def _member_is_blacklisted(
-        self,
         *,
         guild: discord.Guild,
         member: discord.Member,
@@ -420,8 +373,8 @@ class BirthdaysCog(commands.Cog):
         member_role_ids = {role.id for role in member.roles}
         return any(role_id in member_role_ids for role_id in blacklisted_roles)
 
+    @staticmethod
     async def _is_trusted_allowed(
-        self,
         *,
         guild: discord.Guild,
         member: discord.Member,
@@ -651,6 +604,7 @@ class BirthdaysCog(commands.Cog):
     @birthday.command(name="setup", description="Configure birthday channel/role quickly.")
     @app_commands.default_permissions(administrator=True)
     @owner_or_has_permissions(administrator=True)
+    @app_commands.describe(channel="Text channel for birthday announcements (optional)", role="Role given on the birthday (optional)")
     async def birthday_setup(
         self,
         ctx: commands.Context,
@@ -680,6 +634,7 @@ class BirthdaysCog(commands.Cog):
 
     @birthday.command(name="set", description="Set your birthday date (MM-DD or DD/MM).")
     @app_commands.rename(date_text="date", birth_year="year")
+    @app_commands.describe(date_text="Birthday as MM-DD or DD/MM, for example 03-25", birth_year="Birth year, for example 1998 (optional)")
     async def birthday_set(
         self,
         ctx: commands.Context,
@@ -713,21 +668,14 @@ class BirthdaysCog(commands.Cog):
             return
 
         month, day = parsed
-        if birth_year is not None and (birth_year < 1900 or birth_year > datetime.now(timezone.utc).year):
+        try:
+            await set_birthday(self.bot.db, ctx.guild.id, ctx.author.id, month, day, birth_year)
+        except BirthdayError:  # the date was validated above, so only the year can fail here
             await self._send_user_only(
                 ctx,
                 content=tr(lang, "Invalid birth year.", "Año de nacimiento inválido."),
             )
             return
-
-        await self.bot.db.upsert_birthday_profile(
-            guild_id=ctx.guild.id,
-            user_id=ctx.author.id,
-            month=month,
-            day=day,
-            birth_year=birth_year,
-            timezone_name=None,
-        )
 
         await self._send_user_only(
             ctx,
@@ -758,7 +706,7 @@ class BirthdaysCog(commands.Cog):
             )
             return
 
-        removed = await self.bot.db.delete_birthday_profile(ctx.guild.id, ctx.author.id)
+        removed = await remove_birthday(self.bot.db, ctx.guild.id, ctx.author.id)
         if removed:
             await self._send_user_only(
                 ctx,
@@ -775,6 +723,7 @@ class BirthdaysCog(commands.Cog):
         await self.birthday_remove(ctx)
 
     @birthday.command(name="view", description="View birthday info of a user.")
+    @app_commands.describe(user="Member to look up (default: you)")
     async def birthday_view(self, ctx: commands.Context, user: discord.Member | None = None) -> None:
         lang = await self._lang(ctx.guild)
         if ctx.guild is None:
@@ -793,7 +742,8 @@ class BirthdaysCog(commands.Cog):
         if target is None:
             await ctx.send(tr(lang, "User not found.", "Usuario no encontrado."))
             return
-        profile = await self.bot.db.get_birthday_profile(ctx.guild.id, target.id)
+        hidden = await view_hidden_by_blacklist(self.bot.db, ctx.guild, target, ctx.author.id)
+        profile = None if hidden else await view_birthday(self.bot.db, ctx.guild.id, target.id)
         if profile is None:
             await ctx.send(
                 tr(
@@ -803,22 +753,18 @@ class BirthdaysCog(commands.Cog):
                 )
             )
             return
-        settings = await self.bot.db.get_or_create_birthday_guild_settings(ctx.guild.id)
-        hide_ages = int(settings.get("disable_ages", 0)) == 1
-        month = int(profile["month"])
-        day = int(profile["day"])
-        birth_year = profile.get("birth_year")
         embed = discord.Embed(
             title=tr(lang, "Birthday profile", "Perfil de cumpleaños"),
             color=discord.Color.blurple(),
         )
         embed.set_author(name=str(target), icon_url=target.display_avatar.url)
-        embed.add_field(name=tr(lang, "Date", "Fecha"), value=f"`{month:02d}-{day:02d}`", inline=True)
-        if not hide_ages and isinstance(birth_year, int):
-            embed.add_field(name=tr(lang, "Birth year", "Año de nacimiento"), value=f"`{birth_year}`", inline=True)
+        embed.add_field(name=tr(lang, "Date", "Fecha"), value=f"`{profile['month']:02d}-{profile['day']:02d}`", inline=True)
+        if profile["birth_year"] is not None:
+            embed.add_field(name=tr(lang, "Birth year", "Año de nacimiento"), value=f"`{profile['birth_year']}`", inline=True)
         await ctx.send(embed=embed)
 
     @birthday.command(name="next", description="List next upcoming birthdays in this server.")
+    @app_commands.describe(count="How many upcoming birthdays to list (default 10)")
     async def birthday_next(self, ctx: commands.Context, count: int = 10) -> None:
         lang = await self._lang(ctx.guild)
         if ctx.guild is None:
@@ -833,39 +779,11 @@ class BirthdaysCog(commands.Cog):
                 )
             )
             return
-        count = max(1, min(count, 25))
-        settings = await self.bot.db.get_or_create_birthday_guild_settings(ctx.guild.id)
-        tz_name = str(settings.get("server_timezone", "UTC") or "UTC")
-        try:
-            server_tz = ZoneInfo(tz_name)
-        except ZoneInfoNotFoundError:
-            server_tz = ZoneInfo("UTC")
-        now_local = datetime.now(timezone.utc).astimezone(server_tz)
-        blacklisted_users = set(await self.bot.db.list_birthday_blacklist_users(ctx.guild.id))
-        blacklisted_roles = set(await self.bot.db.list_birthday_blacklist_roles(ctx.guild.id))
-        rows: list[tuple[tuple[int, int], str]] = []
-        for profile in await self.bot.db.list_birthday_profiles(ctx.guild.id):
-            member = ctx.guild.get_member(int(profile["user_id"]))
-            if member is None or member.bot:
-                continue
-            if await self._member_is_blacklisted(
-                guild=ctx.guild,
-                member=member,
-                blacklisted_users=blacklisted_users,
-                blacklisted_roles=blacklisted_roles,
-            ):
-                continue
-            if not await self._is_trusted_allowed(guild=ctx.guild, member=member, settings=settings, check_kind="list"):
-                continue
-            month = int(profile["month"])
-            day = int(profile["day"])
-            key = self._next_occurrence_key(month, day, now_local)
-            rows.append((key, f"`{month:02d}-{day:02d}` - {member.mention}"))
+        rows = await next_birthdays(self.bot.db, ctx.guild, count)
         if not rows:
             await ctx.send(tr(lang, "No birthdays configured yet.", "Aún no hay cumpleaños configurados."))
             return
-        rows.sort(key=lambda item: item[0])
-        lines = [item[1] for item in rows[:count]]
+        lines = [f"`{row['month']:02d}-{row['day']:02d}` - {row['member'].mention}" for row in rows]
         embed = discord.Embed(
             title=tr(lang, "Upcoming birthdays", "Próximos cumpleaños"),
             description="\n".join(lines),
@@ -877,6 +795,7 @@ class BirthdaysCog(commands.Cog):
     @birthday.command(name="channel", description="Set or clear the birthday announcement channel.")
     @app_commands.default_permissions(administrator=True)
     @owner_or_has_permissions(administrator=True)
+    @app_commands.describe(channel="Text channel for birthday announcements (leave empty to clear)")
     async def birthday_channel(self, ctx: commands.Context, channel: discord.TextChannel | None = None) -> None:
         lang = await self._lang(ctx.guild)
         if ctx.guild is None:
@@ -897,6 +816,7 @@ class BirthdaysCog(commands.Cog):
     @birthday.command(name="role", description="Set or clear the birthday role.")
     @app_commands.default_permissions(administrator=True)
     @owner_or_has_permissions(administrator=True)
+    @app_commands.describe(role="Role given on the birthday (leave empty to clear)")
     async def birthday_role(self, ctx: commands.Context, role: discord.Role | None = None) -> None:
         lang = await self._lang(ctx.guild)
         if ctx.guild is None:
@@ -918,42 +838,49 @@ class BirthdaysCog(commands.Cog):
     @app_commands.default_permissions(administrator=True)
     @owner_or_has_permissions(administrator=True)
     @app_commands.rename(timezone_name="timezone")
+    @app_commands.describe(timezone_name="IANA timezone name, for example America/Mexico_City")
     async def birthday_timezone(self, ctx: commands.Context, timezone_name: str) -> None:
         lang = await self._lang(ctx.guild)
         if ctx.guild is None:
             await ctx.send(tr(lang, "Use this command in a server.", "Usa este comando en un servidor."))
             return
-        tz = self._validate_timezone(timezone_name)
-        if tz is None:
+        try:
+            tz = await set_birthday_timezone(self.bot.db, ctx.guild.id, timezone_name)
+        except BirthdayError:
             await ctx.send(tr(lang, "Invalid timezone. Use IANA format.", "Zona horaria inválida. Usa formato IANA."))
             return
-        await self.bot.db.update_birthday_guild_settings(ctx.guild.id, server_timezone=tz)
         await ctx.send(tr(lang, f"Server timezone set to `{tz}`.", f"Zona horaria del servidor configurada a `{tz}`."))
 
     @birthday.command(name="mode", description="Set birthday mode: user or server timezone.")
     @app_commands.default_permissions(administrator=True)
     @owner_or_has_permissions(administrator=True)
+    @app_commands.describe(mode="Whose timezone decides when birthdays happen")
+    @app_commands.choices(mode=[
+        app_commands.Choice(name="user", value="user"),
+        app_commands.Choice(name="server", value="server"),
+    ])
     async def birthday_mode(self, ctx: commands.Context, mode: str) -> None:
         lang = await self._lang(ctx.guild)
-        normalized = mode.strip().lower()
-        if normalized not in {"user", "server"}:
-            await ctx.send(tr(lang, "Mode must be `user` or `server`.", "El modo debe ser `user` o `server`."))
-            return
         if ctx.guild is None:
             await ctx.send(tr(lang, "Use this command in a server.", "Usa este comando en un servidor."))
             return
-        await self.bot.db.update_birthday_guild_settings(ctx.guild.id, birthday_timezone_mode=normalized)
+        try:
+            normalized = await set_birthday_mode(self.bot.db, ctx.guild.id, mode)
+        except BirthdayError:
+            await ctx.send(tr(lang, "Mode must be `user` or `server`.", "El modo debe ser `user` o `server`."))
+            return
         await ctx.send(tr(lang, f"Birthday mode set to `{normalized}`.", f"Modo de cumpleaños configurado a `{normalized}`."))
 
     @birthday.command(name="ages", description="Enable or disable age visibility in birthday messages.")
     @app_commands.default_permissions(administrator=True)
     @owner_or_has_permissions(administrator=True)
+    @app_commands.describe(enabled="True to show ages in birthday messages, false to hide them")
     async def birthday_ages(self, ctx: commands.Context, enabled: bool) -> None:
         lang = await self._lang(ctx.guild)
         if ctx.guild is None:
             await ctx.send(tr(lang, "Use this command in a server.", "Usa este comando en un servidor."))
             return
-        await self.bot.db.update_birthday_guild_settings(ctx.guild.id, disable_ages=not enabled)
+        await set_birthday_ages(self.bot.db, ctx.guild.id, enabled)
         await ctx.send(
             tr(
                 lang,
@@ -967,6 +894,7 @@ class BirthdaysCog(commands.Cog):
     @owner_or_has_permissions(administrator=True)
     @app_commands.rename(event_type="type")
     @app_commands.choices(event_type=EVENT_CONFIG_CHOICES)
+    @app_commands.describe(event_type="Event to configure, or disable to turn the birthday module off", color="Embed hex color such as #00ffaa, or clear (optional)", image="Embed image URL (optional)", message="Custom message text for this event (optional)")
     async def birthday_event(
         self,
         ctx: commands.Context,
@@ -981,22 +909,23 @@ class BirthdaysCog(commands.Cog):
             await ctx.send(tr(lang, "Use this command in a server.", "Usa este comando en un servidor."))
             return
 
-        normalized_event = (event_type or "").strip().lower()
-        target_event_type = ""
-        birthday_variant = "default"
-        if normalized_event in {"birthday_year", "year"}:
-            target_event_type = "birthday"
-            birthday_variant = "year"
-        elif normalized_event in {"birthday_default", "default", "birthday"}:
-            target_event_type = "birthday"
-            birthday_variant = "default"
-        elif normalized_event in {"member_anniversary", "join"}:
-            target_event_type = "member_anniversary"
-        elif normalized_event in {"server_anniversary", "server"}:
-            target_event_type = "server_anniversary"
-
-        if normalized_event == "disable":
-            await self.bot.db.update_birthday_guild_settings(ctx.guild.id, enabled=False)
+        try:
+            target_event_type, birthday_variant, cfg = await set_birthday_event(
+                self.bot.db, ctx.guild.id, event_type, color, image, message,
+            )
+        except BirthdayError as exc:
+            if str(exc) == "invalid_color":
+                await ctx.send(
+                    tr(
+                        lang,
+                        "color must be a valid hex like `#00ffaa`, or `clear`.",
+                        "color debe ser un hex válido como `#00ffaa`, o `clear`.",
+                    )
+                )
+            else:
+                await ctx.send(tr(lang, "Invalid event type.", "Tipo de evento inválido."))
+            return
+        if target_event_type is None:
             await ctx.send(
                 tr(
                     lang,
@@ -1004,48 +933,6 @@ class BirthdaysCog(commands.Cog):
                     "Módulo de cumpleaños desactivado.",
                 )
             )
-            return
-        if not target_event_type:
-            await ctx.send(tr(lang, "Invalid event type.", "Tipo de evento inválido."))
-            return
-
-        normalized_color = self._normalize_hex_color(color)
-        if color is not None and normalized_color is None:
-            await ctx.send(
-                tr(
-                    lang,
-                    "color must be a valid hex like `#00ffaa`, or `clear`.",
-                    "color debe ser un hex válido como `#00ffaa`, o `clear`.",
-                )
-            )
-            return
-
-        normalized_image = self._normalize_optional_text(image)
-        normalized_message = self._normalize_optional_text(message)
-
-        try:
-            update_kwargs: dict[str, object] = {
-                "enabled": True,
-                "message_mode": "embed",
-                "embed_color": normalized_color,
-                "embed_image_url": normalized_image,
-            }
-            if normalized_message is not None:
-                if target_event_type == "birthday":
-                    if birthday_variant == "year":
-                        update_kwargs["birthday_message_with_age"] = normalized_message
-                    else:
-                        update_kwargs["birthday_message_no_year"] = normalized_message
-                else:
-                    update_kwargs["birthday_message_no_year"] = normalized_message
-
-            cfg = await self.bot.db.update_birthday_event_settings(
-                ctx.guild.id,
-                target_event_type,
-                **update_kwargs,
-            )
-        except ValueError:
-            await ctx.send(tr(lang, "Invalid event type.", "Tipo de evento inválido."))
             return
 
         embed = discord.Embed(
@@ -1090,20 +977,14 @@ class BirthdaysCog(commands.Cog):
     @owner_or_has_permissions(administrator=True)
     @app_commands.rename(preview_type="type")
     @app_commands.choices(preview_type=EVENT_PREVIEW_CHOICES)
+    @app_commands.describe(preview_type="Event output to preview")
     async def birthday_preview(self, ctx: commands.Context, preview_type: str) -> None:
         lang = await self._lang(ctx.guild)
         if ctx.guild is None:
             await ctx.send(tr(lang, "Use this command in a server.", "Usa este comando en un servidor."))
             return
 
-        target_channel: discord.TextChannel | None = ctx.channel if isinstance(ctx.channel, discord.TextChannel) else None
-        if target_channel is None:
-            settings = await self.bot.db.get_or_create_birthday_guild_settings(ctx.guild.id)
-            config_channel_id = settings.get("channel_id")
-            if isinstance(config_channel_id, int):
-                maybe_channel = ctx.guild.get_channel(config_channel_id)
-                if isinstance(maybe_channel, discord.TextChannel):
-                    target_channel = maybe_channel
+        target_channel = await preview_channel(self.bot.db, ctx.guild, ctx.channel)
         if target_channel is None:
             await ctx.send(
                 tr(
@@ -1113,80 +994,32 @@ class BirthdaysCog(commands.Cog):
                 )
             )
             return
-
-        normalized = (preview_type or "").strip().lower()
-        target_event_type = ""
-        preview_age: int | None = None
-        preview_year_value: int | None = None
-        preview_member = ctx.author if isinstance(ctx.author, discord.Member) else None
-
-        if normalized in {"default", "birthday", "birthday_default"}:
-            target_event_type = "birthday"
-        elif normalized in {"year", "birthday_year"}:
-            target_event_type = "birthday"
-            now_year = datetime.now(timezone.utc).year
-            preview_age = 24
-            preview_year_value = now_year - preview_age
-            if preview_member is not None:
-                profile = await self.bot.db.get_birthday_profile(ctx.guild.id, preview_member.id)
-                if profile is not None:
-                    birth_year = profile.get("birth_year")
-                    if isinstance(birth_year, int):
-                        computed_age = now_year - birth_year
-                        if computed_age > 0:
-                            preview_age = computed_age
-                            preview_year_value = birth_year
-        elif normalized in {"server", "server_anniversary"}:
-            target_event_type = "server_anniversary"
-            created_year = ctx.guild.created_at.year
-            preview_year_value = max(1, datetime.now(timezone.utc).year - created_year)
-        elif normalized in {"user", "join", "member_anniversary"}:
-            target_event_type = "member_anniversary"
-            if preview_member is not None and preview_member.joined_at is not None:
-                preview_year_value = max(1, datetime.now(timezone.utc).year - preview_member.joined_at.year)
-            else:
-                preview_year_value = 1
-
-        if not target_event_type:
+        try:
+            await preview_birthday_event(self, ctx.guild, ctx.author, target_channel, preview_type, lang)
+        except BirthdayError:
             await ctx.send(tr(lang, "Invalid preview type.", "Tipo de vista previa inválido."))
-            return
-
-        event_settings = await self.bot.db.get_or_create_birthday_event_settings(ctx.guild.id, target_event_type)
-        await self._send_event_announcement(
-            guild=ctx.guild,
-            event_type=target_event_type,
-            channel=target_channel,
-            event_settings=event_settings,
-            member=preview_member,
-            age=preview_age,
-            year_value=preview_year_value,
-            lang=lang,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
 
     @birthday.command(name="templateadd", description="Add a custom template for an event type (max 100).")
     @app_commands.default_permissions(administrator=True)
     @owner_or_has_permissions(administrator=True)
     @app_commands.rename(event_type="type", template_text="template")
     @app_commands.choices(event_type=EVENT_CHOICES)
+    @app_commands.describe(event_type="Event the template is for", template_text="Template text to add")
     async def birthday_template_add(self, ctx: commands.Context, event_type: str, *, template_text: str) -> None:
         lang = await self._lang(ctx.guild)
         if ctx.guild is None:
             await ctx.send(tr(lang, "Use this command in a server.", "Usa este comando en un servidor."))
             return
-        clean = template_text.strip()
-        if not clean:
-            await ctx.send(tr(lang, "Template text cannot be empty.", "La plantilla no puede estar vacia."))
-            return
         try:
-            current = await self.bot.db.count_birthday_templates(ctx.guild.id, event_type)
-        except ValueError:
-            await ctx.send(tr(lang, "Invalid event type.", "Tipo de evento inválido."))
+            template_id = await add_birthday_template(self.bot.db, ctx.guild.id, event_type, template_text)
+        except BirthdayError as exc:
+            if str(exc) == "empty_template":
+                await ctx.send(tr(lang, "Template text cannot be empty.", "La plantilla no puede estar vacia."))
+            elif str(exc) == "template_limit_reached":
+                await ctx.send(tr(lang, "Template limit reached (100).", "Limite de plantillas alcanzado (100)."))
+            else:
+                await ctx.send(tr(lang, "Invalid event type.", "Tipo de evento inválido."))
             return
-        if current >= 100:
-            await ctx.send(tr(lang, "Template limit reached (100).", "Limite de plantillas alcanzado (100)."))
-            return
-        template_id = await self.bot.db.add_birthday_template(ctx.guild.id, event_type, clean)
         await ctx.send(
             tr(
                 lang,
@@ -1200,14 +1033,15 @@ class BirthdaysCog(commands.Cog):
     @owner_or_has_permissions(administrator=True)
     @app_commands.rename(event_type="type")
     @app_commands.choices(event_type=EVENT_CHOICES)
+    @app_commands.describe(event_type="Event whose templates to list")
     async def birthday_template_list(self, ctx: commands.Context, event_type: str) -> None:
         lang = await self._lang(ctx.guild)
         if ctx.guild is None:
             await ctx.send(tr(lang, "Use this command in a server.", "Usa este comando en un servidor."))
             return
         try:
-            templates = await self.bot.db.list_birthday_templates(ctx.guild.id, event_type)
-        except ValueError:
+            templates = await list_birthday_templates(self.bot.db, ctx.guild.id, event_type)
+        except BirthdayError:
             await ctx.send(tr(lang, "Invalid event type.", "Tipo de evento inválido."))
             return
         if not templates:
@@ -1230,14 +1064,15 @@ class BirthdaysCog(commands.Cog):
     @owner_or_has_permissions(administrator=True)
     @app_commands.rename(event_type="type", template_id="id")
     @app_commands.choices(event_type=EVENT_CHOICES)
+    @app_commands.describe(event_type="Event the template belongs to", template_id="Template ID from /birthday templatelist")
     async def birthday_template_remove(self, ctx: commands.Context, event_type: str, template_id: int) -> None:
         lang = await self._lang(ctx.guild)
         if ctx.guild is None:
             await ctx.send(tr(lang, "Use this command in a server.", "Usa este comando en un servidor."))
             return
         try:
-            removed = await self.bot.db.delete_birthday_template(ctx.guild.id, event_type, template_id)
-        except ValueError:
+            removed = await remove_birthday_template(self.bot.db, ctx.guild.id, event_type, template_id)
+        except BirthdayError:
             await ctx.send(tr(lang, "Invalid event type.", "Tipo de evento inválido."))
             return
         if removed:
@@ -1248,31 +1083,31 @@ class BirthdaysCog(commands.Cog):
     @birthday.command(name="blacklistuser", description="Add or remove a user from birthday celebrations.")
     @app_commands.default_permissions(administrator=True)
     @owner_or_has_permissions(administrator=True)
+    @app_commands.describe(user="Member to add or remove", blocked="True to exclude them from celebrations, false to include them again")
     async def birthday_blacklist_user(self, ctx: commands.Context, user: discord.Member, blocked: bool) -> None:
         lang = await self._lang(ctx.guild)
         if ctx.guild is None:
             await ctx.send(tr(lang, "Use this command in a server.", "Usa este comando en un servidor."))
             return
+        await set_birthday_blacklist_user(self.bot.db, ctx.guild.id, user.id, blocked)
         if blocked:
-            await self.bot.db.add_birthday_blacklist_user(ctx.guild.id, user.id)
             await ctx.send(tr(lang, f"{user.mention} added to birthday blacklist.", f"{user.mention} agregado a la blacklist de cumpleaños."))
         else:
-            await self.bot.db.remove_birthday_blacklist_user(ctx.guild.id, user.id)
             await ctx.send(tr(lang, f"{user.mention} removed from birthday blacklist.", f"{user.mention} eliminado de la blacklist de cumpleaños."))
 
     @birthday.command(name="blacklistrole", description="Add or remove a role from birthday celebrations.")
     @app_commands.default_permissions(administrator=True)
     @owner_or_has_permissions(administrator=True)
+    @app_commands.describe(role="Role to add or remove", blocked="True to exclude the role from celebrations, false to include it again")
     async def birthday_blacklist_role(self, ctx: commands.Context, role: discord.Role, blocked: bool) -> None:
         lang = await self._lang(ctx.guild)
         if ctx.guild is None:
             await ctx.send(tr(lang, "Use this command in a server.", "Usa este comando en un servidor."))
             return
+        await set_birthday_blacklist_role(self.bot.db, ctx.guild.id, role.id, blocked)
         if blocked:
-            await self.bot.db.add_birthday_blacklist_role(ctx.guild.id, role.id)
             await ctx.send(tr(lang, f"{role.mention} added to birthday blacklist.", f"{role.mention} agregado a la blacklist de cumpleaños."))
         else:
-            await self.bot.db.remove_birthday_blacklist_role(ctx.guild.id, role.id)
             await ctx.send(tr(lang, f"{role.mention} removed from birthday blacklist.", f"{role.mention} eliminado de la blacklist de cumpleaños."))
 
     @birthday.command(name="trusted", description="Set trusted role behavior for birthday system.")
@@ -1283,6 +1118,7 @@ class BirthdaysCog(commands.Cog):
         prevent_role="blockrole",
         prevent_list="blocklist",
     )
+    @app_commands.describe(role="Trusted role (leave empty to clear)", prevent_message="Skip birthday messages for members without the trusted role", prevent_role="Skip the birthday role for members without the trusted role", prevent_list="Hide members without the trusted role from /birthday next")
     async def birthday_trusted(
         self,
         ctx: commands.Context,
@@ -1295,12 +1131,8 @@ class BirthdaysCog(commands.Cog):
         if ctx.guild is None:
             await ctx.send(tr(lang, "Use this command in a server.", "Usa este comando en un servidor."))
             return
-        updated = await self.bot.db.update_birthday_guild_settings(
-            ctx.guild.id,
-            trusted_role_id=role.id if role is not None else None,
-            trusted_prevent_message=prevent_message,
-            trusted_prevent_role=prevent_role,
-            trusted_prevent_list=prevent_list,
+        updated = await set_birthday_trusted(
+            self.bot.db, ctx.guild.id, role.id if role is not None else None, prevent_message, prevent_role, prevent_list,
         )
         trusted_role = ctx.guild.get_role(int(updated["trusted_role_id"])) if updated.get("trusted_role_id") else None
         embed = discord.Embed(
@@ -1354,6 +1186,305 @@ class BirthdaysCog(commands.Cog):
                 f"El comando de cumpleaños falló: {original}",
             )
         )
+
+class BirthdayError(ValueError):
+    pass
+
+
+def validate_birthday(month: int, day: int, birth_year: int | None) -> None:
+    try:
+        datetime(2000, month, day)  # 2000 is a leap year, so Feb 29 is a valid birthday
+    except ValueError:
+        raise BirthdayError("invalid_date") from None
+    if birth_year is not None and (birth_year < 1900 or birth_year > datetime.now(timezone.utc).year):
+        raise BirthdayError("invalid_year")
+
+
+async def birthday_module_enabled(db, guild_id: int) -> bool:
+    settings = await db.get_or_create_birthday_guild_settings(guild_id)
+    return int(settings.get("enabled", 0)) == 1
+
+
+async def set_birthday(db, guild_id: int, user_id: int, month: int, day: int, birth_year: int | None) -> None:
+    validate_birthday(month, day, birth_year)
+    await db.upsert_birthday_profile(
+        guild_id=guild_id, user_id=user_id, month=month, day=day, birth_year=birth_year, timezone_name=None,
+    )
+
+
+async def remove_birthday(db, guild_id: int, user_id: int) -> bool:
+    return await db.delete_birthday_profile(guild_id, user_id)
+
+
+async def view_birthday(db, guild_id: int, user_id: int) -> dict | None:
+    profile = await db.get_birthday_profile(guild_id, user_id)
+    if profile is None:
+        return None
+    settings = await db.get_or_create_birthday_guild_settings(guild_id)
+    birth_year = profile.get("birth_year")
+    hide_ages = int(settings.get("disable_ages", 0)) == 1
+    return {
+        "month": int(profile["month"]),
+        "day": int(profile["day"]),
+        "birth_year": birth_year if not hide_ages and isinstance(birth_year, int) else None,
+    }
+
+
+async def view_hidden_by_blacklist(db, guild: discord.Guild, member, requester_id: int) -> bool:
+    """A blacklisted member (user or role entry) is never revealed to someone else; one's own profile stays visible."""
+
+    if member.id == requester_id:
+        return False
+    blacklisted_users = set(await db.list_birthday_blacklist_users(guild.id))
+    blacklisted_roles = set(await db.list_birthday_blacklist_roles(guild.id))
+    return member.id in blacklisted_users or any(role.id in blacklisted_roles for role in getattr(member, "roles", ()))
+
+
+async def next_birthdays(db, guild: discord.Guild, count: int) -> list[dict]:
+    count = max(1, min(count, 25))
+    settings = await db.get_or_create_birthday_guild_settings(guild.id)
+    tz_name = str(settings.get("server_timezone", "UTC") or "UTC")
+    try:
+        server_tz = ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        server_tz = ZoneInfo("UTC")
+    now_local = datetime.now(timezone.utc).astimezone(server_tz)
+    blacklisted_users = set(await db.list_birthday_blacklist_users(guild.id))
+    blacklisted_roles = set(await db.list_birthday_blacklist_roles(guild.id))
+    rows: list[tuple[tuple[int, int], dict]] = []
+    for profile in await db.list_birthday_profiles(guild.id):
+        member = guild.get_member(int(profile["user_id"]))
+        if member is None or member.bot:
+            continue
+        if await BirthdaysCog._member_is_blacklisted(
+            guild=guild, member=member, blacklisted_users=blacklisted_users, blacklisted_roles=blacklisted_roles,
+        ):
+            continue
+        if not await BirthdaysCog._is_trusted_allowed(guild=guild, member=member, settings=settings, check_kind="list"):
+            continue
+        month = int(profile["month"])
+        day = int(profile["day"])
+        year, ordinal = BirthdaysCog._next_occurrence_key(month, day, now_local)
+        days_until = ((datetime(year, 1, 1) + timedelta(days=ordinal - 1)).date() - now_local.date()).days
+        rows.append(((year, ordinal), {"member": member, "month": month, "day": day, "days_until": days_until}))
+    rows.sort(key=lambda item: item[0])
+    return [item[1] for item in rows[:count]]
+
+
+def validate_timezone(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    try:
+        ZoneInfo(value)
+    except ZoneInfoNotFoundError:
+        return None
+    return value
+
+
+def normalize_hex_color(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    value = raw.strip()
+    if value.lower() in {"", "clear", "reset", "none", "-"}:
+        return ""
+    if not re.fullmatch(r"#?[0-9a-fA-F]{6}", value):
+        return None
+    if not value.startswith("#"):
+        value = f"#{value}"
+    return value.lower()
+
+
+def normalize_optional_text(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    value = raw.strip()
+    if value.lower() in {"", "clear", "reset", "none", "-"}:
+        return ""
+    return value
+
+
+def event_target(key: str) -> tuple[str, str] | None:
+    if key in {"birthday_year", "year"}:
+        return "birthday", "year"
+    if key in {"birthday_default", "default", "birthday"}:
+        return "birthday", "default"
+    if key in {"member_anniversary", "join"}:
+        return "member_anniversary", "default"
+    if key in {"server_anniversary", "server"}:
+        return "server_anniversary", "default"
+    return None
+
+
+async def set_birthday_timezone(db, guild_id: int, raw: str | None) -> str:
+    tz = validate_timezone(raw)
+    if tz is None:
+        raise BirthdayError("invalid_timezone")
+    await db.update_birthday_guild_settings(guild_id, server_timezone=tz)
+    return tz
+
+
+async def set_birthday_mode(db, guild_id: int, raw: str) -> str:
+    mode = raw.strip().lower()
+    if mode not in {"user", "server"}:
+        raise BirthdayError("invalid_mode")
+    await db.update_birthday_guild_settings(guild_id, birthday_timezone_mode=mode)
+    return mode
+
+
+async def set_birthday_ages(db, guild_id: int, enabled: bool) -> None:
+    """The stored column is the inverse (disable_ages)."""
+
+    await db.update_birthday_guild_settings(guild_id, disable_ages=not enabled)
+
+
+async def set_birthday_event(
+    db, guild_id: int, event_key: str, color: str | None, image: str | None, message: str | None,
+) -> tuple[str | None, str, dict]:
+    key = (event_key or "").strip().lower()
+    if key == "disable":
+        await db.update_birthday_guild_settings(guild_id, enabled=False)
+        return None, "default", {}
+    target = event_target(key)
+    if target is None:
+        raise BirthdayError("invalid_event")
+    event_type, variant = target
+    normalized_color = normalize_hex_color(color)
+    if color is not None and normalized_color is None:
+        raise BirthdayError("invalid_color")
+    normalized_message = normalize_optional_text(message)
+    update_kwargs: dict[str, object] = {
+        "enabled": True,
+        "message_mode": "embed",
+        "embed_color": normalized_color,
+        "embed_image_url": normalize_optional_text(image),
+    }
+    if normalized_message is not None:
+        update_kwargs["birthday_message_with_age" if variant == "year" else "birthday_message_no_year"] = normalized_message
+    try:
+        return event_type, variant, await db.update_birthday_event_settings(guild_id, event_type, **update_kwargs)
+    except ValueError:
+        raise BirthdayError("invalid_event") from None
+
+
+BIRTHDAY_TEMPLATE_LIMIT = 100
+
+
+async def add_birthday_template(db, guild_id: int, event_type: str, text: str) -> int:
+    clean = text.strip()
+    if not clean:
+        raise BirthdayError("empty_template")
+    try:
+        current = await db.count_birthday_templates(guild_id, event_type)
+    except ValueError:
+        raise BirthdayError("invalid_event") from None
+    if current >= BIRTHDAY_TEMPLATE_LIMIT:
+        raise BirthdayError("template_limit_reached")
+    return await db.add_birthday_template(guild_id, event_type, clean)
+
+
+async def list_birthday_templates(db, guild_id: int, event_type: str) -> list[dict]:
+    try:
+        return await db.list_birthday_templates(guild_id, event_type)
+    except ValueError:
+        raise BirthdayError("invalid_event") from None
+
+
+async def remove_birthday_template(db, guild_id: int, event_type: str, template_id: int) -> bool:
+    try:
+        return await db.delete_birthday_template(guild_id, event_type, template_id)
+    except ValueError:
+        raise BirthdayError("invalid_event") from None
+
+
+async def set_birthday_blacklist_user(db, guild_id: int, user_id: int, blocked: bool) -> None:
+    if blocked:
+        await db.add_birthday_blacklist_user(guild_id, user_id)
+    else:
+        await db.remove_birthday_blacklist_user(guild_id, user_id)
+
+
+async def set_birthday_blacklist_role(db, guild_id: int, role_id: int, blocked: bool) -> None:
+    if blocked:
+        await db.add_birthday_blacklist_role(guild_id, role_id)
+    else:
+        await db.remove_birthday_blacklist_role(guild_id, role_id)
+
+
+async def set_birthday_trusted(
+    db, guild_id: int, role_id: int | None, prevent_message: bool, prevent_role: bool, prevent_list: bool,
+) -> dict:
+    return await db.update_birthday_guild_settings(
+        guild_id, trusted_role_id=role_id, trusted_prevent_message=prevent_message,
+        trusted_prevent_role=prevent_role, trusted_prevent_list=prevent_list,
+    )
+
+
+async def preview_channel(db, guild: discord.Guild, channel) -> discord.TextChannel | None:
+    if isinstance(channel, discord.TextChannel):
+        return channel
+    config_channel_id = (await db.get_or_create_birthday_guild_settings(guild.id)).get("channel_id")
+    if isinstance(config_channel_id, int):
+        configured = guild.get_channel(config_channel_id)
+        if isinstance(configured, discord.TextChannel):
+            return configured
+    return None
+
+
+async def preview_birthday_event(
+    cog: BirthdaysCog, guild: discord.Guild, author, channel: discord.TextChannel, preview_type: str, lang: str,
+) -> None:
+    normalized = (preview_type or "").strip().lower()
+    target_event_type = ""
+    preview_age: int | None = None
+    preview_year_value: int | None = None
+    preview_member = author if isinstance(author, discord.Member) else None
+
+    if normalized in {"default", "birthday", "birthday_default"}:
+        target_event_type = "birthday"
+    elif normalized in {"year", "birthday_year"}:
+        target_event_type = "birthday"
+        now_year = datetime.now(timezone.utc).year
+        preview_age = 24
+        preview_year_value = now_year - preview_age
+        if preview_member is not None:
+            profile = await cog.bot.db.get_birthday_profile(guild.id, preview_member.id)
+            if profile is not None:
+                birth_year = profile.get("birth_year")
+                if isinstance(birth_year, int):
+                    computed_age = now_year - birth_year
+                    if computed_age > 0:
+                        preview_age = computed_age
+                        preview_year_value = birth_year
+    elif normalized in {"server", "server_anniversary"}:
+        target_event_type = "server_anniversary"
+        created_year = guild.created_at.year
+        preview_year_value = max(1, datetime.now(timezone.utc).year - created_year)
+    elif normalized in {"user", "join", "member_anniversary"}:
+        target_event_type = "member_anniversary"
+        if preview_member is not None and preview_member.joined_at is not None:
+            preview_year_value = max(1, datetime.now(timezone.utc).year - preview_member.joined_at.year)
+        else:
+            preview_year_value = 1
+
+    if not target_event_type:
+        raise BirthdayError("invalid_preview")
+
+    event_settings = await cog.bot.db.get_or_create_birthday_event_settings(guild.id, target_event_type)
+    await cog._send_event_announcement(
+        guild=guild,
+        event_type=target_event_type,
+        channel=channel,
+        event_settings=event_settings,
+        member=preview_member,
+        age=preview_age,
+        year_value=preview_year_value,
+        lang=lang,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(BirthdaysCog(bot))

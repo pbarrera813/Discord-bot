@@ -5,7 +5,6 @@ from typing import Any
 
 
 UNIT_ALIASES: dict[str, str] = {
-    # Length
     "m": "meter",
     "meter": "meter",
     "meters": "meter",
@@ -41,7 +40,6 @@ UNIT_ALIASES: dict[str, str] = {
     "yd": "yard",
     "yard": "yard",
     "yards": "yard",
-    # Weight
     "g": "gram",
     "gram": "gram",
     "grams": "gram",
@@ -63,7 +61,6 @@ UNIT_ALIASES: dict[str, str] = {
     "ounces": "ounce",
     "onza": "ounce",
     "onzas": "ounce",
-    # Volume
     "l": "liter",
     "liter": "liter",
     "liters": "liter",
@@ -79,7 +76,6 @@ UNIT_ALIASES: dict[str, str] = {
     "gallons": "gallon",
     "galon": "gallon",
     "galones": "gallon",
-    # Temperature
     "c": "celsius",
     "celsius": "celsius",
     "centigrade": "celsius",
@@ -88,7 +84,6 @@ UNIT_ALIASES: dict[str, str] = {
     "fahrenheit": "fahrenheit",
     "k": "kelvin",
     "kelvin": "kelvin",
-    # Time
     "s": "second",
     "sec": "second",
     "second": "second",
@@ -160,7 +155,7 @@ def _to_number(value: Any) -> float | None:
 
 
 def extract_target_conversion(data: Any, target_unit: str) -> tuple[float | None, str | None]:
-    target = normalize_requested_unit(target_unit)
+    target = normalize_unit_name(target_unit)
 
     if isinstance(data, dict):
         conversions = data.get("conversions")
