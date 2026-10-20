@@ -18,24 +18,11 @@ MEMORY_TYPES: Final[set[str]] = {
     "CHANNEL_CONTEXT",
     "FOOTBALL_PREFERENCE",
 }
-MEMORY_STATUSES: Final[set[str]] = {"active", "pending", "rejected", "archived", "expired"}
-AFFIRMATIVE_RESPONSES: Final[set[str]] = {
-    "si",
-    "sí",
-    "ok",
-    "va",
-    "va ta bien",
-    "ta bien",
-    "simon",
-    "simón",
-    "dale",
-    "jalo",
-    "no hay pedo",
-    "me parece",
-    "esta bien",
-    "está bien",
-}
-NEGATIVE_RESPONSES: Final[set[str]] = {"no", "nel", "nah", "no quiero", "ni madres", "mejor no"}
+MEMORY_STATUSES: Final[set[str]] = {"active", "pending", "rejected", "expired"}
+# Memories about a person that the person themselves may approve or reject (administrators decide everything else).
+SELF_DECIDABLE_MEMORY_TYPES: Final[frozenset[str]] = frozenset(
+    {"USER_NICKNAME", "USER_ALIAS", "USER_PREFERENCE", "FOOTBALL_PREFERENCE", "SERVER_FACT", "INSIDE_JOKE"}
+)
 
 
 @dataclass(frozen=True)
@@ -143,19 +130,8 @@ class ServerMemoryService:
     async def list_user_memories(self, guild_id: int, user_id: int) -> list[dict[str, Any]]:
         return await self.list_memories(guild_id, subject_user_id=user_id)
 
-    async def list_pending_memories(self, guild_id: int) -> list[dict[str, Any]]:
-        return await self.list_memories(guild_id, status="pending")
-
-    async def update_memory(self, guild_id: int, memory_id: int, *, value: str, key: str | None = None) -> bool:
-        return await self.db.update_server_memory_value(
-            memory_id,
-            guild_id=guild_id,
-            value=self.clean_value(value),
-            key=self.normalize_key(key) if key else None,
-        )
-
-    async def archive_memory(self, guild_id: int, memory_id: int) -> bool:
-        return await self.db.update_server_memory_status(memory_id, guild_id=guild_id, status="archived")
+    async def delete_memory(self, guild_id: int, memory_id: int) -> bool:
+        return await self.db.delete_server_memory(memory_id, guild_id=guild_id)
 
     async def approve_memory(self, guild_id: int, memory_id: int, approver_user_id: int) -> bool:
         return await self.db.update_server_memory_status(
@@ -183,39 +159,10 @@ class ServerMemoryService:
         return await self.db.count_server_memories_by_status(guild_id)
 
     @classmethod
-    def should_require_approval(cls, memory_type: str, value: str, *, created_for_other: bool) -> bool:
-        if memory_type not in {"USER_NICKNAME", "USER_ALIAS"}:
-            return False
-        lowered = value.casefold()
-        conflict_words = {
-            "pendej",
-            "idiot",
-            "stupid",
-            "dumb",
-            "puta",
-            "puto",
-            "mierda",
-            "doxx",
-            "dox",
-            "address",
-            "telefono",
-            "teléfono",
-        }
-        return created_for_other and any(word in lowered for word in conflict_words)
-
-    @staticmethod
-    def classify_approval_text(content: str) -> str | None:
-        normalized = ServerMemoryService.normalize_phrase(content)
-        if normalized in AFFIRMATIVE_RESPONSES:
-            return "approve"
-        if normalized in NEGATIVE_RESPONSES:
-            return "reject"
-        return None
-
-    @staticmethod
-    def normalize_phrase(value: str) -> str:
-        cleaned = re.sub(r"[.,!¡¿?;:]+", " ", value.casefold())
-        return " ".join(cleaned.split())
+    def should_require_approval(cls, memory_type: str, *, author_can_manage: bool, subject_is_author: bool) -> bool:
+        # Only an administrator, or a member recording a personal memory about themselves, is saved without approval;
+        # anything about someone else, or about nobody identified, waits for an administrator or the person it is about.
+        return not (author_can_manage or (subject_is_author and memory_type in SELF_DECIDABLE_MEMORY_TYPES))
 
     @staticmethod
     def normalize_memory_type(value: str) -> str:

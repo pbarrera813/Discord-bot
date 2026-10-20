@@ -9,10 +9,11 @@ import re
 import discord
 from discord.ext import commands, tasks
 
+from services.admin_actions import AdminActionResult, AdminActionService
 from services.database import AI_INTERACTIONS_CONTEXT_CHANNEL_ID
 from services.server_memory import ServerMemoryInput, ServerMemoryService
 from services.voice_messages import ALLOWED_TTS_TAGS
-from utils.i18n import normalize_language, tr
+from utils.i18n import tr
 from utils.permissions import owner_or_has_permissions
 
 HELP_SECTION_ALIASES: dict[str, str] = {
@@ -125,23 +126,6 @@ class HelpCapabilitySpec:
     body_es: str
     access: str = "everyone"
 
-
-HELP_ACCESS_EN: dict[str, str] = {
-    "everyone": "",
-    "manage_messages": "Requires Manage Messages.",
-    "moderator": "Requires moderator permissions.",
-    "manage_guild": "Requires Manage Server or Administrator.",
-    "administrator": "Requires Administrator.",
-}
-
-HELP_ACCESS_ES: dict[str, str] = {
-    "everyone": "",
-    "manage_messages": "Requiere Gestionar mensajes.",
-    "moderator": "Requiere permisos de moderación.",
-    "manage_guild": "Requiere Gestionar servidor o Administrador.",
-    "administrator": "Requiere Administrador.",
-}
-
 HELP_INTENTIONAL_EXCLUSIONS: dict[str, str] = {}
 
 
@@ -149,7 +133,7 @@ HELP_COMMANDS: tuple[HelpCommandSpec, ...] = (
     HelpCommandSpec("help", "general", "/help [section]", "/help [sección]", "Open this paginated guide.", "Abre esta guía por páginas."),
     HelpCommandSpec("setup", "general", "/setup", "/setup", "Show setup and capability summary.", "Muestra resumen de configuración y capacidades."),
     HelpCommandSpec("translate", "general", "/translate <language> [text]", "/translate <idioma> [texto]", "Translate provided or replied text.", "Traduce texto escrito o respondido."),
-    HelpCommandSpec("roast", "fun", "/roast <user|id|name>", "/roast <usuario|id|nombre>", "Playful AI roast using server vibe.", "Roast juguetón con la vibra del servidor."),
+    HelpCommandSpec("roast", "fun", "/roast <user|id|name>", "/roast <usuario|id|nombre>", "Roast a user directly based on the server's context.", "Roastea a un usuario directamente con base en el contexto del servidor."),
     HelpCommandSpec("roastme", "fun", "/roastme", "/roastme", "Roast yourself.", "Roast para ti."),
     HelpCommandSpec("say", "voice", "/say mensaje:<text> modo:<text|voice>", "/say mensaje:<texto> modo:<text|voice>", "Make Nitori send text or a native voice message.", "Haz que Nitori mande texto o mensaje de voz nativo.", access="manage_messages", material_options=("mensaje", "modo"), material_choices=("modo=text|voice",), show_to_all=True),
     HelpCommandSpec("remindme", "fun", "/remindme <time> <message>", "/remindme <tiempo> <mensaje>", "Create a reminder. Units: m, h, d, w, mo, y.", "Crea un recordatorio. Unidades: m, h, d, w, mo, y."),
@@ -189,6 +173,13 @@ HELP_COMMANDS: tuple[HelpCommandSpec, ...] = (
     HelpCommandSpec("football top", "sports", "/football top <scorers|assists|yellowcards|redcards>", "/football top <scorers|assists|yellowcards|redcards>", "Top scorers, assists, yellow cards, or red cards.", "Líderes de goles, asistencias, amarillas o rojas.", material_choices=("scorers", "assists", "yellowcards", "redcards")),
     HelpCommandSpec("football preview", "sports", "/football preview <fixture_id>", "/football preview <fixture_id>", "Data-only match preview.", "Previa del partido con datos."),
     HelpCommandSpec("football summary", "sports", "/football summary <fixture_id>", "/football summary <fixture_id>", "Data-only match summary.", "Resumen del partido con datos."),
+    HelpCommandSpec("football odds", "sports", "/football odds [fixture_id] [league] [date] [bookmaker] [bet] [page]", "/football odds [fixture_id] [liga] [fecha] [bookmaker] [apuesta] [pagina]", "Pre-match odds.", "Cuotas previas al partido."),
+    HelpCommandSpec("football live-odds", "sports", "/football live-odds [fixture_id] [league] [bet]", "/football live-odds [fixture_id] [liga] [apuesta]", "In-play odds.", "Cuotas en vivo."),
+    HelpCommandSpec("football odds-reference", "sports", "/football odds-reference <scope> [query]", "/football odds-reference <alcance> [busqueda]", "Bookmaker and odds-market reference IDs.", "IDs de bookmakers y mercados."),
+    HelpCommandSpec("football odds-mapping", "sports", "/football odds-mapping [page]", "/football odds-mapping [pagina]", "Fixtures available for pre-match odds.", "Partidos disponibles para cuotas previas."),
+    HelpCommandSpec("football timezones", "sports", "/football timezones", "/football timezones", "API-Football timezone catalog.", "Catalogo de zonas horarias."),
+    HelpCommandSpec("football countries", "sports", "/football countries [filter] [query]", "/football countries [filtro] [busqueda]", "API-Football country catalog.", "Catalogo de paises."),
+    HelpCommandSpec("football seasons", "sports", "/football seasons", "/football seasons", "API-Football season catalog.", "Catalogo de temporadas."),
     HelpCommandSpec("birthday", "birthday", "/birthday", "/birthday", "Birthday command prompt.", "Ayuda rápida de cumpleaños."),
     HelpCommandSpec("birthday set", "birthday", "/birthday set <MM-DD|DD/MM> [year]", "/birthday set <MM-DD|DD/MM> [año]", "Save your birthday.", "Guarda tu cumpleaños."),
     HelpCommandSpec("birthday remove", "birthday", "/birthday remove", "/birthday remove", "Remove your birthday data.", "Elimina tus datos de cumpleaños."),
@@ -255,7 +246,7 @@ HELP_COMMANDS: tuple[HelpCommandSpec, ...] = (
     HelpCommandSpec("servercontext", "admin", "/servercontext", "/servercontext", "View structured server memory.", "Muestra memoria estructurada.", access="manage_guild"),
     HelpCommandSpec("servercontext view", "admin", "/servercontext view", "/servercontext view", "View structured server memory.", "Muestra memoria estructurada.", access="manage_guild"),
     HelpCommandSpec("servercontext remember", "admin", "/servercontext remember <type> <value> [user] [channel] [key]", "/servercontext remember <tipo> <valor> [usuario] [canal] [key]", "Store structured server memory.", "Guarda memoria estructurada.", access="manage_guild"),
-    HelpCommandSpec("servercontext forget", "admin", "/servercontext forget <memory_id>", "/servercontext forget <memory_id>", "Archive a memory.", "Archiva una memoria.", access="manage_guild"),
+    HelpCommandSpec("servercontext forget", "admin", "/servercontext forget <memory_id>", "/servercontext forget <memory_id>", "Delete a memory.", "Elimina una memoria.", access="manage_guild"),
     HelpCommandSpec("servercontext list", "admin", "/servercontext list [type] [status]", "/servercontext list [tipo] [estado]", "List memories.", "Lista memorias.", access="manage_guild"),
     HelpCommandSpec("servercontext user", "admin", "/servercontext user <user>", "/servercontext user <usuario>", "List user memories.", "Lista memorias de usuario.", access="manage_guild"),
     HelpCommandSpec("servercontext approve", "admin", "/servercontext approve <memory_id>", "/servercontext approve <memory_id>", "Approve pending memory.", "Aprueba memoria pendiente.", access="manage_guild"),
@@ -284,13 +275,10 @@ HELP_COMMANDS: tuple[HelpCommandSpec, ...] = (
 
 
 HELP_CAPABILITIES: tuple[HelpCapabilitySpec, ...] = (
-    HelpCapabilitySpec("ai_conversation", "general", "AI Conversation", "Conversación IA", "Mention Nitori, address it by name, reply to one of its AI messages, or continue a fresh same-user thread. Slash-command result embeds are ignored unless you explicitly mention Nitori in the reply.", "Menciona a Nitori, háblale por nombre, responde a uno de sus mensajes IA o continúa una conversación reciente. Las respuestas a embeds de comandos se ignoran salvo que menciones a Nitori explícitamente."),
-    HelpCapabilitySpec("image_context", "general", "Images", "Imágenes", "Nitori can analyze supported current/replied images and can generate or edit images when directly asked.", "Nitori puede analizar imágenes actuales/respondidas y generar o editar imágenes cuando se lo pides directamente."),
-    HelpCapabilitySpec("web_lookup", "utility", "Current Web Lookup", "Búsqueda web actual", "When web search is enabled, direct current/freshness questions can use web lookup. Normal chat does not browse automatically.", "Cuando la búsqueda web está activada, preguntas directas sobre información actual pueden usar web. El chat normal no navega automáticamente."),
-    HelpCapabilitySpec("football_ai", "sports", "Natural Football Questions", "Preguntas naturales de fútbol", "You can ask football questions in normal language. Nitori resolves teams, players, leagues, fixtures, dates, stats, standings, events, lineups, transfers, injuries, and match-center details through API-Football.", "Puedes hacer preguntas de fútbol en lenguaje natural. Nitori resuelve equipos, jugadores, ligas, partidos, fechas, estadísticas, tablas, eventos, alineaciones, transferencias, lesiones y centros de partido con API-Football."),
-    HelpCapabilitySpec("football_watch", "sports", "Live Watch", "Seguimiento en vivo", "Ask Nitori to follow a live match for compact updates. One AI-started watch can run per channel and stops at final time or timeout.", "Pídele a Nitori seguir un partido en vivo para actualizaciones compactas. Puede haber un seguimiento IA por canal y se detiene al final o por timeout."),
-    HelpCapabilitySpec("voice_conversation", "voice", "Conversational Voice", "Voz conversacional", "Any normal user can explicitly ask for the current AI response as a native Discord voice message. Voice applies to that one response only; the next turn returns to text unless voice is requested again.", "Cualquier usuario normal puede pedir explícitamente que la respuesta IA actual se entregue como mensaje de voz nativo de Discord. La voz aplica solo a esa respuesta; el siguiente turno vuelve a texto salvo que se pida voz otra vez."),
-    HelpCapabilitySpec("voice_tts", "voice", "TTS Details", "Detalles TTS", "Voice uses the configured xAI TTS voice, currently Iris with es-MX. It sends native Discord voice messages, not Discord tts=true and not voice-channel playback.", "La voz usa la voz xAI TTS configurada, actualmente Iris con es-MX. Envía mensajes de voz nativos de Discord, no Discord tts=true ni reproducción en canal de voz."),
+    HelpCapabilitySpec("ai_conversation", "general", "AI Conversation", "Conversación IA", "Mention Nitori directly to talk to her. You can also say her name, or keep a conversation going by replying to her messages.", "Menciona directamente a Nitori para hablar con ella. También puedes decir su nombre o continuar una conversación respondiendo a sus mensajes."),
+    HelpCapabilitySpec("image_context", "general", "Images", "Imágenes", "Nitori can analyze, create, or edit images when prompted to.", "Nitori puede analizar, crear o editar imágenes cuando se lo pidas."),
+    HelpCapabilitySpec("football_ai", "sports", "Football Questions", "Preguntas de fútbol", "You can tag Nitori and ask for the same player, team, league, match, and stat information supported by the commands. You can also ask her to follow a currently live match minute by minute.", "Puedes etiquetar a Nitori y preguntarle por la misma información de jugadores, equipos, ligas, partidos y estadísticas que soportan los comandos. También puedes pedirle que siga minuto a minuto un partido que esté en vivo."),
+    HelpCapabilitySpec("voice_conversation", "voice", "Conversational Voice", "Voz conversacional", "Nitori can also send voice messages when prompted; just ask her to do it.", "Nitori también puede enviar mensajes de voz cuando se lo pidas; solo tienes que pedírselo."),
     HelpCapabilitySpec("voice_tags", "voice", "Expressive Tags", "Etiquetas expresivas", "In voice delivery, supported xAI expressive tags may be used when semantically appropriate: " + ", ".join(f"`[{tag}]`" for tag in sorted(ALLOWED_TTS_TAGS)), "En respuestas de voz, se pueden usar etiquetas expresivas de xAI cuando tengan sentido: " + ", ".join(f"`[{tag}]`" for tag in sorted(ALLOWED_TTS_TAGS))),
 )
 
@@ -418,17 +406,8 @@ class AdminCog(commands.Cog):
             await ctx.send("This command can only be used in a server.")
             return
 
-        new_prefix = new_prefix.strip()
-        if not new_prefix:
-            await ctx.send("Prefix cannot be empty.")
-            return
-        if len(new_prefix) > 5:
-            await ctx.send("Prefix is too long. Use up to 5 characters.")
-            return
-
-        await self.bot.db.get_or_create_guild_settings(guild.id)
-        await self.bot.db.set_prefix(guild.id, new_prefix)
-        await ctx.send(f"Prefix updated to `{new_prefix}`.")
+        result = await AdminActionService(self.bot).set_prefix(guild, ctx.author, new_prefix)
+        await ctx.send(result.message)
 
     async def _collect_channel_messages(
         self, channel: discord.TextChannel, lang: str
@@ -754,6 +733,7 @@ class AdminCog(commands.Cog):
 
     @commands.hybrid_command(name="setmodlog", description="Set the moderation log channel.")
     @owner_or_has_permissions(manage_guild=True)
+    @discord.app_commands.describe(channel="Channel to send moderation logs to (leave empty to clear)")
     async def set_modlog(
         self, ctx: commands.Context, channel: discord.TextChannel | None = None
     ) -> None:
@@ -762,25 +742,27 @@ class AdminCog(commands.Cog):
             await ctx.send("This command can only be used in a server.")
             return
 
-        await self.bot.db.get_or_create_guild_settings(guild.id)
-        await self.bot.db.set_modlog_channel(guild.id, channel.id if channel else None)
-        if channel is None:
-            await ctx.send("Mod-log channel cleared.")
-            return
-        await ctx.send(f"Mod-log channel set to {channel.mention}.")
+        result = await AdminActionService(self.bot).set_modlog_channel(guild, ctx.author, channel)
+        await ctx.send(result.message)
 
     @commands.hybrid_command(
         name="setprefix", description="Set the text command prefix for this server."
     )
     @owner_or_has_permissions(manage_guild=True)
+    @discord.app_commands.describe(prefix="New text command prefix, up to 5 characters (example: !)")
     async def set_prefix(self, ctx: commands.Context, prefix: str) -> None:
         await self._update_prefix(ctx, prefix)
 
     @commands.hybrid_command(
         name="language",
-        description="Set bot language for command responses. Allowed: en, es.",
+        description="Set the language the bot uses for command replies and AI chat (en or es).",
     )
     @owner_or_has_permissions(manage_guild=True)
+    @discord.app_commands.describe(language_code="Language for the bot to use")
+    @discord.app_commands.choices(language_code=[
+        discord.app_commands.Choice(name="en", value="en"),
+        discord.app_commands.Choice(name="es", value="es"),
+    ])
     @discord.app_commands.rename(language_code="language")
     async def language(self, ctx: commands.Context, language_code: str) -> None:
         guild = ctx.guild
@@ -788,27 +770,15 @@ class AdminCog(commands.Cog):
             await ctx.send("This command can only be used in a server.")
             return
 
-        requested = language_code.strip().lower()
-        if requested not in {"en", "es"}:
-            await ctx.send("Invalid language code. Use `en` or `es`.")
-            return
-
-        lang = normalize_language(requested)
-        await self.bot.db.get_or_create_guild_settings(guild.id)
-        await self.bot.db.set_language(guild.id, lang)
-        await ctx.send(
-            tr(
-                lang,
-                f"Bot language updated to `{lang}`.",
-                f"Idioma del bot actualizado a `{lang}`.",
-            )
-        )
+        result = await AdminActionService(self.bot).set_language(guild, ctx.author, language_code)
+        await ctx.send(result.message)
 
     @commands.hybrid_command(
         name="setservercontext",
         description="Analyze one text channel (last 7 days) and update AI server context.",
     )
     @owner_or_has_permissions(manage_guild=True)
+    @discord.app_commands.describe(channel="Text channel to analyze for the server vibe")
     async def set_server_context(
         self, ctx: commands.Context, channel: discord.TextChannel
     ) -> None:
@@ -822,52 +792,60 @@ class AdminCog(commands.Cog):
         if ctx.interaction:
             await ctx.defer()
 
+        result = await self.learn_channel_context(guild, channel, lang)
+        await ctx.send(result.message)
+
+    async def learn_channel_context(self, guild: discord.Guild, channel: discord.TextChannel, lang: str) -> AdminActionResult:
         try:
             summary = await self._summarize_channel_context(
                 channel=channel,
                 lang=lang,
             )
         except discord.Forbidden:
-            await ctx.send(
+            return AdminActionResult(
+                False,
                 tr(
                     lang,
                     "I do not have permission to read message history in that channel.",
                     "No tengo permisos para leer el historial de mensajes en ese canal.",
-                )
+                ),
+                "context_read_forbidden",
             )
-            return
         except discord.HTTPException:
             logging.exception("Failed to read channel history for context in guild=%s", guild.id)
-            await ctx.send(
+            return AdminActionResult(
+                False,
                 tr(
                     lang,
                     "Failed to read channel history.",
                     "No se pudo leer el historial del canal.",
-                )
+                ),
+                "context_read_failed",
             )
-            return
         except Exception:
             logging.exception("Failed to summarize server context in guild=%s", guild.id)
-            await ctx.send(
+            return AdminActionResult(
+                False,
                 tr(
                     lang,
                     "Failed to analyze channel context right now. Try again in a moment.",
                     "No se pudo analizar el contexto del canal en este momento. Intenta de nuevo en un momento.",
-                )
+                ),
+                "context_analysis_failed",
             )
-            return
 
         if not summary:
-            await ctx.send(
+            return AdminActionResult(
+                False,
                 tr(
                     lang,
                     "I could not find enough user messages from the last 7 days in that channel. "
                     "If the channel is old/inactive, choose a more active one.",
                     "No encontré suficientes mensajes de usuarios de los últimos 7 días en ese canal. "
                     "Si el canal es antiguo o inactivo, elige uno más activo.",
-                )
+                ),
+                "context_not_enough_messages",
             )
-            return
 
         await self.bot.db.upsert_server_context_entry(
             guild_id=guild.id,
@@ -877,12 +855,15 @@ class AdminCog(commands.Cog):
             max_entries=2,
         )
 
-        await ctx.send(
+        return AdminActionResult(
+            True,
             tr(
                 lang,
                 "I now understand how the people in the server behave, I will talk like you from now!",
                 "Ahora entiendo cómo se comporta la gente en el servidor, ¡hablaré como ustedes de ahora en adelante!",
-            )
+            ),
+            "server_context_learned",
+            data={"channel_id": channel.id},
         )
 
     @commands.hybrid_command(
@@ -890,6 +871,12 @@ class AdminCog(commands.Cog):
         description="Reset AI server context and stored AI conversation memory.",
     )
     @discord.app_commands.describe(scope="What to reset: summaries, memory, ai_history, or all.")
+    @discord.app_commands.choices(scope=[
+        discord.app_commands.Choice(name="summaries", value="summaries"),
+        discord.app_commands.Choice(name="memory", value="memory"),
+        discord.app_commands.Choice(name="ai_history", value="ai_history"),
+        discord.app_commands.Choice(name="all", value="all"),
+    ])
     @owner_or_has_permissions(manage_guild=True)
     async def reset_server_context(self, ctx: commands.Context, scope: str = "all") -> None:
         guild = ctx.guild
@@ -898,39 +885,8 @@ class AdminCog(commands.Cog):
             return
 
         lang = await self._lang(guild)
-        scope_key = scope.strip().casefold()
-        if scope_key not in {"summaries", "memory", "ai_history", "all"}:
-            await ctx.send(
-                tr(
-                    lang,
-                    "Invalid scope. Use `summaries`, `memory`, `ai_history`, or `all`.",
-                    "Scope invalido. Usa `summaries`, `memory`, `ai_history` o `all`.",
-                )
-            )
-            return
-        await self._reset_server_context_scope(guild.id, scope_key)
-        await ctx.send(
-            tr(
-                lang,
-                f"AI server context reset complete for scope `{scope_key}`.",
-                f"Reinicio de contexto IA completado para scope `{scope_key}`.",
-            )
-        )
-
-    async def _reset_server_context_scope(self, guild_id: int, scope: str) -> None:
-        if scope == "all":
-            await self.bot.db.reset_ai_server_context(guild_id)
-            await ServerMemoryService(self.bot.db).clear_memories(guild_id)
-        elif scope == "summaries":
-            await self.bot.db.reset_server_context_summaries(guild_id)
-        elif scope == "memory":
-            await ServerMemoryService(self.bot.db).clear_memories(guild_id)
-        elif scope == "ai_history":
-            await self.bot.db.reset_ai_conversation_turns(guild_id)
-        if scope in {"all", "ai_history"}:
-            ai_cog = self.bot.get_cog("AIChatCog")
-            if ai_cog is not None and hasattr(ai_cog, "clear_guild_history"):
-                ai_cog.clear_guild_history(guild_id)
+        result = await AdminActionService(self.bot).reset_server_context(guild, ctx.author, scope, lang=lang)
+        await ctx.send(result.message)
 
     @commands.hybrid_command(
         name="viewservercontext",
@@ -969,13 +925,24 @@ class AdminCog(commands.Cog):
 
     @server_context_group.command(name="remember", description="Store a structured server memory.")
     @discord.app_commands.describe(
-        memory_type="Type, for example USER_NICKNAME, SERVER_RULE, CHANNEL_CONTEXT.",
+        memory_type="Kind of memory to store",
         value="Value to remember.",
         user="Optional target user.",
         channel="Optional target channel.",
         key="Optional memory key.",
     )
     @owner_or_has_permissions(manage_guild=True)
+    @discord.app_commands.choices(memory_type=[
+        discord.app_commands.Choice(name="USER_NICKNAME", value="USER_NICKNAME"),
+        discord.app_commands.Choice(name="USER_ALIAS", value="USER_ALIAS"),
+        discord.app_commands.Choice(name="USER_PREFERENCE", value="USER_PREFERENCE"),
+        discord.app_commands.Choice(name="SERVER_FACT", value="SERVER_FACT"),
+        discord.app_commands.Choice(name="SERVER_RULE", value="SERVER_RULE"),
+        discord.app_commands.Choice(name="BOT_BEHAVIOR_RULE", value="BOT_BEHAVIOR_RULE"),
+        discord.app_commands.Choice(name="INSIDE_JOKE", value="INSIDE_JOKE"),
+        discord.app_commands.Choice(name="CHANNEL_CONTEXT", value="CHANNEL_CONTEXT"),
+        discord.app_commands.Choice(name="FOOTBALL_PREFERENCE", value="FOOTBALL_PREFERENCE"),
+    ])
     async def server_context_remember(
         self,
         ctx: commands.Context,
@@ -1011,7 +978,7 @@ class AdminCog(commands.Cog):
             return
         await ctx.send(tr(lang, f"Saved structured memory `{row.get('id')}`.", f"Memoria estructurada guardada `{row.get('id')}`."))
 
-    @server_context_group.command(name="forget", description="Archive a structured server memory.")
+    @server_context_group.command(name="forget", description="Delete a structured server memory.")
     @discord.app_commands.describe(memory_id="Memory ID from /servercontext list or view.")
     @owner_or_has_permissions(manage_guild=True)
     async def server_context_forget(self, ctx: commands.Context, memory_id: int) -> None:
@@ -1020,11 +987,28 @@ class AdminCog(commands.Cog):
             await ctx.send("This command can only be used in a server.")
             return
         lang = await self._lang(guild)
-        ok = await ServerMemoryService(self.bot.db).archive_memory(guild.id, memory_id)
-        await ctx.send(tr(lang, "Memory archived." if ok else "Memory not found.", "Memoria archivada." if ok else "Memoria no encontrada."))
+        ok = await ServerMemoryService(self.bot.db).delete_memory(guild.id, memory_id)
+        await ctx.send(tr(lang, "Memory deleted." if ok else "Memory not found.", "Memoria eliminada." if ok else "Memoria no encontrada."))
 
     @server_context_group.command(name="list", description="List structured server memories.")
-    @discord.app_commands.describe(memory_type="Optional memory type.", status="active, pending, rejected, archived, or expired.")
+    @discord.app_commands.describe(memory_type="Only show this kind of memory (optional)", status="Only show memories with this status (default: active)")
+    @discord.app_commands.choices(memory_type=[
+        discord.app_commands.Choice(name="USER_NICKNAME", value="USER_NICKNAME"),
+        discord.app_commands.Choice(name="USER_ALIAS", value="USER_ALIAS"),
+        discord.app_commands.Choice(name="USER_PREFERENCE", value="USER_PREFERENCE"),
+        discord.app_commands.Choice(name="SERVER_FACT", value="SERVER_FACT"),
+        discord.app_commands.Choice(name="SERVER_RULE", value="SERVER_RULE"),
+        discord.app_commands.Choice(name="BOT_BEHAVIOR_RULE", value="BOT_BEHAVIOR_RULE"),
+        discord.app_commands.Choice(name="INSIDE_JOKE", value="INSIDE_JOKE"),
+        discord.app_commands.Choice(name="CHANNEL_CONTEXT", value="CHANNEL_CONTEXT"),
+        discord.app_commands.Choice(name="FOOTBALL_PREFERENCE", value="FOOTBALL_PREFERENCE"),
+    ])
+    @discord.app_commands.choices(status=[
+        discord.app_commands.Choice(name="active", value="active"),
+        discord.app_commands.Choice(name="pending", value="pending"),
+        discord.app_commands.Choice(name="rejected", value="rejected"),
+        discord.app_commands.Choice(name="expired", value="expired"),
+    ])
     @owner_or_has_permissions(manage_guild=True)
     async def server_context_list(self, ctx: commands.Context, memory_type: str = "", status: str = "active") -> None:
         guild = ctx.guild
@@ -1045,6 +1029,7 @@ class AdminCog(commands.Cog):
 
     @server_context_group.command(name="user", description="List structured memories about a user.")
     @owner_or_has_permissions(manage_guild=True)
+    @discord.app_commands.describe(user="Member whose memories to list")
     async def server_context_user(self, ctx: commands.Context, user: discord.Member) -> None:
         guild = ctx.guild
         if guild is None:
@@ -1055,6 +1040,7 @@ class AdminCog(commands.Cog):
 
     @server_context_group.command(name="approve", description="Approve a pending structured memory.")
     @owner_or_has_permissions(manage_guild=True)
+    @discord.app_commands.describe(memory_id="Memory ID from /servercontext list")
     async def server_context_approve(self, ctx: commands.Context, memory_id: int) -> None:
         guild = ctx.guild
         if guild is None:
@@ -1065,6 +1051,7 @@ class AdminCog(commands.Cog):
 
     @server_context_group.command(name="reject", description="Reject a pending structured memory.")
     @owner_or_has_permissions(manage_guild=True)
+    @discord.app_commands.describe(memory_id="Memory ID from /servercontext list")
     async def server_context_reject(self, ctx: commands.Context, memory_id: int) -> None:
         guild = ctx.guild
         if guild is None:
@@ -1074,7 +1061,13 @@ class AdminCog(commands.Cog):
         await ctx.send("Memory rejected." if ok else "Memory not found.")
 
     @server_context_group.command(name="reset", description="Reset one server context scope.")
-    @discord.app_commands.describe(scope="summaries, memory, ai_history, or all.")
+    @discord.app_commands.describe(scope="What to reset: summaries, memory, ai_history, or all.")
+    @discord.app_commands.choices(scope=[
+        discord.app_commands.Choice(name="summaries", value="summaries"),
+        discord.app_commands.Choice(name="memory", value="memory"),
+        discord.app_commands.Choice(name="ai_history", value="ai_history"),
+        discord.app_commands.Choice(name="all", value="all"),
+    ])
     @owner_or_has_permissions(manage_guild=True)
     async def server_context_reset(self, ctx: commands.Context, scope: str = "all") -> None:
         guild = ctx.guild
@@ -1082,24 +1075,8 @@ class AdminCog(commands.Cog):
             await ctx.send("This command can only be used in a server.")
             return
         lang = await self._lang(guild)
-        scope_key = scope.strip().casefold()
-        if scope_key not in {"summaries", "memory", "ai_history", "all"}:
-            await ctx.send(
-                tr(
-                    lang,
-                    "Invalid scope. Use `summaries`, `memory`, `ai_history`, or `all`.",
-                    "Scope invalido. Usa `summaries`, `memory`, `ai_history` o `all`.",
-                )
-            )
-            return
-        await self._reset_server_context_scope(guild.id, scope_key)
-        await ctx.send(
-            tr(
-                lang,
-                f"AI server context reset complete for scope `{scope_key}`.",
-                f"Reinicio de contexto IA completado para scope `{scope_key}`.",
-            )
-        )
+        result = await AdminActionService(self.bot).reset_server_context(guild, ctx.author, scope, lang=lang)
+        await ctx.send(result.message)
 
     @staticmethod
     def _format_server_context_view(
@@ -1203,23 +1180,25 @@ class AdminCog(commands.Cog):
         name="antispam", description="Enable or disable the basic anti-spam filter."
     )
     @owner_or_has_permissions(manage_guild=True)
+    @discord.app_commands.describe(enabled="True to turn the anti-spam filter on, false to turn it off")
     async def antispam(self, ctx: commands.Context, enabled: bool) -> None:
         if ctx.guild is None:
             await ctx.send("This command can only be used in a server.")
             return
-        await self.bot.db.set_anti_spam(ctx.guild.id, enabled)
-        await ctx.send(f"Anti-spam is now {'enabled' if enabled else 'disabled'}.")
+        result = await AdminActionService(self.bot).set_filter(ctx.guild, ctx.author, "spam", enabled)
+        await ctx.send(result.message)
 
     @commands.hybrid_command(
         name="antilink", description="Enable or disable the basic anti-link filter."
     )
     @owner_or_has_permissions(manage_guild=True)
+    @discord.app_commands.describe(enabled="True to turn the anti-link filter on, false to turn it off")
     async def antilink(self, ctx: commands.Context, enabled: bool) -> None:
         if ctx.guild is None:
             await ctx.send("This command can only be used in a server.")
             return
-        await self.bot.db.set_anti_link(ctx.guild.id, enabled)
-        await ctx.send(f"Anti-link is now {'enabled' if enabled else 'disabled'}.")
+        result = await AdminActionService(self.bot).set_filter(ctx.guild, ctx.author, "link", enabled)
+        await ctx.send(result.message)
 
     @commands.hybrid_group(
         name="aichannel",
@@ -1235,47 +1214,30 @@ class AdminCog(commands.Cog):
         description="Allow AI chat/translation in a specific channel.",
     )
     @owner_or_has_permissions(manage_guild=True)
+    @discord.app_commands.describe(channel="Text channel where AI chat and translation are allowed")
     async def aichanneladd(
         self, ctx: commands.Context, channel: discord.TextChannel
     ) -> None:
         if ctx.guild is None:
             await ctx.send("This command can only be used in a server.")
             return
-        await self.bot.db.add_ai_channel(ctx.guild.id, channel.id)
-        await ctx.send(f"AI channel added: {channel.mention}.")
+        result = await AdminActionService(self.bot).add_ai_channel(ctx.guild, ctx.author, channel)
+        await ctx.send(result.message)
 
     @aichannel.command(
         name="remove",
         description="Remove a channel from the AI-allowed channel list.",
     )
     @owner_or_has_permissions(manage_guild=True)
+    @discord.app_commands.describe(channel="Text channel to remove from the AI-allowed list")
     async def aichannelremove(
         self, ctx: commands.Context, channel: discord.TextChannel
     ) -> None:
         if ctx.guild is None:
             await ctx.send("This command can only be used in a server.")
             return
-        scope, allowed_channels = await self.bot.db.get_ai_channel_scope(ctx.guild.id)
-        if scope == "all":
-            await ctx.send(
-                "AI is currently allowed in all channels. Use `/aichannel add` first to enable channel restrictions."
-            )
-            return
-        if channel.id not in allowed_channels:
-            await ctx.send(f"{channel.mention} is not currently in the AI-allowed list.")
-            return
-
-        await self.bot.db.remove_ai_channel(ctx.guild.id, channel.id)
-        scope_after, allowed_after = await self.bot.db.get_ai_channel_scope(ctx.guild.id)
-        if scope_after == "none":
-            await ctx.send(
-                f"AI channel removed: {channel.mention}. AI is now disabled in all channels "
-                "until you add at least one channel with `/aichannel add`."
-            )
-            return
-        await ctx.send(
-            f"AI channel removed: {channel.mention}. Remaining AI-allowed channels: {len(allowed_after)}."
-        )
+        result = await AdminActionService(self.bot).remove_ai_channel(ctx.guild, ctx.author, channel)
+        await ctx.send(result.message)
 
     @aichannel.command(
         name="list",
@@ -1319,8 +1281,8 @@ class AdminCog(commands.Cog):
         if ctx.guild is None:
             await ctx.send("This command can only be used in a server.")
             return
-        await self.bot.db.clear_ai_channels(ctx.guild.id)
-        await ctx.send("AI channel restrictions cleared. AI is now allowed in all channels.")
+        result = await AdminActionService(self.bot).clear_ai_channels(ctx.guild, ctx.author)
+        await ctx.send(result.message)
 
     @commands.hybrid_command(
         name="help",
@@ -1414,6 +1376,19 @@ class AdminCog(commands.Cog):
         normalized = re.sub(r"\s+", " ", normalized)
         return normalized
 
+    def help_text(self, lang: str, member: discord.Member | None, section: str | None = None) -> AdminActionResult:
+        """An exact section key only, never an alias."""
+
+        keys = self._help_section_keys(member)
+        key = str(section or "").strip().casefold()
+        if not key:
+            return AdminActionResult(True, "Help sections", "help_sections", data={"sections": keys})
+        if key not in keys:
+            return AdminActionResult(False, "Unknown help section.", "unknown_help_section", data={"sections": keys})
+        page = self._build_help_pages(lang, member=member)[keys.index(key)]
+        text = "\n".join([str(page.title or ""), str(page.description or ""), *(f"{field.name}\n{field.value}" for field in page.fields)])
+        return AdminActionResult(True, "Help page", "help_page", data={"sections": keys, "section": key, "text": text[:3500]})
+
     def _resolve_help_section(
         self,
         raw_value: str,
@@ -1468,14 +1443,6 @@ class AdminCog(commands.Cog):
         return aliases
 
     @staticmethod
-    def documented_non_command_capabilities() -> set[str]:
-        return {item.key for item in HELP_CAPABILITIES}
-
-    @staticmethod
-    def intentional_help_exclusions() -> dict[str, str]:
-        return dict(HELP_INTENTIONAL_EXCLUSIONS)
-
-    @staticmethod
     def _help_access_allowed(spec: HelpCommandSpec | HelpCapabilitySpec, *, is_admin: bool, is_mod: bool) -> bool:
         if getattr(spec, "show_to_all", False):
             return True
@@ -1487,18 +1454,10 @@ class AdminCog(commands.Cog):
             return is_admin
         return is_mod
 
-    @staticmethod
-    def _help_access_label(lang: str, access: str) -> str:
-        labels = HELP_ACCESS_EN if lang == "en" else HELP_ACCESS_ES
-        return labels.get(access, "")
-
     def _help_command_line(self, spec: HelpCommandSpec, lang: str) -> str:
         usage = spec.usage_en if lang == "en" else spec.usage_es
         description = spec.description_en if lang == "en" else spec.description_es
         line = f"`{usage}` - {description}"
-        access = self._help_access_label(lang, spec.access)
-        if access:
-            line += f" {access}"
         if spec.aliases:
             alias_label = tr(lang, "Aliases", "Aliases")
             rendered = ", ".join(f"`/{alias}`" for alias in spec.aliases)
@@ -1562,7 +1521,7 @@ class AdminCog(commands.Cog):
         capability_lines = self._capability_lines_for_section(section, lang, is_admin=is_admin, is_mod=is_mod)
         command_lines = self._command_lines_for_section(section, lang, is_admin=is_admin, is_mod=is_mod)
         if capability_lines:
-            self._add_help_lines(embed, name=tr(lang, "Capabilities", "Capacidades"), lines=capability_lines)
+            embed.description = "\n".join(capability_lines)
         if command_lines:
             self._add_help_lines(embed, name=tr(lang, "Commands", "Comandos"), lines=command_lines)
         pages.append(embed)
