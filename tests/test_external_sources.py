@@ -364,6 +364,11 @@ class ExternalSourceServiceTests(unittest.IsolatedAsyncioTestCase):
                 url=SOURCE_A,
             ),
             _FakeResponse(
+                body=b"\x89PNG\r\n\x1a\n" + bytes(64),
+                headers={"Content-Type": "image/png"},
+                url=MEDIA_PRIMARY,
+            ),
+            _FakeResponse(
                 body=b'<html><body><article><img src="https://media-b.test/kit.png"></article></body></html>',
                 headers={"Content-Type": "text/html"},
                 url=SOURCE_B,
@@ -398,7 +403,8 @@ class ExternalSourceServiceTests(unittest.IsolatedAsyncioTestCase):
         media = await service.acquire_media_from_web_result(result, required_media_count=1)
 
         self.assertEqual([item.url for item in media], [MEDIA_PRIMARY])
-        self.assertEqual(len(session.calls), 1)
+        self.assertEqual([url for url, _kwargs in session.calls], [SOURCE_A, MEDIA_PRIMARY])
+        self.assertEqual(len(session.responses), 1)
 
     async def test_empty_direct_source_selects_alternate_adapter(self) -> None:
         web = _FakeWebResearch(
