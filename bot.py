@@ -56,6 +56,7 @@ class DiscordModBot(commands.Bot):
             image_model=settings.xai_image_model,
             tts_voice=settings.xai_tts_voice,
             tts_language=settings.xai_tts_language,
+            router_output_token_ceiling=getattr(settings, "xai_router_output_token_ceiling", None),
         )
         self.mc_client = McSrvStatClient()
         self.ninjas_client = (
@@ -67,7 +68,6 @@ class DiscordModBot(commands.Bot):
             GlotClient(
                 settings.glot_api_token,
                 settings.glot_base_url,
-                mode=settings.glot_api_mode,
             )
             if settings.glot_api_token
             else None
@@ -372,12 +372,12 @@ class DiscordModBot(commands.Bot):
 
 
 def main() -> None:
+    settings = load_settings()
     logging.basicConfig(
-        level=logging.INFO,
+        level=settings.nitori_log_level,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
-    settings = load_settings()
     bot = DiscordModBot(settings)
     bot.run(settings.discord_token)
 
