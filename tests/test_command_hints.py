@@ -20,7 +20,7 @@ FIXED_CHOICES: dict[tuple[str, str], set[str]] = {
     ("servercontext list", "memory_type"): set(MEMORY_TYPES),
     ("servercontext remember", "memory_type"): set(MEMORY_TYPES),
     ("football countries", "filter"): {"name", "code", "search"},
-    ("football schedule", "mode"): {"next", "last"},
+    ("football schedule", "date"): {"next", "last"},
     ("football top", "category"): {"scorers", "assists", "yellowcards", "redcards"},
 }
 
