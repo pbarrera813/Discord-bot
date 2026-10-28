@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import logging
 import re
 import unicodedata
@@ -18,6 +19,23 @@ from services.football_api_request_compiler import (
     _make_league_slot,
     _make_player_slot,
     _make_team_slot,
+    validate_positive_int,
+)
+
+
+CANONICAL_FOOTBALL_TIME_SCOPES = frozenset(
+    {
+        "live",
+        "today",
+        "yesterday",
+        "tomorrow",
+        "current",
+        "last_finished_match",
+        "previous_match",
+        "specific_date",
+        "recent_finished",
+        "next_match",
+    }
 )
 
 
@@ -40,6 +58,11 @@ class FootballQuerySpec:
     season_hint: str | None
     live: bool
     time_scope: str | None
+    odds_bookmaker_candidates: tuple[str, ...]
+    odds_bet_candidates: tuple[str, ...]
+    reference_query: str | None
+    country_filter: str | None
+    reference_page: int | None
     source_route: str
     capability_intent: FootballCapabilityIntent | None = None
 
@@ -53,21 +76,35 @@ class FootballQueryOperation:
     country_candidates: tuple[str, ...]
     team_candidates: tuple[str, ...]
     player_candidates: tuple[str, ...]
+    coach_candidates: tuple[str, ...]
+    venue_candidates: tuple[str, ...]
     fixture_focus: str | None
     stat_focus: str | None
     date_hint: str | None
     season_hint: str | None
     live: bool
     time_scope: str | None
+    odds_bookmaker_candidates: tuple[str, ...] = ()
+    odds_bet_candidates: tuple[str, ...] = ()
+    reference_query: str | None = None
+    country_filter: str | None = None
+    reference_page: int | None = None
     spec: FootballQuerySpec | None = None
     league_slots: tuple[LeagueSlot, ...] = ()
     country_slots: tuple[CountrySlot, ...] = ()
     team_slots: tuple[TeamSlot, ...] = ()
     player_slots: tuple[PlayerSlot, ...] = ()
     capability_intent: FootballCapabilityIntent | None = None
+    semantic_source: str = "compatibility"
+    fixture_count: int | None = None
+    fixture_round: str | None = None
 
-
-CompiledFootballOperation = FootballQueryOperation
+    def __post_init__(self) -> None:
+        if self.fixture_count is not None and validate_positive_int(self.fixture_count, "fixture_count") > 50:
+            raise InvalidFootballApiRequest("fixture_count must be between 1 and 50.")
+        if self.fixture_round is not None and (not isinstance(self.fixture_round, str) or
+                not 1 <= len(self.fixture_round.strip()) <= 100 or any(ord(char) < 32 for char in self.fixture_round)):
+            raise InvalidFootballApiRequest("fixture_round must be a provider round name.")
 
 
 @dataclass(frozen=True)
@@ -101,6 +138,7 @@ OPERATION_TYPES = {
     "player_sidelined",
     "player_match_stats",
     "team_squad",
+    "team_seasons",
     "team_season_statistics",
     "team_transfers",
     "team_injuries",
@@ -131,6 +169,7 @@ OPERATION_TYPES = {
     "odds_bookmakers",
     "odds_bets",
     "odds_live_bets",
+    "odds_mapping",
     "league_lookup",
     "top_scorers",
     "top_assists",
@@ -228,15 +267,32 @@ def compile_football_operation(
     plan: dict[str, Any] | None,
     prior_context: str | None = None,
 ) -> FootballQueryOperation:
-    date_correction_only = bool(prior_context) and _request_is_date_correction_only(request)
-    parsed_player = football_resolver.parse_player_query(request)
-    structured_player = _StructuredPlayerExtraction() if str(route_action or "").upper() == "FOOTBALL_COMPARISON" else _structured_player_extraction(request)
+    typed_plan = isinstance(plan, dict) and str(plan.get("semantic_source", "")).strip().lower() == "router"
+    date_correction_only = not typed_plan and bool(prior_context) and _request_is_date_correction_only(request)
+    parsed_player = football_resolver.parse_player_query(request) if not typed_plan else football_resolver.parse_player_query("")
+    structured_player = (
+        _StructuredPlayerExtraction()
+        if typed_plan or str(route_action or "").upper() == "FOOTBALL_COMPARISON"
+        else _structured_player_extraction(request)
+    )
     planned_players = _list(plan, "player_candidates")
     planned_focus = _text(plan, "data_focus")
     planned_teams = _list(plan, "team_candidates")
+    planned_coaches = _list(plan, "coach_candidates")
+    planned_venues = _list(plan, "venue_candidates")
+    coach_candidates = clean_entity_candidates(
+        "coach", planned_coaches, request,
+        allow_contextual=typed_plan,
+        allow_static_alias=not typed_plan,
+    )
+    venue_candidates = clean_entity_candidates(
+        "venue", planned_venues, request,
+        allow_contextual=typed_plan,
+        allow_static_alias=not typed_plan,
+    )
     prior_context_operation = _operation_type_from_prior_context(prior_context)
     text_players = []
-    if not _planned_team_entity_focus(planned_focus, planned_teams):
+    if not typed_plan and not _planned_team_entity_focus(planned_focus, planned_teams):
         text_players = list(structured_player.players) or _player_candidates_from_text(parsed_player, route_action, planned_focus, request)
     prior_context_player = _player_candidate_from_prior_context(prior_context)
     if prior_context_player and (planned_players or text_players):
@@ -250,31 +306,59 @@ def compile_football_operation(
     prior_player_keys = _candidate_keys(prior_player_candidates)
     player_candidates = _dedupe(
         [
-            *clean_entity_candidates("player", [*planned_players, *text_players], request),
+            *clean_entity_candidates(
+                "player", [*planned_players, *text_players], request,
+                allow_contextual=typed_plan,
+                allow_static_alias=not typed_plan,
+            ),
             *prior_player_candidates,
         ]
     )
     has_player_focus = _has_player_focus(route_action, planned_focus, player_candidates, planned_teams)
-    data_focus = _data_focus(plan, route_action, request, has_player_focus)
+    data_focus = _data_focus(plan, route_action, request if not typed_plan else "", has_player_focus)
     if data_focus is None and prior_context_operation in {"league_fixture_results", "team_fixture_result", "fixture_result"} and _request_has_date_correction(request):
         data_focus = "summary"
     route = _route_action_for_focus(route_action, data_focus)
-    operation_type = _operation_type(route, data_focus, request, bool(player_candidates))
+    operation_type = _operation_type(route, data_focus, request if not typed_plan else "", bool(player_candidates))
+    planned_fixture_focus = _text(plan, "fixture_focus")
+    fixture_focus = planned_fixture_focus
+    if typed_plan and str(data_focus or "").casefold() in {"venue", "stadium", "team_venue"}:
+        fixture_focus = _fixture_focus_from_prior_context(prior_context) or planned_fixture_focus
+    if fixture_focus and str(data_focus or "").casefold() in {"venue", "stadium", "team_venue"}:
+        operation_type = "fixture_result"
     planned_leagues = _list(plan, "league_candidates")
-    text_leagues = extract_alias_candidates("league", request)
+    text_leagues = extract_alias_candidates("league", request) if not typed_plan else []
     prior_league = _league_candidate_from_prior_context(prior_context)
     prior_league_candidates = clean_entity_candidates("league", [prior_league] if prior_league and not planned_leagues and not text_leagues else [], request, allow_contextual=True)
     prior_league_keys = _candidate_keys(prior_league_candidates)
+    prior_request = _prior_request_from_context(prior_context)
+    prior_league_keys.update(
+        football_resolver.normalize_key(candidate)
+        for candidate in planned_leagues
+        if (
+            prior_request
+            and _phrase_in_text(candidate, prior_request)
+            and not _phrase_in_text(candidate, request)
+        )
+    )
     league_candidates = _dedupe(
         [
-            *clean_entity_candidates("league", [*planned_leagues, *text_leagues], request),
+            *clean_entity_candidates(
+                "league", [*planned_leagues, *text_leagues], request,
+                allow_contextual=typed_plan,
+                allow_static_alias=not typed_plan,
+            ),
             *prior_league_candidates,
         ]
     )
     if prior_league and not league_candidates and not player_candidates:
         league_candidates = clean_entity_candidates("league", [prior_league], request, allow_contextual=True)
         prior_league_keys = _candidate_keys(league_candidates)
-    country_candidates = clean_entity_candidates("country", _list(plan, "country_candidates"), request)
+    country_candidates = clean_entity_candidates(
+        "country", _list(plan, "country_candidates"), request,
+        allow_contextual=typed_plan,
+        allow_static_alias=not typed_plan,
+    )
     league_scoped_operations = {
         "standings",
         "top_scorers",
@@ -288,7 +372,9 @@ def compile_football_operation(
         "competition_structure",
     }
     derive_team_from_text = not operation_type.startswith("player_") and operation_type not in league_scoped_operations
-    if planned_teams and operation_type in {
+    if typed_plan:
+        team_text_candidates = []
+    elif planned_teams and operation_type in {
         "fixture_prediction",
         "fixture_odds_pre_match",
         "fixture_odds_live",
@@ -311,14 +397,20 @@ def compile_football_operation(
     prior_team_keys = _candidate_keys(prior_team_candidates)
     team_candidates = _dedupe(
         [
-            *clean_entity_candidates("team", [*_list(plan, "team_candidates"), *team_text_candidates], request),
+            *clean_entity_candidates(
+                "team", [*_list(plan, "team_candidates"), *team_text_candidates], request,
+                allow_contextual=typed_plan,
+                allow_static_alias=not typed_plan,
+            ),
             *prior_team_candidates,
         ]
     )
     if prior_teams and not team_candidates and not player_candidates:
         team_candidates = clean_entity_candidates("team", prior_teams, request, allow_contextual=True)
         prior_team_keys = _candidate_keys(team_candidates)
-    if operation_type in league_scoped_operations:
+    if typed_plan:
+        team_candidates = _validate_typed_team_arity(operation_type, team_candidates)
+    if operation_type in league_scoped_operations and not typed_plan:
         team_candidates = []
     if player_candidates:
         player_candidates = _prune_cross_entity_player_candidates(
@@ -350,6 +442,7 @@ def compile_football_operation(
         "league_lookup",
         "team_profile",
         "team_squad",
+        "team_seasons",
         "team_season_statistics",
         "team_injuries",
         "team_transfers",
@@ -361,10 +454,20 @@ def compile_football_operation(
         "h2h",
     }:
         player_candidates = []
-    stat_focus = _text(plan, "stat_focus") or (parsed_player.stat_focus if operation_type.startswith("player_") or operation_type == "player_profile" else None)
-    if operation_type == "fixture_statistics":
+    if typed_plan and operation_type == "fixture_result" and fixture_focus:
+        league_candidates = []
+        country_candidates = []
+        team_candidates = []
+        player_candidates = []
+    stat_focus = _text(plan, "stat_focus") or (parsed_player.stat_focus if not typed_plan and (operation_type.startswith("player_") or operation_type == "player_profile") else None)
+    if not typed_plan and operation_type == "fixture_statistics":
         stat_focus = stat_focus or _stat_focus_from_text(request)
-    time_scope = _time_scope(plan, request, operation_type)
+    time_scope = _time_scope(plan, request if not typed_plan else "", operation_type, typed_plan=typed_plan)
+    odds_bookmaker_candidates = tuple(_list(plan, "bookmaker_candidates"))
+    odds_bet_candidates = tuple(_list(plan, "bet_candidates"))
+    reference_query = _text(plan, "reference_query")
+    country_filter = _text(plan, "country_filter")
+    reference_page = _int(plan, "reference_page")
     player_slots = tuple(
         _player_slots(
             player_candidates,
@@ -374,11 +477,25 @@ def compile_football_operation(
             nationality_hint=structured_player.nationality_hint,
             request=request,
             context_keys=prior_player_keys,
+            allow_static_alias=not typed_plan,
         )
     )
     country_slots = tuple(_country_slots(country_candidates))
-    league_slots = tuple(_league_slots(league_candidates, country_candidates=country_candidates, request=request, context_keys=prior_league_keys))
-    team_slots = tuple(_team_slots(team_candidates, league_candidates=league_candidates, country_candidates=country_candidates, request=request, context_keys=prior_team_keys))
+    league_slots = tuple(_league_slots(
+        league_candidates,
+        country_candidates=country_candidates,
+        request=request,
+        context_keys=prior_league_keys,
+        allow_static_alias=not typed_plan,
+    ))
+    team_slots = tuple(_team_slots(
+        team_candidates,
+        league_candidates=league_candidates,
+        country_candidates=country_candidates,
+        request=request,
+        context_keys=prior_team_keys,
+        allow_static_alias=not typed_plan,
+    ))
     capability_intent = _capability_intent_from_request(
         request,
         operation_type=operation_type,
@@ -398,12 +515,17 @@ def compile_football_operation(
         leagues=league_slots,
         country=country_slots[0] if country_slots else None,
         countries=country_slots,
-        fixture_focus=_text(plan, "fixture_focus"),
+        fixture_focus=fixture_focus,
         stat_focus=stat_focus,
         date_hint=_text(plan, "date_hint"),
         season_hint=_text(plan, "season_hint"),
         live=bool(plan.get("live", False)) if isinstance(plan, dict) else False,
         time_scope=time_scope,
+        odds_bookmaker_candidates=odds_bookmaker_candidates,
+        odds_bet_candidates=odds_bet_candidates,
+        reference_query=reference_query,
+        country_filter=country_filter,
+        reference_page=reference_page,
         source_route=route,
         capability_intent=capability_intent,
     )
@@ -415,18 +537,26 @@ def compile_football_operation(
         country_candidates=tuple(country_candidates),
         team_candidates=tuple(team_candidates),
         player_candidates=tuple(player_candidates),
-        fixture_focus=_text(plan, "fixture_focus"),
+        coach_candidates=tuple(coach_candidates),
+        venue_candidates=tuple(venue_candidates),
+        fixture_focus=fixture_focus,
         stat_focus=stat_focus,
         date_hint=_text(plan, "date_hint"),
         season_hint=_text(plan, "season_hint"),
         live=bool(plan.get("live", False)) if isinstance(plan, dict) else False,
         time_scope=time_scope,
+        odds_bookmaker_candidates=odds_bookmaker_candidates,
+        odds_bet_candidates=odds_bet_candidates,
+        reference_query=reference_query,
+        country_filter=country_filter,
+        reference_page=reference_page,
         spec=spec,
         league_slots=league_slots,
         country_slots=country_slots,
         team_slots=team_slots,
         player_slots=player_slots,
         capability_intent=capability_intent,
+        semantic_source="router" if typed_plan else "compatibility",
     )
 
 
@@ -434,7 +564,38 @@ def _candidate_keys(candidates: list[str] | tuple[str, ...]) -> set[str]:
     return {football_resolver.normalize_key(candidate) for candidate in candidates if football_resolver.normalize_key(candidate)}
 
 
-def _slot_metadata(kind: str, candidate: str, request: str, context_keys: set[str]) -> dict[str, Any]:
+_TWO_TEAM_OPERATIONS = {
+    "h2h",
+    "fixture_prediction",
+    "fixture_odds_pre_match",
+    "fixture_odds_live",
+    "fixture_shootout",
+    "fixture_shootout_attempts",
+    "fixture_statistics_half_comparison",
+}
+
+
+def _validate_typed_team_arity(operation_type: str, candidates: list[str]) -> list[str]:
+    maximum = 2 if operation_type in _TWO_TEAM_OPERATIONS else 1
+    if len(candidates) <= maximum:
+        return candidates
+    logging.info(
+        "AI football typed team candidates rejected incompatible arity operation=%s candidate_count=%s maximum=%s",
+        operation_type,
+        len(candidates),
+        maximum,
+    )
+    return []
+
+
+def _slot_metadata(
+    kind: str,
+    candidate: str,
+    request: str,
+    context_keys: set[str],
+    *,
+    allow_static_alias: bool = True,
+) -> dict[str, Any]:
     key = football_resolver.normalize_key(candidate)
     if key in context_keys and not _phrase_in_text(candidate, request):
         return {
@@ -444,7 +605,7 @@ def _slot_metadata(kind: str, candidate: str, request: str, context_keys: set[st
             "source_component": "validated_football_context",
             "evidence": "prior_validated_context",
         }
-    alias = _alias_evidence(kind, candidate, request)
+    alias = _alias_evidence(kind, candidate, request) if allow_static_alias else None
     if alias:
         return {
             "source": "alias",
@@ -463,11 +624,11 @@ def _slot_metadata(kind: str, candidate: str, request: str, context_keys: set[st
             "evidence": candidate,
         }
     return {
-        "source": "deterministic_parser",
-        "authority": "EXPLICIT_CURRENT_MESSAGE",
+        "source": "planner",
+        "authority": "PLANNER_INFERENCE",
         "literal": candidate,
-        "source_component": "current_message",
-        "evidence": candidate,
+        "source_component": "native_router",
+        "evidence": "planner_candidate",
     }
 
 
@@ -506,6 +667,7 @@ def _team_slots(
     country_candidates: list[str] | None = None,
     request: str,
     context_keys: set[str],
+    allow_static_alias: bool = True,
 ) -> list[TeamSlot]:
     slots: list[TeamSlot] = []
     seen: set[str] = set()
@@ -517,19 +679,32 @@ def _team_slots(
             if key in seen:
                 continue
             seen.add(key)
-            metadata = _slot_metadata("team", candidate, request, context_keys)
+            metadata = _slot_metadata(
+                "team", candidate, request, context_keys,
+                allow_static_alias=allow_static_alias,
+            )
             slots.append(_make_team_slot(candidate, league_hint=league_hint, country_hint=country_hint, **metadata))
         except InvalidFootballApiRequest:
             continue
     return slots
 
 
-def _league_slots(candidates: list[str], *, country_candidates: list[str] | None = None, request: str, context_keys: set[str]) -> list[LeagueSlot]:
+def _league_slots(
+    candidates: list[str],
+    *,
+    country_candidates: list[str] | None = None,
+    request: str,
+    context_keys: set[str],
+    allow_static_alias: bool = True,
+) -> list[LeagueSlot]:
     slots: list[LeagueSlot] = []
     country_hint = country_candidates[0] if country_candidates else None
     for candidate in candidates:
         try:
-            metadata = _slot_metadata("league", candidate, request, context_keys)
+            metadata = _slot_metadata(
+                "league", candidate, request, context_keys,
+                allow_static_alias=allow_static_alias,
+            )
             slots.append(_make_league_slot(candidate, country_hint=country_hint, **metadata))
         except InvalidFootballApiRequest:
             continue
@@ -555,6 +730,7 @@ def _player_slots(
     nationality_hint: str | None = None,
     request: str,
     context_keys: set[str],
+    allow_static_alias: bool = True,
 ) -> list[PlayerSlot]:
     slots: list[PlayerSlot] = []
     team_hint = team_candidates[0] if team_candidates else None
@@ -562,7 +738,10 @@ def _player_slots(
     country_hint = country_candidates[0] if country_candidates else None
     for candidate in candidates:
         try:
-            metadata = _slot_metadata("player", candidate, request, context_keys)
+            metadata = _slot_metadata(
+                "player", candidate, request, context_keys,
+                allow_static_alias=allow_static_alias,
+            )
             slots.append(
                 _make_player_slot(
                     candidate,
@@ -691,6 +870,7 @@ def clean_entity_candidates(
     original_request: str,
     *,
     allow_contextual: bool = False,
+    allow_static_alias: bool = True,
 ) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
@@ -706,7 +886,12 @@ def clean_entity_candidates(
                 abs(hash(key)) % 100000,
             )
             continue
-        if not allow_contextual and not _candidate_is_grounded(kind, cleaned, original_request):
+        if not allow_contextual and not _candidate_is_grounded(
+            kind,
+            cleaned,
+            original_request,
+            allow_static_alias=allow_static_alias,
+        ):
             logging.info(
                 "AI football ungrounded candidate rejected kind=%s candidate_hash=%s request_hash=%s",
                 kind,
@@ -804,7 +989,13 @@ def extract_alias_candidates(kind: str, text: str) -> list[str]:
     return clean_entity_candidates(kind, candidates, text)
 
 
-def _candidate_is_grounded(kind: str, candidate: str, text: str) -> bool:
+def _candidate_is_grounded(
+    kind: str,
+    candidate: str,
+    text: str,
+    *,
+    allow_static_alias: bool = True,
+) -> bool:
     candidate_key = football_resolver.normalize_key(candidate)
     if kind == "league" and candidate_key == "laliga" and re.search(r"\bla\s+liga\s+de\b", _normalize_words_text(text)):
         return False
@@ -814,6 +1005,8 @@ def _candidate_is_grounded(kind: str, candidate: str, text: str) -> bool:
         normalized = _normalize_words_text(text)
         if re.search(r"\bla\s+liga\b(?!\s+de\b)", normalized):
             return True
+    if not allow_static_alias:
+        return False
     aliases = (
         football_resolver.TEAM_ALIASES
         if kind == "team"
@@ -856,6 +1049,7 @@ def _phrase_in_text(phrase: str, text: str) -> bool:
 
 def _data_focus(plan: dict[str, Any] | None, route_action: str, request: str, has_player_candidate: bool = False) -> str | None:
     route = str(route_action or "").upper()
+    typed_plan = isinstance(plan, dict) and str(plan.get("semantic_source", "")).strip().lower() == "router"
     planned = _text(plan, "data_focus")
     planned_stat = _text(plan, "stat_focus")
     lowered = _normalize_words_text(request)
@@ -870,7 +1064,7 @@ def _data_focus(plan: dict[str, Any] | None, route_action: str, request: str, ha
             return "summary"
         if planned_key in {"next_fixtures", "fixture_next", "next_match"} and _is_competition_start_request(lowered):
             return "season_start"
-        if planned_key == "season_start" and not _is_competition_start_request(lowered):
+        if planned_key == "season_start" and not typed_plan and not _is_competition_start_request(lowered):
             return None
         if planned_key == "statistics" and planned_stat and _stat_focus_is_event(planned_stat) and not has_player_candidate:
             return "events"
@@ -965,7 +1159,7 @@ def _route_action_for_focus(route_action: str, data_focus: str | None) -> str:
         return "FOOTBALL_PLAYER_QUERY"
     if data_focus and str(data_focus).startswith("player_"):
         return "FOOTBALL_PLAYER_QUERY"
-    if data_focus == "team":
+    if data_focus in {"team", "team_seasons"}:
         return "FOOTBALL_TEAM_QUERY"
     if data_focus in {"events", "lineups", "statistics", "fixture_players", "prediction", "predictions", "odds", "live_odds", "shootout", "half_statistics"}:
         return "FOOTBALL_MATCH_CENTER"
@@ -1007,6 +1201,8 @@ def _operation_type(route_action: str, data_focus: str | None, request: str, has
         return "player_match_stats"
     if focus in {"team_season_statistics", "team_stats", "team_statistics"}:
         return "team_season_statistics"
+    if focus == "team_seasons":
+        return "team_seasons"
     if focus in {"coach", "coach_profile"}:
         return "coach_profile"
     if focus in {"current_coach", "team_current_coach"}:
@@ -1017,6 +1213,22 @@ def _operation_type(route_action: str, data_focus: str | None, request: str, has
         return "coach_trophies"
     if focus == "coach_sidelined":
         return "coach_sidelined"
+    if focus in {"countries", "football_countries"}:
+        return "football_countries"
+    if focus in {"timezones", "football_timezones"}:
+        return "football_timezones"
+    if focus == "league_seasons":
+        return "league_seasons"
+    if focus == "team_countries":
+        return "team_countries"
+    if focus in {"bookmakers", "odds_bookmakers"}:
+        return "odds_bookmakers"
+    if focus in {"bets", "odds_bets"}:
+        return "odds_bets"
+    if focus in {"live_bets", "odds_live_bets"}:
+        return "odds_live_bets"
+    if focus in {"odds_mapping", "mapping"}:
+        return "odds_mapping"
     if focus in {"venue", "stadium", "team_venue"}:
         return "team_venue"
     if focus == "player" or route == "FOOTBALL_PLAYER_QUERY":
@@ -1041,7 +1253,7 @@ def _operation_type(route_action: str, data_focus: str | None, request: str, has
         return "h2h"
     if focus == "season_start":
         return "competition_structure"
-    if focus == "next_fixtures":
+    if focus in {"next_fixtures", "next_match"}:
         return "fixture_next"
     if focus == "last_fixtures":
         return "fixture_last"
@@ -1099,6 +1311,8 @@ def _operation_type(route_action: str, data_focus: str | None, request: str, has
         return "odds_bets"
     if focus in {"live_bets", "odds_live_bets"}:
         return "odds_live_bets"
+    if focus in {"odds_mapping", "mapping"}:
+        return "odds_mapping"
     if focus == "summary" or route in {"FOOTBALL_SUMMARY", "FOOTBALL_EXPLAIN_RESULT"} or _is_result_request(_normalize_words_text(request)):
         return "fixture_result"
     if route in {"FOOTBALL_MATCH_CENTER", "FOOTBALL_PREVIEW"}:
@@ -1149,7 +1363,7 @@ def _planned_team_entity_focus(data_focus: str | None, team_candidates: list[str
     if not team_candidates:
         return False
     focus = str(data_focus or "").casefold()
-    return focus in {"team", "injuries", "team_injuries", "transfers", "team_transfers", "squad", "team_squad"}
+    return focus in {"team", "injuries", "team_injuries", "transfers", "team_transfers", "squad", "team_squad", "team_seasons"}
 
 
 def _has_player_focus(
@@ -1224,6 +1438,17 @@ def _league_candidate_from_prior_context(prior_context: str | None) -> str | Non
     return match.group(1) if match else None
 
 
+def _prior_request_from_context(prior_context: str | None) -> str | None:
+    if not prior_context or not prior_context.lstrip().startswith("{"):
+        return None
+    try:
+        payload = json.loads(prior_context)
+    except (TypeError, ValueError):
+        return None
+    request = payload.get("prior_request") if isinstance(payload, dict) else None
+    return " ".join(str(request or "").split()) or None
+
+
 def _team_candidates_from_prior_context(prior_context: str | None) -> list[str]:
     if not prior_context or not prior_context.lstrip().startswith("{"):
         return []
@@ -1239,6 +1464,13 @@ def _operation_type_from_prior_context(prior_context: str | None) -> str | None:
     if not prior_context or not prior_context.lstrip().startswith("{"):
         return None
     match = re.search(r'"operation_type"\s*:\s*"([^"]+)"', prior_context)
+    return match.group(1) if match else None
+
+
+def _fixture_focus_from_prior_context(prior_context: str | None) -> str | None:
+    if not prior_context or not prior_context.lstrip().startswith("{"):
+        return None
+    match = re.search(r'"fixture_id"\s*:\s*(\d+)', prior_context)
     return match.group(1) if match else None
 
 
@@ -1389,9 +1621,17 @@ def _is_live_request(text: str) -> bool:
     return _has_any(lowered, ("ahora", "ahorita", "now", "live", "en vivo", "minuto a minuto", "pretemporada", "pre temporada", "preseason", "amistoso", "friendly"))
 
 
-def _time_scope(plan: dict[str, Any] | None, request: str, operation_type: str) -> str | None:
+def _time_scope(
+    plan: dict[str, Any] | None,
+    request: str,
+    operation_type: str,
+    *,
+    typed_plan: bool = False,
+) -> str | None:
     planned = _text(plan, "time_scope")
     if planned:
+        if typed_plan:
+            return planned
         key = planned.casefold()
         aliases = {
             "live": "live",
@@ -1556,29 +1796,6 @@ def _dedupe(values: list[str]) -> list[str]:
     return result
 
 
-def season_hint_to_int(value: str | None) -> int | None:
-    if not value:
-        return None
-    match = re.search(r"\b(20\d{2})\b", value)
-    if match:
-        return int(match.group(1))
-    return None
-
-
-def season_hint_to_year(value: str | None, current_season: int | None) -> int | None:
-    explicit = season_hint_to_int(value)
-    if explicit is not None:
-        return explicit
-    if not isinstance(current_season, int):
-        return None
-    normalized = football_resolver.normalize_key(value)
-    if any(marker in normalized for marker in ("torneopasado", "temporadapasada", "lastseason", "previousseason")):
-        return current_season - 1
-    if any(marker in normalized for marker in ("torneoactual", "temporadaactual", "currentseason")):
-        return current_season
-    return None
-
-
 def _list(plan: dict[str, Any] | None, key: str) -> list[str]:
     if not isinstance(plan, dict):
         return []
@@ -1604,6 +1821,15 @@ def _text(plan: dict[str, Any] | None, key: str) -> str | None:
     if not cleaned or looks_like_raw_sentence(cleaned, None):
         return None
     return cleaned
+
+
+def _int(plan: dict[str, Any] | None, key: str) -> int | None:
+    if not isinstance(plan, dict):
+        return None
+    value = plan.get(key)
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
 
 
 def _words(value: str) -> list[str]:

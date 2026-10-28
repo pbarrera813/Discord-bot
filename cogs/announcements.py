@@ -244,7 +244,6 @@ class AnnouncementCog(commands.Cog):
             await target_channel.send(embed=embed, allowed_mentions=allowed_mentions)
             return True, "sent"
 
-        # mode == both
         if not (embed.description or "").strip():
             embed.description = rendered
         await target_channel.send(embed=embed, allowed_mentions=allowed_mentions)

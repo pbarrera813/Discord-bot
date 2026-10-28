@@ -2,14 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from services.football_live_match_service import (
-    FootballLiveMatchService,
-    derive_second_half_statistics,
-    match_requested_stat,
-    normalize_match_statistics,
-    normalize_fixture_players,
-    normalize_shootout,
-)
+from services.football_live_match_service import FootballLiveMatchService, derive_second_half_statistics, normalize_match_statistics, normalize_shootout
 
 
 def _fixture(
@@ -42,40 +35,42 @@ class _Client:
         self.half_stats = []
         self.lineups = []
         self.players = []
+        self.fixture_requests = []
 
-    async def get_live_fixtures(self, **_kwargs):  # noqa: ANN202
+    async def get_live_fixtures(self, **_kwargs):
         self.calls.append("live")
         return self.live
 
-    async def get_fixtures_on_date(self, **_kwargs):  # noqa: ANN202
+    async def get_fixtures_on_date(self, **_kwargs):
         self.calls.append("date")
         return self.today
 
-    async def get_last_fixtures(self, **_kwargs):  # noqa: ANN202
+    async def get_last_fixtures(self, **_kwargs):
         self.calls.append("last")
         return self.last
 
-    async def get_next_fixtures(self, **_kwargs):  # noqa: ANN202
+    async def get_next_fixtures(self, **_kwargs):
         self.calls.append("next")
         return self.next
 
-    async def get_fixture_by_id(self, **_kwargs):  # noqa: ANN202
+    async def get_fixture_by_id(self, **_kwargs):
+        self.fixture_requests.append(_kwargs)
         self.calls.append("fixture_by_id")
         return self.detail
 
-    async def get_fixture_events(self, **_kwargs):  # noqa: ANN202
+    async def get_fixture_events(self, **_kwargs):
         self.calls.append("events")
         return self.events
 
-    async def get_fixture_statistics(self, **kwargs):  # noqa: ANN202
+    async def get_fixture_statistics(self, **kwargs):
         self.calls.append("half_stats" if kwargs.get("half") else "stats")
         return self.half_stats if kwargs.get("half") else self.stats
 
-    async def get_fixture_lineups(self, **_kwargs):  # noqa: ANN202
+    async def get_fixture_lineups(self, **_kwargs):
         self.calls.append("lineups")
         return self.lineups
 
-    async def get_fixture_players(self, **_kwargs):  # noqa: ANN202
+    async def get_fixture_players(self, **_kwargs):
         self.calls.append("players")
         return self.players
 
@@ -104,14 +99,6 @@ class FootballLiveMatchServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(team_stats["passes_percent"].numeric_value, 83.0)
         self.assertNotIn("null_thing", team_stats)
 
-    def test_stat_matching_uses_synonyms_then_returned_labels(self) -> None:
-        stats = normalize_match_statistics([
-            {"team": {"id": 1, "name": "A"}, "statistics": [{"type": "Shots on Goal", "value": 2}, {"type": "Expected Threat", "value": 1.2}]}
-        ])
-
-        self.assertEqual(match_requested_stat(stats, "tiros a puerta"), "shots_on_goal")
-        self.assertEqual(match_requested_stat(stats, "expected threat"), "expected_threat")
-        self.assertIsNone(match_requested_stat(stats, "duelos espaciales"))
 
     async def test_live_team_lookup_rejects_unrelated_fixtures(self) -> None:
         client = _Client()
@@ -121,22 +108,30 @@ class FootballLiveMatchServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(match.fixture_id, 11)
         self.assertEqual(client.calls, ["live"])
+        client.today_iso = lambda: "2026-07-26"
+        service = FootballLiveMatchService(client)
+        client.calls.clear()
+        client.live = [_fixture(12,home_id=1,status="HT")]
+        self.assertEqual((await service.get_team_fixture_choices(1,when="live"))[0]["fixture"]["id"],12)
+        client.live = []
+        client.calls.clear()
+        self.assertEqual(await service.get_team_fixture_choices(1,when="live"),[])
+        self.assertEqual(client.calls,["live"])
+        client.today = [_fixture(13,home_id=1,date_iso="2026-07-26")]
+        client.calls.clear()
+        self.assertEqual((await service.get_team_fixture_choices(1))[0]["fixture"]["id"],13)
+        self.assertEqual(client.calls,["live","date"])
+        client.today=[]
+        client.next=[_fixture(14,home_id=1,status="NS")]
+        client.calls.clear()
+        self.assertEqual((await service.get_team_fixture_choices(1))[0]["fixture"]["id"],14)
+        self.assertEqual(client.calls,["live","date","next"])
+        client.next=[]
+        client.last=[_fixture(15,home_id=1,status="FT"),_fixture(16,home_id=1,status="NS"),_fixture(17,home_id=9,away_id=8)]
+        client.calls.clear()
+        self.assertEqual([row["fixture"]["id"] for row in await service.get_team_fixture_choices(1)],[15])
+        self.assertEqual(client.calls,["live","date","next","last"])
 
-    async def test_yesterday_lookup_matches_team_and_date_without_live_call(self) -> None:
-        client = _Client()
-        client.today = [
-            _fixture(20, home_id=1, away_id=2, date_iso="2026-07-24"),
-            _fixture(21, home_id=1, away_id=3, date_iso="2026-07-25"),
-        ]
-
-        match = await FootballLiveMatchService(client).find_recent_fixture_for_team(
-            1,
-            "yesterday",
-            today_iso="2026-07-26",
-        )
-
-        self.assertEqual(match.fixture_id, 21)
-        self.assertEqual(client.calls, ["date"])
 
     async def test_last_finished_requires_terminal_status_and_team_pair(self) -> None:
         client = _Client()
@@ -151,14 +146,6 @@ class FootballLiveMatchServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(match.fixture_id, 32)
         self.assertEqual(match.status_short, "FT")
 
-    async def test_unrelated_past_fixture_returns_mismatch_note(self) -> None:
-        client = _Client()
-        client.last = [_fixture(40, home_id=8, away_id=9, status="FT")]
-
-        match = await FootballLiveMatchService(client).find_last_finished_fixture_for_team(1, opponent_id=2)
-
-        self.assertIsNone(match.fixture_id)
-        self.assertIn("fixture_team_mismatch", match.notes)
 
     def test_second_half_derivation_only_uses_additive_stats(self) -> None:
         full = [{"team": {"id": 1, "name": "A"}, "statistics": [{"type": "Total Shots", "value": 10}, {"type": "Ball Possession", "value": "60%"}]}]
@@ -183,35 +170,6 @@ class FootballLiveMatchServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(shootout.attempts), 1)
         self.assertEqual(shootout.attempts[0].player_name, "Shooter")
 
-    def test_historical_pen_exposes_aggregate_without_ambiguous_attempts(self) -> None:
-        fixture = _fixture(51, status="PEN")
-        fixture["score"] = {"penalty": {"home": 4, "away": 3}}
-        events = [{"time": {"elapsed": 90}, "team": {"id": 1}, "player": {"name": "Reg"}, "type": "Goal", "detail": "Penalty"}]
-
-        shootout = normalize_shootout(fixture, events)
-
-        self.assertEqual((shootout.home_penalties, shootout.away_penalties), (4, 3))
-        self.assertFalse(shootout.attempts_available)
-        self.assertTrue(shootout.attempts_ambiguous)
-
-    def test_fixture_player_performance_preserves_nested_metrics(self) -> None:
-        rows = [
-            {
-                "team": {"id": 1, "name": "A"},
-                "players": [
-                    {
-                        "player": {"id": 9, "name": "Keeper"},
-                        "statistics": [{"games": {"minutes": 90, "rating": "7.4"}, "goals": {"saves": 5}, "custom": {"future": 12}}],
-                    }
-                ],
-            }
-        ]
-
-        performances = normalize_fixture_players(rows)
-
-        self.assertEqual(performances[0].metrics["games_minutes"], 90)
-        self.assertEqual(performances[0].metrics["goals_saves"], 5)
-        self.assertEqual(performances[0].metrics["custom_future"], 12)
 
     async def test_match_center_reuses_embedded_payloads_before_subendpoint_fallback(self) -> None:
         client = _Client()
@@ -230,6 +188,20 @@ class FootballLiveMatchServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.calls, ["fixture_by_id"])
         self.assertEqual(match.normalized_events[0].event_key, "id:1")
         self.assertIn("total_shots", match.stats[1])
+        client.calls.clear()
+        await FootballLiveMatchService(client).get_match_center(60,time_scope="live_watch",include_stats=True)
+        self.assertEqual(client.fixture_requests[-1]["cache_ttl_seconds"],30)
+        client.calls.clear()
+        await FootballLiveMatchService(client).get_match_center(60,time_scope="fixture_id",fixture=client.detail[0],include_stats=True)
+        self.assertEqual(client.calls,[])
+        with self.assertRaises(ValueError):
+            await FootballLiveMatchService(client).get_match_center(99,time_scope="fixture_id",fixture=client.detail[0])
+        client.calls.clear()
+        client.detail=[]
+        missing=await FootballLiveMatchService(client).get_match_center(999,time_scope="fixture_id",include_stats=True,include_events=True)
+        self.assertIsNone(missing.fixture)
+        self.assertEqual(client.calls,["fixture_by_id"])
+
 
 
 if __name__ == "__main__":

@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
-
-import discord
 
 
 def fixture_status(fixture: dict[str, Any]) -> str:
@@ -101,37 +99,6 @@ def format_fixture_line(item: dict[str, Any]) -> tuple[str, str]:
     if round_name:
         details = f"{details}\n{round_name}"
     return title, details
-
-
-def build_match_embed(
-    *,
-    lang: str,
-    league_label: str,
-    item: dict[str, Any],
-    title_en: str,
-    title_es: str,
-    color: discord.Color,
-    index: int = 1,
-    total: int = 1,
-) -> discord.Embed:
-    fixture = item.get("fixture")
-    if not isinstance(fixture, dict):
-        fixture = {}
-    home, away = fixture_teams(item)
-    home_logo, away_logo = fixture_team_logos(item)
-    details = [f"**{home} vs {away}**", f"**{fixture_score(item)}**", fixture_status(fixture), fixture_datetime(item)]
-    round_name = fixture_round(item)
-    if round_name:
-        details.append(round_name)
-    page_suffix = f" ({index}/{total})" if total > 1 else ""
-    title = f"{league_label} - {title_es if str(lang).startswith('es') else title_en}{page_suffix}"
-    embed = discord.Embed(title=title, description="\n".join(details)[:4096], color=color, timestamp=datetime.now(timezone.utc))
-    embed.set_author(name=home, icon_url=home_logo or discord.Embed.Empty)
-    if away_logo:
-        embed.set_footer(text=away, icon_url=away_logo)
-    else:
-        embed.set_footer(text=away)
-    return embed
 
 
 def _clean_url(value: object) -> str | None:

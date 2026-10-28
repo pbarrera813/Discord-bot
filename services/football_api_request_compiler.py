@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 
 class InvalidFootballApiRequest(ValueError):
-    """Raised before API-Football transport when a request is not compiled."""
+    pass
 
 
 _COMPILER_TOKEN = object()
@@ -23,6 +23,7 @@ CandidateSource = Literal[
     "canonicalizer",
 ]
 CandidateAuthority = Literal[
+    "PLANNER_INFERENCE",
     "EXPLICIT_CURRENT_MESSAGE",
     "EXPLICIT_REPLY_TARGET",
     "VALIDATED_FOOTBALL_CONTEXT",
@@ -91,7 +92,14 @@ def words(value: str | None) -> list[str]:
     return re.findall(r"[a-z0-9]+", normalize_text(value))
 
 
-def _clean_text(value: Any, *, label: str, max_words: int = 6, allow_single_fragment: bool = False) -> str:
+def _clean_text(
+    value: Any,
+    *,
+    label: str,
+    max_words: int = 6,
+    min_chars: int = 2,
+    allow_single_fragment: bool = False,
+) -> str:
     if not isinstance(value, str):
         raise InvalidFootballApiRequest(f"{label} must be validated text.")
     cleaned = " ".join(value.split())
@@ -109,7 +117,7 @@ def _clean_text(value: Any, *, label: str, max_words: int = 6, allow_single_frag
         raise InvalidFootballApiRequest(f"{label} looks like request text.")
     if not allow_single_fragment and len(value_words) == 1 and value_words[0] in _FORBIDDEN_FRAGMENTS:
         raise InvalidFootballApiRequest(f"{label} is an unsafe fragment.")
-    if len(key) < 2:
+    if len(key) < min_chars:
         raise InvalidFootballApiRequest(f"{label} is too short.")
     return cleaned[:120]
 
@@ -379,37 +387,6 @@ class FootballCapabilityIntent:
 
 
 PlayerCandidate = PlayerSlot
-TeamCandidate = TeamSlot
-LeagueCandidate = LeagueSlot
-CountryCandidate = CountrySlot
-
-
-@dataclass(frozen=True)
-class ResolvedPlayer:
-    player_id: int
-    name: str
-    row: dict[str, Any] | None = None
-
-
-@dataclass(frozen=True)
-class ResolvedTeam:
-    team_id: int
-    name: str
-    row: dict[str, Any] | None = None
-
-
-@dataclass(frozen=True)
-class ResolvedLeague:
-    league_id: int
-    name: str
-    season: int | None = None
-    row: dict[str, Any] | None = None
-
-
-@dataclass(frozen=True)
-class ResolvedFixture:
-    fixture_id: int
-    row: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -417,11 +394,13 @@ class LeagueSearchRequest:
     name: ValidatedLeagueName | None = None
     country: ValidatedCountryName | None = None
     search: ValidatedLeagueName | None = None
+    team_id: int | None = None
     current: bool | None = None
 
     def __post_init__(self) -> None:
-        if self.name is None and self.country is None and self.search is None:
+        if self.name is None and self.country is None and self.search is None and self.team_id is None:
             raise InvalidFootballApiRequest("league search requires a validated field.")
+        _validate_optional_id(self.team_id, "team_id")
         if self.current is not None and not isinstance(self.current, bool):
             raise InvalidFootballApiRequest("current must be boolean.")
 
@@ -434,13 +413,19 @@ class TeamSearchRequest:
     season: ValidatedSeason | None = None
 
     def __post_init__(self) -> None:
-        if self.name is None and self.search is None:
-            raise InvalidFootballApiRequest("team search requires a validated team name.")
+        has_name_query = self.name is not None or self.search is not None
+        has_league_roster_scope = self.league_id is not None and self.season is not None
+        if not has_name_query and not has_league_roster_scope:
+            raise InvalidFootballApiRequest("team search requires a validated team name or league roster scope.")
         if self.name is not None and not isinstance(self.name, ValidatedTeamName):
             raise InvalidFootballApiRequest("team search requires a validated team name.")
         if self.search is not None and not isinstance(self.search, ValidatedTeamName):
             raise InvalidFootballApiRequest("team search requires a validated team search.")
+        if self.search is not None and (self.league_id is not None or self.season is not None):
+            raise InvalidFootballApiRequest("team search cannot be combined with league or season.")
         _validate_optional_id(self.league_id, "league_id")
+        if self.season is not None and not isinstance(self.season, ValidatedSeason):
+            raise InvalidFootballApiRequest("team search requires a validated season.")
 
 
 @dataclass(frozen=True)
@@ -508,6 +493,10 @@ class InjuryRequest:
 
     def __post_init__(self) -> None:
         _require_any_id(league_id=self.league_id, team_id=self.team_id, player_id=self.player_id, fixture_id=self.fixture_id)
+        if self.season is not None and not isinstance(self.season, ValidatedSeason):
+            raise InvalidFootballApiRequest("injury season must be validated.")
+        if self.season is None and any(value is not None for value in (self.league_id, self.team_id, self.player_id)):
+            raise InvalidFootballApiRequest("injury requests scoped by league, team, or player require season.")
 
 
 @dataclass(frozen=True)
@@ -677,6 +666,7 @@ class OddsRequest:
     date: ValidatedDate | None = None
     bookmaker_id: int | None = None
     bet_id: int | None = None
+    page: int | None = None
     live: bool = False
 
     def __post_init__(self) -> None:
@@ -684,6 +674,7 @@ class OddsRequest:
         _validate_optional_id(self.league_id, "league_id")
         _validate_optional_id(self.bookmaker_id, "bookmaker_id")
         _validate_optional_id(self.bet_id, "bet_id")
+        _validate_optional_id(self.page, "page")
         if self.season is not None and not isinstance(self.season, ValidatedSeason):
             raise InvalidFootballApiRequest("odds season must be validated.")
         if self.date is not None and not isinstance(self.date, ValidatedDate):
@@ -695,6 +686,8 @@ class OddsRequest:
                 raise InvalidFootballApiRequest("live odds require fixture, league, or bet scope.")
             if self.season is not None or self.date is not None or self.bookmaker_id is not None:
                 raise InvalidFootballApiRequest("live odds do not support season, date, or bookmaker filters.")
+            if self.page is not None:
+                raise InvalidFootballApiRequest("live odds do not support pagination.")
         elif self.fixture_id is None and self.league_id is None and self.date is None:
             raise InvalidFootballApiRequest("odds require fixture, league, or date scope.")
         if self.league_id is not None and not self.live and self.season is None:
@@ -710,6 +703,18 @@ class OddsReferenceRequest:
         _validate_optional_id(self.item_id, "item_id")
         if self.search is not None and not isinstance(self.search, ValidatedOddsLabel):
             raise InvalidFootballApiRequest("odds reference search must be validated.")
+
+
+@dataclass(frozen=True)
+class FootballCatalogRequest:
+    search: ValidatedOddsLabel | None = None
+    filter: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.search is not None and not isinstance(self.search, ValidatedOddsLabel):
+            raise InvalidFootballApiRequest("catalog search must be validated.")
+        if self.filter is not None and self.filter not in {"name", "code", "search"}:
+            raise InvalidFootballApiRequest("country filter is invalid.")
 
 
 def _make_player_slot(
@@ -831,6 +836,8 @@ def _make_country_slot(
 
 
 def _authority_for_source(source: CandidateSource) -> CandidateAuthority:
+    if source == "planner":
+        return "PLANNER_INFERENCE"
     if source == "validated_context":
         return "VALIDATED_FOOTBALL_CONTEXT"
     if source == "alias":
@@ -838,22 +845,6 @@ def _authority_for_source(source: CandidateSource) -> CandidateAuthority:
     if source == "canonicalizer":
         return "CANONICAL_EQUIVALENT"
     return "EXPLICIT_CURRENT_MESSAGE"
-
-
-def make_player_candidate(*_args: Any, **_kwargs: Any) -> PlayerSlot:
-    raise InvalidFootballApiRequest("raw player candidate factories were removed; use FootballQuerySpec slots.")
-
-
-def make_team_candidate(*_args: Any, **_kwargs: Any) -> TeamSlot:
-    raise InvalidFootballApiRequest("raw team candidate factories were removed; use FootballQuerySpec slots.")
-
-
-def make_league_candidate(*_args: Any, **_kwargs: Any) -> LeagueSlot:
-    raise InvalidFootballApiRequest("raw league candidate factories were removed; use FootballQuerySpec slots.")
-
-
-def make_country_candidate(*_args: Any, **_kwargs: Any) -> CountrySlot:
-    raise InvalidFootballApiRequest("raw country candidate factories were removed; use FootballQuerySpec slots.")
 
 
 def make_validated_season(value: Any) -> ValidatedSeason:
@@ -879,7 +870,7 @@ def make_validated_date(value: Any) -> ValidatedDate:
 def build_player_profile_request(candidate: PlayerSlot) -> PlayerProfileRequest:
     if not isinstance(candidate, PlayerSlot) or not candidate.last_name:
         raise InvalidFootballApiRequest("player profile search requires a compiled player candidate.")
-    last = _clean_text(candidate.last_name, label="player lastname", max_words=1, allow_single_fragment=False)
+    last = _clean_text(candidate.last_name, label="player lastname", max_words=1, min_chars=4, allow_single_fragment=False)
     return PlayerProfileRequest(ValidatedPlayerLastname(last, _token=_COMPILER_TOKEN))
 
 
@@ -893,7 +884,7 @@ def build_player_search_request(
     if not isinstance(candidate, PlayerSlot):
         raise InvalidFootballApiRequest("player search requires a compiled player candidate.")
     season_value = make_validated_season(season) if season is not None else None
-    name = ValidatedPlayerName(_clean_text(candidate.full_name, label="player name", max_words=5, allow_single_fragment=True), _token=_COMPILER_TOKEN)
+    name = ValidatedPlayerName(_clean_text(candidate.full_name, label="player name", max_words=5, min_chars=4, allow_single_fragment=True), _token=_COMPILER_TOKEN)
     return PlayerSearchRequest(name=name, league_id=league_id, season=season_value, team_id=team_id)
 
 
@@ -907,17 +898,25 @@ def build_team_search_request(candidate: TeamSlot, *, league_id: int | None = No
     return TeamSearchRequest(name=value, league_id=league_id, season=season_value)
 
 
+def build_league_teams_request(*, league_id: int, season: int) -> TeamSearchRequest:
+    return TeamSearchRequest(
+        league_id=league_id,
+        season=make_validated_season(season),
+    )
+
+
 def build_league_search_request(
     candidate: LeagueSlot | None = None,
     *,
     country: CountrySlot | None = None,
     search: LeagueSlot | None = None,
+    team_id: int | None = None,
     current: bool | None = None,
 ) -> LeagueSearchRequest:
     name_value = ValidatedLeagueName(candidate.name, _token=_COMPILER_TOKEN) if isinstance(candidate, LeagueSlot) else None
     search_value = ValidatedLeagueName(search.name, _token=_COMPILER_TOKEN) if isinstance(search, LeagueSlot) else None
     country_value = ValidatedCountryName(country.name, _token=_COMPILER_TOKEN) if isinstance(country, CountrySlot) else None
-    return LeagueSearchRequest(name=name_value, country=country_value, search=search_value, current=current)
+    return LeagueSearchRequest(name=name_value, country=country_value, search=search_value, team_id=team_id, current=current)
 
 
 def build_player_stats_request(
@@ -957,10 +956,6 @@ def build_injury_request(
 
 def build_transfer_request(*, team_id: int | None = None, player_id: int | None = None) -> TransferRequest:
     return TransferRequest(team_id=team_id, player_id=player_id)
-
-
-def build_fixture_ids_request(fixture_ids: list[int] | tuple[int, ...]) -> FixtureIdsRequest:
-    return FixtureIdsRequest(tuple(fixture_ids))
 
 
 def build_fixture_statistics_request(
@@ -1017,7 +1012,7 @@ def build_coach_search_request(*, coach_id: int | None = None, team_id: int | No
     return CoachSearchRequest(
         coach_id=coach_id,
         team_id=team_id,
-        search=ValidatedCoachName(_clean_text(search, label="coach search", max_words=5, allow_single_fragment=True), _token=_COMPILER_TOKEN) if search else None,
+        search=ValidatedCoachName(_clean_text(search, label="coach search", max_words=5, min_chars=3, allow_single_fragment=True), _token=_COMPILER_TOKEN) if search else None,
     )
 
 
@@ -1053,6 +1048,7 @@ def build_odds_request(
     date_iso: str | None = None,
     bookmaker_id: int | None = None,
     bet_id: int | None = None,
+    page: int | None = None,
     live: bool = False,
 ) -> OddsRequest:
     return OddsRequest(
@@ -1062,6 +1058,7 @@ def build_odds_request(
         date=make_validated_date(date_iso) if date_iso is not None else None,
         bookmaker_id=bookmaker_id,
         bet_id=bet_id,
+        page=page,
         live=live,
     )
 
@@ -1069,7 +1066,14 @@ def build_odds_request(
 def build_odds_reference_request(*, item_id: int | None = None, search: str | None = None) -> OddsReferenceRequest:
     return OddsReferenceRequest(
         item_id=item_id,
-        search=ValidatedOddsLabel(_clean_text(search, label="odds reference search", max_words=5, allow_single_fragment=True), _token=_COMPILER_TOKEN) if search else None,
+        search=ValidatedOddsLabel(_clean_text(search, label="odds reference search", max_words=5, min_chars=3, allow_single_fragment=True), _token=_COMPILER_TOKEN) if search else None,
+    )
+
+
+def build_catalog_request(*, search: str | None = None, filter: str | None = None) -> FootballCatalogRequest:
+    return FootballCatalogRequest(
+        search=ValidatedOddsLabel(_clean_text(search, label="catalog search", max_words=5, min_chars=2 if filter == "code" else 3, allow_single_fragment=True), _token=_COMPILER_TOKEN) if search else None,
+        filter=filter,
     )
 
 

@@ -7,6 +7,8 @@ from urllib.parse import urlencode
 
 import aiohttp
 
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
 
 class MemeGenClient:
     BASE_URL = "https://api.memegen.link"
@@ -34,6 +36,25 @@ class MemeGenClient:
             if resp.status >= 400:
                 raise RuntimeError(f"Memegen API error ({resp.status})")
             return data
+
+    async def fetch_image(self, url: str) -> tuple[bytes, str]:
+        if not url.startswith(self.BASE_URL + "/"):
+            raise ValueError("Memegen image URL must be on api.memegen.link.")
+        session = await self._get_session()
+        async with session.get(url) as resp:
+            if resp.status >= 400:
+                raise RuntimeError(f"Memegen image error ({resp.status})")
+            content_type = (
+                resp.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            )
+            if not content_type.startswith("image/"):
+                raise RuntimeError("Memegen returned a non-image response.")
+            body = bytearray()
+            async for chunk in resp.content.iter_chunked(65536):
+                body.extend(chunk)
+                if len(body) > MAX_IMAGE_BYTES:
+                    raise RuntimeError("Memegen image is too large.")
+            return bytes(body), content_type
 
     async def list_templates(self) -> list[dict[str, Any]]:
         now = time.monotonic()
@@ -103,7 +124,7 @@ class MemeGenClient:
         if not template:
             raise ValueError("Template ID cannot be empty.")
         top = self.escape_text(top_text)
-        bottom = self.escape_text(bottom_text or "_")
+        bottom = self.escape_text(bottom_text)
         url = f"{self.BASE_URL}/images/{template}/{top}/{bottom}.png"
         if font and font.strip():
             url = f"{url}?{urlencode({'font': font.strip()})}"
@@ -121,7 +142,7 @@ class MemeGenClient:
         if not background:
             raise ValueError("Background URL cannot be empty.")
         top = self.escape_text(top_text)
-        bottom = self.escape_text(bottom_text or "_")
+        bottom = self.escape_text(bottom_text)
         params: dict[str, str] = {"background": background}
         if font and font.strip():
             params["font"] = font.strip()

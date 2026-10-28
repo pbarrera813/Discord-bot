@@ -42,3 +42,28 @@ dist/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local AI-agent tooling and instructions
+.agents/
+.codex/
+.claude/
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+
+# Internal planning, audit and deployment notes
+PLAN-*.md
+architecture-rework-*.md
+discordbot-status.md
+virtual-machine-information.md
+audits/
+audit-input/
+tools/
+docs/
+
+# Local backups and scratch files
+*.bak
+*.orig
+*.tmp
+*.swp
+*~

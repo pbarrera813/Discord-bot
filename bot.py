@@ -56,6 +56,7 @@ class DiscordModBot(commands.Bot):
             image_model=settings.xai_image_model,
             tts_voice=settings.xai_tts_voice,
             tts_language=settings.xai_tts_language,
+            router_output_token_ceiling=getattr(settings, "xai_router_output_token_ceiling", None),
         )
         self.mc_client = McSrvStatClient()
         self.ninjas_client = (
@@ -67,7 +68,6 @@ class DiscordModBot(commands.Bot):
             GlotClient(
                 settings.glot_api_token,
                 settings.glot_base_url,
-                mode=settings.glot_api_mode,
             )
             if settings.glot_api_token
             else None
@@ -147,26 +147,45 @@ class DiscordModBot(commands.Bot):
         return settings.language_code
 
     @staticmethod
-    def _format_app_command_options(data: dict[str, Any] | None) -> str:
+    def _format_app_command_options(data: dict[str, Any] | None, lang: str = "en", command_name: str = "") -> str:
         if not isinstance(data, dict):
             return ""
         raw_options = data.get("options")
         if not isinstance(raw_options, list):
             return ""
 
+        labels = {
+            "player": ("Player", "Jugador"), "team": ("Team", "Equipo"),
+            "opponent": ("Opponent", "Rival"), "league": ("League", "Liga"),
+            "season": ("Season", "Temporada"), "when": ("When", "Cuándo"),
+            "date": ("Date", "Fecha"), "count": ("Count", "Cantidad"),
+            "matches": ("Matches", "Partidos"), "category": ("Category", "Categoría"),
+            "round": ("Round", "Jornada"), "target": ("Target", "Selección"),
+            "language": ("Language", "Lenguaje"), "domain": ("Domain", "Dominio"),
+            "amount": ("Amount", "Cantidad"), "from_unit": ("From unit", "Unidad de origen"),
+            "to_unit": ("To unit", "Unidad de destino"), "user": ("User", "Usuario"),
+            "channel": ("Channel", "Canal"), "role": ("Role", "Rol"),
+            "scope": ("Scope", "Alcance"), "filter": ("Filter", "Filtro"),
+            "page": ("Page", "Página"),
+        }
+        if command_name.startswith("football "):
+            labels["query"] = ("Search", "Búsqueda")
+        if command_name == "football schedule":
+            labels["count"] = ("Match position", "Posición del partido")
         parts: list[str] = []
 
-        def walk(options: list[dict[str, Any]], prefix: str = "") -> None:
+        def walk(options: list[dict[str, Any]]) -> None:
             for option in options:
                 if not isinstance(option, dict):
                     continue
                 name = option.get("name")
                 if not isinstance(name, str) or not name:
                     continue
-                scoped_name = f"{prefix}{name}"
                 children = option.get("options")
                 if isinstance(children, list) and children:
-                    walk(children, f"{scoped_name}.")
+                    walk(children)
+                    continue
+                if name not in labels:
                     continue
                 value = option.get("value")
                 if value is None:
@@ -174,10 +193,12 @@ class DiscordModBot(commands.Bot):
                 rendered = str(value).strip()
                 if not rendered:
                     continue
-                parts.append(f"{scoped_name}={rendered}")
+                label = tr(lang, *labels[name])
+                rendered = discord.utils.escape_markdown(discord.utils.escape_mentions(rendered))
+                parts.append(f"**{label}:** {rendered}")
 
         walk(raw_options)
-        rendered = " | ".join(parts)
+        rendered = "\n".join(parts)
         if len(rendered) > 1000:
             return f"{rendered[:997]}..."
         return rendered
@@ -197,36 +218,19 @@ class DiscordModBot(commands.Bot):
 
         lang = await self._guild_lang(guild)
         embed = discord.Embed(
-            title=tr(lang, "Command used", "Comando usado"),
+            title=("/" if command_source == "slash" else "") + command_name,
             color=discord.Color.blue(),
             timestamp=datetime.now(timezone.utc),
         )
-        embed.add_field(
-            name=tr(lang, "User", "Usuario"),
-            value=f"{actor.mention} (`{actor.id}`)",
-            inline=True,
-        )
         channel_text = (
             channel.mention
-            if isinstance(channel, (discord.TextChannel, discord.Thread))
+            if channel is not None
             else tr(lang, "Unknown", "Desconocido")
         )
-        embed.add_field(
-            name=tr(lang, "Channel", "Canal"),
-            value=channel_text,
-            inline=True,
-        )
-        embed.add_field(
-            name=tr(lang, "Command", "Comando"),
-            value=f"`{command_name}`",
-            inline=False,
-        )
-        embed.add_field(
-            name=tr(lang, "Type", "Tipo"),
-            value=command_source,
-            inline=True,
-        )
-        await send_modlog_embed(guild, self.db, embed)
+        embed.description = tr(lang, f"Requested by: {actor.mention} · {channel_text}", f"Solicitado por: {actor.mention} · {channel_text}")
+        source = "Slash" if command_source == "slash" else tr(lang, "Prefix", "Prefijo")
+        embed.set_footer(text=f"User ID: {actor.id} | Channel ID: {getattr(channel, 'id', '-')} | {source}")
+        await send_modlog_embed(guild, self.db, embed, body=command_input)
 
     async def setup_hook(self) -> None:
         await self.db.init()
@@ -298,9 +302,14 @@ class DiscordModBot(commands.Bot):
             module_name=module_name if isinstance(module_name, str) else None,
         ):
             return
-        command_input = None
-        if ctx.message and ctx.message.content:
-            command_input = ctx.message.content.strip()
+        positional = ctx.args[2:] if cog is not None else ctx.args[1:]
+        options = dict(zip(command.clean_params, positional))
+        options.update(ctx.kwargs)
+        command_input = self._format_app_command_options(
+            {"options": [{"name": name, "value": getattr(value, "mention", value)} for name, value in options.items()]},
+            await self._guild_lang(ctx.guild),
+            command_name,
+        )
         await self._send_command_audit_log(
             guild=ctx.guild,
             actor=ctx.author,
@@ -326,7 +335,11 @@ class DiscordModBot(commands.Bot):
             module_name=module_name if isinstance(module_name, str) else None,
         ):
             return
-        options_text = self._format_app_command_options(interaction.data if isinstance(interaction.data, dict) else None)
+        options_text = self._format_app_command_options(
+            interaction.data if isinstance(interaction.data, dict) else None,
+            await self._guild_lang(interaction.guild),
+            str(command_name),
+        )
         await self._send_command_audit_log(
             guild=interaction.guild,
             actor=interaction.user,
@@ -372,12 +385,12 @@ class DiscordModBot(commands.Bot):
 
 
 def main() -> None:
+    settings = load_settings()
     logging.basicConfig(
-        level=logging.INFO,
+        level=settings.nitori_log_level,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
-    settings = load_settings()
     bot = DiscordModBot(settings)
     bot.run(settings.discord_token)
 

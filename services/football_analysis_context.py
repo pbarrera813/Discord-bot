@@ -49,9 +49,17 @@ def build_standings_context(
     standings: list[dict[str, Any]],
     source_endpoints: list[str] | None = None,
 ) -> str:
+    columns = ("rank", "team", "points", "played", "goalsDiff", "form")
     payload = {
         "label": label,
-        "standings": [_compact_standing(item) for item in standings[:24]],
+        "standing_columns": list(columns),
+        "standings": [
+            [
+                compact.get(column)
+                for column in columns
+            ]
+            for compact in (_compact_standing(item) for item in standings)
+        ],
         "source_endpoints": source_endpoints or [],
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))[:6000]
@@ -84,7 +92,9 @@ def build_player_context(
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))[:6000]
 
 
-def football_grounding_prompt(question: str, context: str) -> str:
+def football_grounding_prompt(question: str, context: str, *, language: str | None = None) -> str:
+    language_code = str(language or "").strip()
+    language_instruction = f" Respond in {language_code}." if language_code else ""
     return (
         f"{question}\n\n"
         "[TRUSTED_FOOTBALL_DATA]\n"
@@ -93,6 +103,7 @@ def football_grounding_prompt(question: str, context: str) -> str:
         "or internal provenance wording to the user. If a score, lineup, injury, transfer, odds, "
         "or live status is missing, say naturally that the specific detail does not appear right now "
         "instead of using a stock availability label. Do not invent missing football facts."
+        f"{language_instruction}"
     )
 
 

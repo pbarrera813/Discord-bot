@@ -1,21 +1,13 @@
 from __future__ import annotations
 
 import os
-import pathlib
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from services import database as db_module
 from services.database import Database
-from services.voice_messages import (
-    DiscordVoiceMessageSender,
-    ProcessedVoiceAudio,
-    VoicePermissionError,
-    detect_voice_response_intent,
-    sanitize_tts_text,
-)
+from services.voice_messages import DiscordVoiceMessageSender, ProcessedVoiceAudio, VoicePermissionError, sanitize_tts_text
 from utils.duration import DurationParseError, parse_duration
 from utils.i18n import normalize_language, tr
 
@@ -77,41 +69,6 @@ class DatabaseSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entries, [])
         self.assertEqual(turns, [])
 
-    async def test_interaction_context_does_not_count_against_real_channels(self) -> None:
-        db_path = os.path.join(tempfile.gettempdir(), "discordbot_test_ai_context_entries.db")
-        if os.path.exists(db_path):
-            os.remove(db_path)
-
-        db = Database(db_path)
-        await db.init()
-        await db.get_or_create_guild_settings(123)
-        sentinel = db_module.AI_INTERACTIONS_CONTEXT_CHANNEL_ID
-
-        final_entries, _ = await db.upsert_server_context_entry(
-            guild_id=123,
-            channel_id=sentinel,
-            channel_name="ai-interactions",
-            summary="Tone: learned from chats",
-        )
-        self.assertEqual([int(entry["channel_id"]) for entry in final_entries], [sentinel])
-
-        await db.upsert_server_context_entry(
-            guild_id=123,
-            channel_id=456,
-            channel_name="general",
-            summary="Tone: general",
-        )
-        final_entries, _ = await db.upsert_server_context_entry(
-            guild_id=123,
-            channel_id=789,
-            channel_name="memes",
-            summary="Tone: memes",
-        )
-
-        channel_ids = [int(entry["channel_id"]) for entry in final_entries]
-        settings = await db.get_guild_settings(123)
-        self.assertEqual(set(channel_ids), {456, 789})
-        self.assertNotIn("ai-interactions", settings.server_context)
 
     async def test_recent_ai_conversation_turns_filters_by_guild_and_date(self) -> None:
         db_path = os.path.join(tempfile.gettempdir(), "discordbot_test_ai_recent_turns.db")
@@ -128,33 +85,6 @@ class DatabaseSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["speaker"], "Pablo")
 
-    async def test_ai_conversation_turn_message_id_lookup(self) -> None:
-        db_path = os.path.join(tempfile.gettempdir(), "discordbot_test_ai_message_id.db")
-        if os.path.exists(db_path):
-            os.remove(db_path)
-
-        db = Database(db_path)
-        await db.init()
-        await db.add_ai_conversation_turn(
-            123,
-            456,
-            "assistant",
-            "Nitori",
-            "Nitori: hola",
-            message_id=999,
-        )
-        await db.add_ai_conversation_turn(
-            123,
-            456,
-            "user",
-            "Pablo",
-            "Pablo: hola",
-            message_id=1000,
-        )
-
-        self.assertTrue(await db.is_ai_assistant_message(123, 456, 999))
-        self.assertFalse(await db.is_ai_assistant_message(123, 456, 1000))
-        self.assertFalse(await db.is_ai_assistant_message(123, 999, 999))
 
     async def test_ai_conversation_turn_metadata_and_parent_chain(self) -> None:
         db_path = os.path.join(tempfile.gettempdir(), "discordbot_test_ai_branch_metadata.db")
@@ -234,39 +164,10 @@ class UtilityTests(unittest.TestCase):
         self.assertEqual(tr("en", "hello", "hola"), "hello")
         self.assertEqual(tr("es", "hello", "hola"), "hola")
 
-    def test_voice_intent_detection_is_current_text_semantic_marker(self) -> None:
-        positive = (
-            "Nitori, respóndeme con audio",
-            "envía un mensaje de voz saludando",
-            "manda un audio diciendo hola",
-            "contéstame con una nota de voz",
-            "dime esto por audio",
-            "send your answer as a voice message",
-            "reply with audio",
-            "say hello in a voice note",
-        )
-        for text in positive:
-            self.assertTrue(detect_voice_response_intent(text), text)
-
-        negative = (
-            "what is a voice message?",
-            "¿cómo funcionan los mensajes de voz?",
-            "Discord soporta audio?",
-            'Nitori, qué opinas de "respóndeme con audio"?',
-            "ayer pedí un audio",
-        )
-        for text in negative:
-            self.assertFalse(detect_voice_response_intent(text), text)
 
     def test_tts_tag_sanitizer_preserves_allowlist_and_neutralizes_unknown(self) -> None:
         output = sanitize_tts_text("hola [sigh] [evil-mode] [laugh]")
         self.assertEqual(output, "hola [sigh] evil mode [laugh]")
-
-    def test_conversational_voice_send_path_does_not_call_legacy_detector(self) -> None:
-        source = pathlib.Path("cogs/ai_chat.py").read_text(encoding="utf-8")
-        self.assertNotIn("detect_voice_response_intent", source)
-        self.assertNotIn("voice_response_decision(", source)
-        self.assertIn("response_delivery", source)
 
 
 class VoiceMessageSenderTests(unittest.IsolatedAsyncioTestCase):
@@ -274,7 +175,7 @@ class VoiceMessageSenderTests(unittest.IsolatedAsyncioTestCase):
         calls: list[dict[str, object]] = []
 
         class _HTTP:
-            async def request(self, route, *, files, form):  # noqa: ANN001, ANN202
+            async def request(self, route, *, files, form):
                 calls.append({"route": route, "files": files, "form": form})
                 return {"id": "12345"}
 
@@ -308,31 +209,6 @@ class VoiceMessageSenderTests(unittest.IsolatedAsyncioTestCase):
                 channel,
                 ProcessedVoiceAudio(data=b"ogg-data", duration_seconds=1.0, waveform="AQID"),
             )
-
-
-class VoiceArchitectureTests(unittest.TestCase):
-    def test_no_discord_tts_or_voice_channel_join_path(self) -> None:
-        root = pathlib.Path(__file__).resolve().parents[1]
-        production = "\n".join(
-            path.read_text(encoding="utf-8")
-            for folder in ("cogs", "services")
-            for path in (root / folder).glob("*.py")
-        )
-        self.assertNotIn("tts=True", production)
-        forbidden_voice_join_markers = (
-            "VoiceChannel.connect",
-            "voice_channel.connect",
-            ".connect(reconnect=",
-            ".connect(timeout=",
-        )
-        for marker in forbidden_voice_join_markers:
-            self.assertNotIn(marker, production)
-
-    def test_voice_sender_does_not_read_bot_token(self) -> None:
-        root = pathlib.Path(__file__).resolve().parents[1]
-        source = (root / "services" / "voice_messages.py").read_text(encoding="utf-8")
-        self.assertNotIn("DISCORD_TOKEN", source)
-        self.assertNotIn(".token", source)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import logging
 import os
 from dataclasses import dataclass
 
@@ -10,7 +11,6 @@ class Settings:
     xai_api_key: str
     glot_api_token: str
     glot_base_url: str
-    glot_api_mode: str
     api_ninjas_key: str
     api_football_key: str
     api_football_base_url: str
@@ -20,6 +20,7 @@ class Settings:
     xai_image_model: str
     xai_tts_voice: str
     xai_tts_language: str
+    xai_router_output_token_ceiling: int | None
     xai_web_search_enabled: bool
     xai_x_search_enabled: bool
     xai_web_search_max_sources: int
@@ -27,6 +28,7 @@ class Settings:
     db_path: str
     default_prefix: str
     bot_owner_ids: tuple[int, ...]
+    nitori_log_level: int
 
 
 def load_settings() -> Settings:
@@ -35,8 +37,8 @@ def load_settings() -> Settings:
     discord_token = os.getenv("DISCORD_TOKEN", "").strip()
     xai_api_key = os.getenv("XAI_API_KEY", "").strip()
     glot_api_token = os.getenv("GLOT_API_TOKEN", "").strip()
-    glot_base_url = os.getenv("GLOT_BASE_URL", "https://run.glot.io").strip() or "https://run.glot.io"
-    glot_api_mode = os.getenv("GLOT_API_MODE", "run_api").strip().lower() or "run_api"
+    # Self-hosted glotcode/docker-run (GLOT_API_TOKEN is its API_ACCESS_TOKEN); run.glot.io no longer exists.
+    glot_base_url = os.getenv("GLOT_BASE_URL", "http://127.0.0.1:8088").strip() or "http://127.0.0.1:8088"
     api_ninjas_key = os.getenv("API_NINJAS_KEY", "").strip()
     api_football_key = os.getenv("API_FOOTBALL_KEY", "").strip()
     api_football_base_url = os.getenv(
@@ -44,12 +46,14 @@ def load_settings() -> Settings:
         "https://v3.football.api-sports.io",
     ).strip() or "https://v3.football.api-sports.io"
     api_football_timezone = os.getenv("API_FOOTBALL_TIMEZONE", "America/Mexico_City").strip() or "America/Mexico_City"
-    xai_model = os.getenv("XAI_MODEL", "grok-4-1-fast-reasoning").strip()
+    xai_model = os.getenv("XAI_MODEL", "grok-4.3").strip()
     xai_vision_model = os.getenv("XAI_VISION_MODEL", xai_model).strip() or xai_model
     xai_image_model = os.getenv("XAI_IMAGE_MODEL", "grok-imagine-image-quality").strip()
     xai_image_model = xai_image_model or "grok-imagine-image-quality"
     xai_tts_voice = os.getenv("XAI_TTS_VOICE", "iris").strip() or "iris"
     xai_tts_language = os.getenv("XAI_TTS_LANGUAGE", "es-MX").strip() or "es-MX"
+    nitori_log_level = _env_log_level("NITORI_LOG_LEVEL", default=logging.INFO)
+    router_ceiling = _env_int("XAI_ROUTER_OUTPUT_TOKEN_CEILING", default=0, minimum=0, maximum=32000)
     xai_web_search_enabled = _env_bool("XAI_WEB_SEARCH_ENABLED", default=False)
     xai_x_search_enabled = _env_bool("XAI_X_SEARCH_ENABLED", default=False)
     xai_web_search_max_sources = _env_int("XAI_WEB_SEARCH_MAX_SOURCES", default=3, minimum=1, maximum=5)
@@ -79,7 +83,6 @@ def load_settings() -> Settings:
         xai_api_key=xai_api_key,
         glot_api_token=glot_api_token,
         glot_base_url=glot_base_url,
-        glot_api_mode=glot_api_mode,
         api_ninjas_key=api_ninjas_key,
         api_football_key=api_football_key,
         api_football_base_url=api_football_base_url,
@@ -89,6 +92,7 @@ def load_settings() -> Settings:
         xai_image_model=xai_image_model,
         xai_tts_voice=xai_tts_voice,
         xai_tts_language=xai_tts_language,
+        xai_router_output_token_ceiling=router_ceiling or None,
         xai_web_search_enabled=xai_web_search_enabled,
         xai_x_search_enabled=xai_x_search_enabled,
         xai_web_search_max_sources=xai_web_search_max_sources,
@@ -96,6 +100,7 @@ def load_settings() -> Settings:
         db_path=db_path,
         default_prefix=default_prefix,
         bot_owner_ids=tuple(owner_ids),
+        nitori_log_level=nitori_log_level,
     )
 
 
@@ -109,6 +114,11 @@ def _env_bool(name: str, *, default: bool) -> bool:
     if value in {"0", "false", "no", "n", "off"}:
         return False
     return default
+
+
+def _env_log_level(name: str, *, default: int) -> int:
+    raw = os.getenv(name, "").strip().upper()
+    return logging.getLevelNamesMapping().get(raw, default)
 
 
 def _env_int(name: str, *, default: int, minimum: int, maximum: int) -> int:

@@ -11,6 +11,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from services.admin_actions import AdminActionService
 from services.voice_messages import DiscordVoiceMessageSender, VoiceAudioProcessor, sanitize_tts_text
 from services.xai_client import XAITTSAuthorizationError
 from utils.i18n import tr
@@ -190,8 +191,8 @@ class FunCog(commands.Cog):
         target_day = min(base.day, max_day)
         return base.replace(year=target_year, month=target_month, day=target_day)
 
+    @staticmethod
     def _compute_reminder_timestamp(
-        self,
         *,
         value: int,
         unit: str,
@@ -209,9 +210,9 @@ class FunCog(commands.Cog):
         elif unit == "w":
             target = now_local + timedelta(weeks=value)
         elif unit == "mo":
-            target = self._add_months(now_local, value)
-        else:  # unit == "y"
-            target = self._add_months(now_local, value * 12)
+            target = FunCog._add_months(now_local, value)
+        else:
+            target = FunCog._add_months(now_local, value * 12)
 
         reminder_local = datetime.combine(
             target.date(),
@@ -299,11 +300,7 @@ class FunCog(commands.Cog):
         channel = getattr(ctx, "channel", None)
         if channel is None:
             return False
-        try:
-            await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
-            return True
-        except (discord.Forbidden, discord.HTTPException):
-            return False
+        return await AdminActionService.send_as_bot(channel, text)
 
     async def _send_say_voice_as_bot(self, ctx: commands.Context, text: str) -> tuple[bool, str]:
         channel = getattr(ctx, "channel", None)
@@ -372,6 +369,7 @@ class FunCog(commands.Cog):
         description="Set a reminder with m, h, d, w, mo or y.",
     )
     @discord.app_commands.rename(reminder_message="message")
+    @discord.app_commands.describe(duration="Time until the reminder, such as 10m, 2h, 7d, 3mo", reminder_message="What to remind you about")
     async def remindme(self, ctx: commands.Context, duration: str, *, reminder_message: str) -> None:
         lang = await self._lang(ctx.guild)
         if ctx.guild is None or not isinstance(ctx.channel, discord.TextChannel):
@@ -406,18 +404,14 @@ class FunCog(commands.Cog):
             )
             return
 
-        value, unit = parsed
-        remind_at_ts, exact_time = self._compute_reminder_timestamp(value=value, unit=unit)
+        created = await create_reminder(
+            self.bot.db, ctx.guild.id, ctx.author.id, ctx.channel.id, duration, message_text,
+        )
+        reminder_id = created["reminder_id"]
+        remind_at_ts = created["remind_at"]
+        exact_time = created["exact_time"]
         when_full = f"<t:{remind_at_ts}:F>"
         when_relative = f"<t:{remind_at_ts}:R>"
-
-        reminder_id = await self.bot.db.create_reminder(
-            guild_id=ctx.guild.id,
-            user_id=ctx.author.id,
-            channel_id=ctx.channel.id,
-            message=message_text,
-            remind_at=remind_at_ts,
-        )
 
         if exact_time:
             confirm_text = tr(
@@ -459,7 +453,7 @@ class FunCog(commands.Cog):
         if guild_id is None or user is None:
             return []
 
-        rows = await self.bot.db.list_active_reminders_for_user(guild_id, user.id, limit=25)
+        rows = await list_reminders(self.bot.db, guild_id, user.id)
         current_cf = (current or "").casefold().strip()
 
         choices: list[app_commands.Choice[str]] = []
@@ -495,7 +489,7 @@ class FunCog(commands.Cog):
             )
             return
 
-        active = await self.bot.db.list_active_reminders_for_user(ctx.guild.id, ctx.author.id, limit=100)
+        active = await list_reminders(self.bot.db, ctx.guild.id, ctx.author.id, limit=100)
         if not active:
             await ctx.send(
                 tr(
@@ -531,11 +525,7 @@ class FunCog(commands.Cog):
             )
             return
 
-        result = await self.bot.db.remove_reminder_for_user(
-            guild_id=ctx.guild.id,
-            user_id=ctx.author.id,
-            reminder_id=reminder_id,
-        )
+        result = await remove_reminder(self.bot.db, ctx.guild.id, ctx.author.id, reminder_id)
         if result is None:
             await ctx.send(
                 tr(
@@ -600,6 +590,40 @@ class FunCog(commands.Cog):
             except (discord.NotFound, discord.HTTPException):
                 pass
         await ctx.send(msg)
+
+
+class ReminderError(ValueError):
+    pass
+
+
+def validate_reminder(duration: str, message: str) -> tuple[int, bool, str]:
+    parsed = FunCog._parse_reminder_input(duration)
+    if parsed is None:
+        raise ReminderError("invalid_duration")
+    text = message.strip()
+    if not text:
+        raise ReminderError("empty_message")
+    try:
+        remind_at, exact_time = FunCog._compute_reminder_timestamp(value=parsed[0], unit=parsed[1])
+    except (ValueError, OverflowError):  # a huge value overflows the calendar
+        raise ReminderError("invalid_duration") from None
+    return remind_at, exact_time, text
+
+
+async def create_reminder(db, guild_id: int, user_id: int, channel_id: int, duration: str, message: str) -> dict:
+    remind_at, exact_time, text = validate_reminder(duration, message)
+    reminder_id = await db.create_reminder(
+        guild_id=guild_id, user_id=user_id, channel_id=channel_id, message=text, remind_at=remind_at,
+    )
+    return {"reminder_id": reminder_id, "remind_at": remind_at, "exact_time": exact_time}
+
+
+async def list_reminders(db, guild_id: int, user_id: int, limit: int = 25) -> list[dict]:
+    return await db.list_active_reminders_for_user(guild_id, user_id, limit=limit)
+
+
+async def remove_reminder(db, guild_id: int, user_id: int, reminder_id: int) -> str | None:
+    return await db.remove_reminder_for_user(guild_id=guild_id, user_id=user_id, reminder_id=reminder_id)
 
 
 async def setup(bot: commands.Bot) -> None:

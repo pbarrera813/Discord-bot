@@ -3,13 +3,13 @@ from __future__ import annotations
 import io
 import os
 import re
-import shlex
 from typing import Any
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+from services.glot import execute_run, truncate_output
 from utils.i18n import tr
 
 
@@ -115,30 +115,6 @@ class CodeRunnerCog(commands.Cog):
         return LANGUAGE_ALIASES.get(compact_key)
 
     @staticmethod
-    def _preferred_run_command(language_slug: str, filename: str) -> str | None:
-        # Try modern standard first for C++; fallback is handled in command execution.
-        if language_slug != "cpp":
-            return None
-        safe_source = shlex.quote(filename or "main.cpp")
-        return f"g++ -std=c++23 {safe_source} -O2 -pipe -o main && ./main"
-
-    @staticmethod
-    def _needs_cpp_runtime_fallback(result: dict[str, Any]) -> bool:
-        stderr = str(result.get("stderr", "") or "").lower()
-        error = str(result.get("error", "") or "").lower()
-        combined = f"{stderr}\n{error}"
-        return (
-            "g++: command not found" in combined
-            or "exit code: 127" in combined
-            or "exit status 127" in combined
-        )
-
-    @staticmethod
-    def _strip_code_fence(raw_code: str) -> str:
-        code, _ = CodeRunnerCog._parse_code_input(raw_code)
-        return code
-
-    @staticmethod
     def _parse_code_input(raw_code: str) -> tuple[str, str | None]:
         code = raw_code.strip()
         if not code.startswith("```"):
@@ -165,11 +141,7 @@ class CodeRunnerCog(commands.Cog):
                 code = single_line
         return code.strip("\n"), detected_language
 
-    @staticmethod
-    def _truncate(value: str, limit: int = 1400) -> str:
-        if len(value) <= limit:
-            return value
-        return f"{value[:limit]}..."
+    _truncate = staticmethod(truncate_output)
 
     @staticmethod
     def _resolve_from_extension(filename: str) -> tuple[str, str] | None:
@@ -389,58 +361,19 @@ class CodeRunnerCog(commands.Cog):
             return
 
         await self._defer_if_needed(ctx)
-        preferred_command = self._preferred_run_command(language_slug, filename)
-        used_cpp_fallback = False
         try:
-            result = await client.run_code(
-                language=language_slug,
-                code=cleaned_code,
-                filename=filename,
-                command=preferred_command,
-            )
+            result = await execute_run(client, language_slug, cleaned_code, filename)
         except Exception as exc:
-            if language_slug == "cpp" and preferred_command:
-                try:
-                    result = await client.run_code(
-                        language=language_slug,
-                        code=cleaned_code,
-                        filename=filename,
-                    )
-                    used_cpp_fallback = True
-                except Exception:
-                    await ctx.send(
-                        tr(
-                            lang,
-                            f"Run failed: {exc}",
-                            f"La ejecucion fallo: {exc}",
-                        )
-                    )
-                    return
-            else:
-                await ctx.send(
-                    tr(
-                        lang,
-                        f"Run failed: {exc}",
-                        f"La ejecucion fallo: {exc}",
-                    )
+            await ctx.send(
+                tr(
+                    lang,
+                    f"Run failed: {exc}",
+                    f"La ejecucion fallo: {exc}",
                 )
-                return
+            )
+            return
 
-        if language_slug == "cpp" and preferred_command and self._needs_cpp_runtime_fallback(result):
-            try:
-                result = await client.run_code(
-                    language=language_slug,
-                    code=cleaned_code,
-                    filename=filename,
-                )
-                used_cpp_fallback = True
-            except Exception:
-                # Keep original result so user sees the underlying runtime error.
-                pass
-
-        stdout = str(result.get("stdout", "") or "")
-        stderr = str(result.get("stderr", "") or "")
-        error = str(result.get("error", "") or "")
+        stdout, stderr, error = result["stdout"], result["stderr"], result["error"]
 
         if error.strip():
             embed_color = discord.Color.red()
@@ -458,12 +391,6 @@ class CodeRunnerCog(commands.Cog):
             embed.set_thumbnail(url=logo_url)
         language_display = LANGUAGE_DISPLAY.get(language_slug, language_slug)
         embed.add_field(name=tr(lang, "Language", "Lenguaje"), value=f"`{language_display}`", inline=True)
-        if used_cpp_fallback:
-            embed.add_field(
-                name=tr(lang, "Runtime", "Runtime"),
-                value=tr(lang, "Default C++ runtime (fallback)", "Runtime C++ por defecto (fallback)"),
-                inline=True,
-            )
 
         no_output = not stdout.strip() and not stderr.strip() and not error.strip()
         if no_output:

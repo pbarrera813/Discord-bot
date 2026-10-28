@@ -105,6 +105,7 @@ class MinecraftCog(commands.Cog):
         name="srvstatus",
         description="Check Minecraft server status using mcsrvstat API.",
     )
+    @discord.app_commands.describe(ip="Server IP or domain, for example play.example.com")
     async def srvstatus(self, ctx: commands.Context, ip: str) -> None:
         lang = await self._lang(ctx.guild)
         ip = ip.strip()

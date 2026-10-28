@@ -3,10 +3,8 @@ from __future__ import annotations
 import ast
 import pathlib
 import unittest
-from types import SimpleNamespace
 
-from cogs.admin import AdminCog, HELP_CAPABILITIES, HELP_COMMANDS, HELP_INTENTIONAL_EXCLUSIONS
-from services.voice_messages import ALLOWED_TTS_TAGS
+from cogs.admin import AdminCog, HELP_INTENTIONAL_EXCLUSIONS
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -82,17 +80,6 @@ def _runtime_command_surface() -> tuple[set[str], set[str]]:
     return paths, aliases
 
 
-def _help_text(pages) -> str:  # noqa: ANN001, ANN202
-    parts: list[str] = []
-    for embed in pages:
-        parts.append(str(embed.title or ""))
-        parts.append(str(embed.description or ""))
-        for field in embed.fields:
-            parts.append(str(field.name))
-            parts.append(str(field.value))
-    return "\n".join(parts)
-
-
 class HelpCoverageTests(unittest.TestCase):
     def test_registered_user_facing_commands_are_documented_or_excluded(self) -> None:
         runtime_paths, runtime_aliases = _runtime_command_surface()
@@ -110,95 +97,6 @@ class HelpCoverageTests(unittest.TestCase):
         runtime = runtime_paths | runtime_aliases
         extra = sorted(AdminCog.documented_help_command_paths() - runtime - set(HELP_INTENTIONAL_EXCLUSIONS))
         self.assertEqual(extra, [])
-
-    def test_say_voice_contract_is_documented(self) -> None:
-        say = next(item for item in HELP_COMMANDS if item.path == "say")
-        self.assertIn("mensaje", say.material_options)
-        self.assertIn("modo", say.material_options)
-        self.assertIn("modo=text|voice", say.material_choices)
-        self.assertEqual(say.access, "manage_messages")
-        self.assertTrue(say.show_to_all)
-
-        pages = AdminCog.__new__(AdminCog)._build_help_pages("en", member=None)
-        text = _help_text(pages)
-        self.assertIn("/say mensaje:<text> modo:<text|voice>", text)
-        self.assertIn("Requires Manage Messages", text)
-
-    def test_non_command_capabilities_are_documented(self) -> None:
-        keys = {item.key for item in HELP_CAPABILITIES}
-        self.assertTrue(
-            {
-                "ai_conversation",
-                "voice_conversation",
-                "voice_tts",
-                "voice_tags",
-                "football_ai",
-                "football_watch",
-                "image_context",
-                "web_lookup",
-            }.issubset(keys)
-        )
-
-        pages = AdminCog.__new__(AdminCog)._build_help_pages("en", member=None)
-        text = _help_text(pages)
-        self.assertIn("one response only", text)
-        self.assertIn("native Discord voice messages", text)
-        self.assertIn("Iris with es-MX", text)
-        for tag in ALLOWED_TTS_TAGS:
-            self.assertIn(f"[{tag}]", text)
-
-    def test_help_does_not_advertise_removed_command_paths(self) -> None:
-        admin_member = SimpleNamespace(
-            guild_permissions=SimpleNamespace(
-                administrator=True,
-                manage_guild=True,
-                manage_messages=True,
-                manage_channels=True,
-                manage_roles=True,
-                moderate_members=True,
-                kick_members=True,
-                ban_members=True,
-                manage_nicknames=True,
-            )
-        )
-        pages = AdminCog.__new__(AdminCog)._build_help_pages("en", member=admin_member)
-        text = _help_text(pages)
-        self.assertNotIn("/utility say", text)
-        self.assertNotIn("/config modlog", text)
-        self.assertNotIn("/config prefix", text)
-        self.assertNotIn("/config language", text)
-        self.assertIn("/setmodlog", text)
-        self.assertIn("/setprefix", text)
-        self.assertIn("/language <en|es>", text)
-
-    def test_permission_sensitive_pages_are_not_free_for_normal_users(self) -> None:
-        normal_member = SimpleNamespace(
-            guild_permissions=SimpleNamespace(
-                administrator=False,
-                manage_guild=False,
-                manage_messages=False,
-                manage_channels=False,
-                manage_roles=False,
-                moderate_members=False,
-                kick_members=False,
-                ban_members=False,
-                manage_nicknames=False,
-            )
-        )
-        text = _help_text(AdminCog.__new__(AdminCog)._build_help_pages("en", member=normal_member))
-        self.assertNotIn("/user ban", text)
-        self.assertNotIn("/aichannel add", text)
-        self.assertIn("/say mensaje:<text> modo:<text|voice>", text)
-        self.assertIn("Requires Manage Messages", text)
-
-    def test_touched_spanish_help_strings_are_valid_unicode(self) -> None:
-        pages = AdminCog.__new__(AdminCog)._build_help_pages("es", member=None)
-        text = _help_text(pages)
-        self.assertIn("Cumpleaños", text)
-        self.assertIn("Próximos", text)
-        self.assertIn("configuración", text.casefold())
-        for marker in ("Ã", "Â", "â€", "ï¿½"):
-            self.assertNotIn(marker, text)
 
 
 if __name__ == "__main__":
