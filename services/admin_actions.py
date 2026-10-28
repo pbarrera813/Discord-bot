@@ -123,20 +123,31 @@ class AdminActionService:
         target: str,
         reason: str,
         details: str | None = None,
+        event_key: tuple[str, int] | None = None,
     ) -> None:
+        color = discord.Color.blue()
+        if event_key is not None:
+            color = discord.Color.red() if event_key[0] == "channel_delete" else discord.Color.green()
         embed = discord.Embed(
             title=title,
-            color=discord.Color.blue(),
+            color=color,
             timestamp=datetime.now(timezone.utc),
         )
         embed.add_field(name="Moderator", value=moderator.mention, inline=True)
-        embed.add_field(name="Target", value=target, inline=True)
+        if title in {"Channel Created", "Channel Deleted"}:
+            embed.description = target
+        else:
+            embed.add_field(name="Target", value=target, inline=True)
         if reason:
             embed.add_field(name="Reason", value=reason[:1024], inline=False)
         if details:
             embed.add_field(name="Details", value=details[:1024], inline=False)
+        if event_key is not None:
+            embed.set_footer(text=f"Channel ID: {event_key[1]} | User ID: {moderator.id}")
         try:
-            await send_modlog_embed(guild, self.db, embed)
+            await send_modlog_embed(guild, self.db, embed, **(
+                {"event_key": event_key, "event_enriched": True} if event_key is not None else {}
+            ))
         except Exception:
             # The Discord mutation already happened; logging must not make a
             # successful effect appear retryable.
@@ -416,7 +427,7 @@ class AdminActionService:
             return AdminActionResult(False, tr(lang, "I do not have permission to create channels.", "No tengo permisos para crear canales."), "create_channel_forbidden")
         except discord.HTTPException as exc:
             return AdminActionResult(False, tr(lang, f"Failed to create channel: {exc}", f"No se pudo crear el canal: {exc}"), "create_channel_http_error")
-        await self._log_action(guild, title="Channel Created", moderator=actor, target=f"#{getattr(channel, 'name', name)}", reason="AI channel creation")
+        await self._log_action(guild, title="Channel Created", moderator=actor, target=f"#{discord.utils.escape_markdown(getattr(channel, 'name', name))}", reason="", event_key=("channel_create", channel.id))
         return AdminActionResult(
             True,
             tr(lang, f"Created channel {getattr(channel, 'mention', '#' + name)}.", f"Canal creado {getattr(channel, 'mention', '#' + name)}."),
@@ -444,7 +455,7 @@ class AdminActionService:
             return AdminActionResult(False, tr(lang, "I do not have permission to delete channels.", "No tengo permisos para eliminar canales."), "delete_channel_forbidden")
         except discord.HTTPException as exc:
             return AdminActionResult(False, tr(lang, f"Failed to delete channel: {exc}", f"No se pudo eliminar el canal: {exc}"), "delete_channel_http_error")
-        await self._log_action(guild, title="Channel Deleted", moderator=actor, target=f"#{name} ({channel_id})", reason=reason_text)
+        await self._log_action(guild, title="Channel Deleted", moderator=actor, target=f"#{discord.utils.escape_markdown(name)}", reason=reason_text, event_key=("channel_delete", channel.id))
         return AdminActionResult(True, tr(lang, f"Deleted channel #{name}.", f"Canal eliminado #{name}."), "channel_deleted")
 
     async def _sync_warning_roles(self, guild: discord.Guild, member: discord.Member, count: int, *, reason: str) -> None:
@@ -918,6 +929,7 @@ class AdminActionService:
             target=f"#{channel.name} ({channel.id})",
             reason=reason or "AI channel clone",
             details=f"Clone created: #{cloned.name} ({cloned.id})",
+            event_key=("channel_create", cloned.id),
         )
         if not positioned:
             return AdminActionResult(

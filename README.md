@@ -1,7 +1,7 @@
 # Nitori Discord Bot
 
 ## Why This Bot Exists
-Nitori was built as a single, no-paywall Discord bot for communities that want basically an all in one bot. Nitori can chat with you via AI and, just by asking in plain language, moderate your server, run your code, make memes, draw and edit images, read links, check several football leagues and minecraft server status, and remind everyone in the server of birthdays, join and server anniversaries. Every feature also keeps its normal slash/prefix command, so nothing depends on talking to the AI. All of this without the need to pay for any of the functions and be able to use them, just add it to your server (or run it yourself), run the /setup command to know what to do and you are on!
+Nitori was built as a single, no-paywall Discord bot for communities that want basically an all in one bot. Nitori can chat with you via AI and, just by asking in plain language, moderate your server, run your code, make memes, draw and edit images, read links, check several football leagues and minecraft server status, and remind everyone in the server of birthdays, join and server anniversaries. Existing slash/prefix commands remain available; image generation/editing, link reading and web research are accessed through natural-language requests. All of this without the need to pay for any of the functions and be able to use them, just add it to your server (or run it yourself), run the /setup command to know what to do and you are on!
 
 ## Core Idea
 - One bot, all-in-one workflow.
@@ -10,7 +10,7 @@ Nitori was built as a single, no-paywall Discord bot for communities that want b
 - xAI understands the request, deterministic code checks it. A router model returns a strict, typed plan: which capabilities to run, with which inputs and in which order. The bot validates authorization, identity, scope and dependencies from live Discord state (never from what a message claims), runs the features, and the final reply is written only from those trusted results. If the validator refuses a plan, the router gets one chance to correct it.
 - Anything that changes the server or your data (moderation, settings, memory, reminders, birthdays) needs the real Discord permission for it, is checked as a whole before it runs, and is never retried or rolled back automatically. Without the permission Nitori says which one is missing and does nothing.
 - Nitori replies in the server's configured language (`/language`).
-- Calls to xAI are built for prompt caching and every call logs its token use and cost (see Logging and Persistence).
+- Language-model requests use stable prompt-cache routing keys and log provider-reported token usage and cost when available (see Logging and Persistence).
 
 ## Main Features
 - Moderation toolkit (message, user, channel, role, and color-role panel management), also available by asking Nitori when you hold the matching permission.
@@ -102,7 +102,7 @@ python bot.py
 - Ask for memes in plain words: a named template, a random one, or a caption on a picture you attach or reply to. Nitori writes the caption unless you dictate it, and tells you when a template name does not exist instead of guessing one.
 - Ask Nitori to translate text into any language, run code you give it, set or remove your own reminders and birthday, check a Minecraft server address, or tell a joke, dad joke, advice, a whois lookup or a unit conversion.
 - Ask Nitori for server administration in plain words (roles, kick/ban/unban/temporary bans, mute/unmute, warnings, deleting or purging messages, creating/deleting/locking/unlocking/clearing/cloning channels, slowmode, nicknames, join/leave stats, `say`, mod-log, prefix, language, anti-spam/anti-link, AI channel scope, color roles, server context). Nitori checks your real Discord permissions first; some actions ask you to confirm.
-- Ask Nitori to remember, look up, list or forget structured server memory; members can approve or reject only their own pending nickname/alias/preference entries.
+- Ask Nitori to remember, look up, list or forget structured server memory. In conversation, members can approve or reject pending entries about themselves, or delete their own eligible entries: nicknames, aliases, personal/football preferences, personal facts and inside jokes. Administrator/manage-guild authority is required for broader memory management and the `/servercontext` commands below.
 - Trusted bot owners/guild admins can naturally update Nitori's server behavior and style rules; authority is checked from runtime Discord/config state, not from claims in message text.
 - `/setservercontext <#channel>` (admin/manage guild)
 - `/resetservercontext [summaries|memory|ai_history|all]` (admin/manage guild)
@@ -251,33 +251,46 @@ Admin commands (slash-visible for admins only):
 - In chat, give Nitori the address; it never guesses one.
 
 ### Sports (Football)
+
+The six-milestone Football command/card upgrade and command cleanup are complete and operator-accepted as of 2026-10-28.
+
 - `/football live <league>`
 - `/football today <league>`
-- `/football next <league> [count|team]`
-- `/football last <league> <team>`
+- `/football next <league> [target:<count-or-team>] [season]`
+- `/football last <league> [team] [count] [season]`
 - `/football table <league>`
-- `/football team <league> <team>`
-- `/football scorers <league>`
-- `/football match <fixture|team>`
-- `/football schedule <team|league> [next|last|season]`
-- `/football player <player>`
-- `/football lineup <fixture_id>`
-- `/football stats <fixture_id>`
-- `/football injuries <team>`
-- `/football transfers <team>`
-- `/football h2h <team_a> <team_b>`
-- `/football top <scorers|assists|yellowcards|redcards>`
-- `/football preview <fixture_id>`
-- `/football summary <fixture_id>`
+- `/football team <league> <team> [season]`
+- `/football match team:<name> [when:auto|live|next|last] [league]`
+- `/football schedule team:<name> date:<next|last> [league] [count]`
+- `/football player <player> [league] [season] [team]`
+- `/football injuries <team> [league]`
+- `/football transfers <team> [league]`
+- `/football h2h team:<name> opponent:<name> [league] [matches]`
+- `/football top [category:scorers|assists|yellowcards|redcards] [league]`
+- `/football odds-reference [scope:bookmakers|bets|live_bets] [query]`
+- `/football odds-mapping [page]`
+- `/football timezones`
+- `/football countries [filter:name|code|search] [query]`
+- `/football seasons`
 
-Supported leagues:
+Schedule selects one match: `count` is its position, defaults to 1 and accepts 1-50. For example, `/football schedule team:Tigres UANL date:next count:2` opens the second upcoming match. With no league supplied, Schedule resolves the team's current domestic league; an explicit league changes that scope. H2H's `matches` is a sample quantity, defaults to 10 and accepts 1-50. Its optional league helps identify the teams; the returned meetings can span competitions. Next's `target` accepts either a fixture quantity (default 10, maximum 50) or a team name; Last's `count` is a fixture quantity with the same default and limit.
+
+Player statistics use the explicit season when supplied, the selected league's current season when a league is supplied without a season, or the player's latest registered season otherwise. The chosen season is labeled, each team/competition statistics block stays separate, and the optional team field narrows ambiguous player identities.
+
+Main Football views are standalone image cards. Section menus and Previous/Next buttons expose the available records; fixture lists let you select a match and return to the same list page. Only the requesting user can operate the controls. Text sends the current card's information as paginated ephemeral replies visible only to that user. After three minutes of inactivity, controls expire and the command must be run again. Browsing loaded pages reuses their data; Refresh respects the provider cache. Successful empty results use contextual text messages.
+
+The match menu includes preview, lineups, statistics, events, player performances, period scores, season comparisons, provider forecasts and odds. Forecasts and odds load only when opened. For an upcoming match, use `/football match team:<name> when:next`; for a current match, use `when:live`. Open the desired section after selecting the match. Scorers are available through `/football top category:scorers`. These menu sections replace the former standalone preview, lineup, stats, summary, odds, live-odds and scorers commands.
+
+Team cards also offer current squads, registered seasons, coach profiles and venue details. Player cards offer career teams, transfer history, trophies and recorded absences. These sections load only when opened. The squad is current even when viewing another season; career/history sections retain their full recorded scope.
+
+League fields support provider-backed autocomplete and league-name searches, subject to API-Football's league/season coverage. Existing shortcuts remain available:
 - `ligamx`
 - `premier`
 - `laliga`
 - `concacaf`
 - `worldcup`
 
-Natural AI football requests are not limited to these short keys. When addressed directly, Nitori can resolve natural names such as Liga MX, Liga de Expansion MX, Premier League, LaLiga, World Cup, clubs, national teams, and player aliases through the shared football resolver before calling API-Football.
+Natural AI football requests also accept league, team and player names. xAI supplies typed identity candidates, and the shared resolver validates them against API-Football results before answering.
 
 The AI football pipeline also supports typed follow-ups from validated football context, fixture result/date questions, match-center details, events, statistics, lineups, fixture-player data, injuries, transfers, top scorers/assists/cards, H2H, and live-watch selection without treating model guesses as facts.
 
@@ -319,9 +332,13 @@ Supported source files:
 - Uses SQLite (`DB_PATH`) for server settings, reminders, warns, temp actions, and context.
 - AI responses, structured server memories, trusted behavior rules, and football/image context metadata are persisted where needed for replies and future context.
 - Live football watches are in-memory only; bot restart clears active watches.
-- Modlog channel receives moderation and selected API/command events.
-- Every xAI call writes one journal line such as `AI xAI usage role=nitori-router input=15356 cached=13952 output=1077 reasoning=300 cost_usd=0.0072`, so token use, prompt-cache hits and cost per call are visible. Requests keep their stable parts first and send a per-role cache key so repeated prompt prefixes are billed at the cached rate.
-- Data is persistent across bot restarts.
+- The modlog channel receives moderation and selected API/command events as compact native Discord cards, with localized labels, requester/context information and small-text footer items on separate lines. Football command logs include relevant search options. Command logs use selected fields rather than copying raw invocations, code or message bodies automatically.
+- Channel creation/deletion/cloning reports share one card when the action service and Discord event listener report the same guild/event/channel. Requester details enrich that card. Created/deleted channel names appear once as plain text. This correlation is in-memory and bounded to five minutes/512 entries. Distinct member-change records and per-message deletion evidence remain separate from action summaries.
+- Edited/deleted-message logs retain text, attachment/image evidence, spoiler flags, IDs and the existing context/user-ID controls.
+- Language-model Responses requests log usage once when the provider returns it, for example `AI xAI usage role=nitori-router input=15356 cached=13952 output=1077 reasoning=300 cost_usd=0.0072`. Missing cost is reported as `n/a`; responses without usage do not emit that usage line.
+- Stable cache-routing keys cover the router, chat, reactions, Football identity helpers, recovery planning/assessment, translation, server-context summaries, web research and tool-backed URL image editing. Fixed instructions precede changing request context. Cache hits depend on matching prompt prefixes and provider cache availability; a key does not guarantee a hit, lifetime or saving. Prompt caching reuses input processing; provider requests retain their existing freshness rules.
+- Direct image-generation/editing and TTS endpoints are separate from language-model prompt caching and the Responses usage logger.
+- SQLite data persists across bot restarts; Football card controls, active watches and transient correlation/cache state do not.
 
 ## Deployment (systemd example)
 ```ini

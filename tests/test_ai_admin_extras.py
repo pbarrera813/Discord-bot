@@ -157,7 +157,7 @@ class _Modlog:
     def __init__(self) -> None:
         self.embeds: list[discord.Embed] = []
 
-    async def __call__(self, _guild: object, _db: object, embed: discord.Embed) -> None:
+    async def __call__(self, _guild: object, _db: object, embed: discord.Embed, **_kwargs: object) -> None:
         self.embeds.append(embed)
 
     def fields(self, index: int = 0) -> list[tuple[str, str]]:

@@ -562,7 +562,7 @@ class ModerationCog(commands.Cog):
                     color=discord.Color.from_rgb(255, 74, 34),
                     timestamp=logged_at,
                 )
-                embed.description = f"{tr(lang, 'From', 'De')}: <@{author_id}>    {tr(lang, 'In', 'En')}: {channel_mention}"
+                embed.description = f"{tr(lang, 'From', 'De')}: <@{author_id}> · {tr(lang, 'In', 'En')}: {channel_mention}"
                 embed.set_footer(text=f"Author: {author_id} | Message ID: {message_id}")
                 if other_attachments:
                     names = ", ".join(dict.fromkeys(other_attachments))[:500]
@@ -609,17 +609,17 @@ class ModerationCog(commands.Cog):
     async def on_guild_channel_create(self, channel: discord.abc.GuildChannel) -> None:
         lang = await self._lang(channel.guild)
         embed = discord.Embed(title=tr(lang, "Channel created", "Canal creado"), color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
-        embed.description = tr(lang, f"Channel created: {channel.mention}", f"Canal creado: {channel.mention}")
+        embed.description = f"#{discord.utils.escape_markdown(channel.name)}"
         embed.set_footer(text=f"Channel ID: {channel.id}")
-        await send_modlog_embed(channel.guild, self.bot.db, embed)
+        await send_modlog_embed(channel.guild, self.bot.db, embed, event_key=("channel_create", channel.id))
 
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
         lang = await self._lang(channel.guild)
         embed = discord.Embed(title=tr(lang, "Channel deleted", "Canal eliminado"), color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
-        embed.description = tr(lang, f"Channel deleted: #{channel.name}", f"Canal eliminado: #{channel.name}")
+        embed.description = f"#{discord.utils.escape_markdown(channel.name)}"
         embed.set_footer(text=f"Channel ID: {channel.id}")
-        await send_modlog_embed(channel.guild, self.bot.db, embed)
+        await send_modlog_embed(channel.guild, self.bot.db, embed, event_key=("channel_delete", channel.id))
 
     async def _maybe_defer(self, ctx: commands.Context) -> None:
         if ctx.interaction is None:
@@ -1965,8 +1965,8 @@ class ModerationCog(commands.Cog):
         author_mention = getattr(before.author, "mention", f"<@{before.author.id}>")
         embed.description = tr(
             lang,
-            f"From: {author_mention}    In: {channel_mention}",
-            f"De: {author_mention}    En: {channel_mention}",
+            f"From: {author_mention} · In: {channel_mention}",
+            f"De: {author_mention} · En: {channel_mention}",
         )
         embed.add_field(
             name=tr(lang, "Before", "Antes"),
@@ -2493,6 +2493,10 @@ class ModerationCog(commands.Cog):
             )
             return
 
+        await self.admin_actions._log_action(
+            ctx.guild, title="Channel Created", moderator=ctx.author,
+            target=f"#{discord.utils.escape_markdown(created.name)}", reason="", event_key=("channel_create", created.id),
+        )
         await self._send_success(
             ctx,
             tr(
@@ -2555,6 +2559,10 @@ class ModerationCog(commands.Cog):
             )
             return
 
+        await self.admin_actions._log_action(
+            ctx.guild, title="Channel Deleted", moderator=ctx.author,
+            target=f"#{discord.utils.escape_markdown(deleted_name)}", reason="", event_key=("channel_delete", deleted_id),
+        )
         await self._send_success(
             ctx,
             tr(
