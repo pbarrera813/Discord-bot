@@ -421,6 +421,8 @@ class TeamSearchRequest:
             raise InvalidFootballApiRequest("team search requires a validated team name.")
         if self.search is not None and not isinstance(self.search, ValidatedTeamName):
             raise InvalidFootballApiRequest("team search requires a validated team search.")
+        if self.search is not None and (self.league_id is not None or self.season is not None):
+            raise InvalidFootballApiRequest("team search cannot be combined with league or season.")
         _validate_optional_id(self.league_id, "league_id")
         if self.season is not None and not isinstance(self.season, ValidatedSeason):
             raise InvalidFootballApiRequest("team search requires a validated season.")

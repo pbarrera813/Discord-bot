@@ -55,6 +55,7 @@ from services.ai_operation_catalog import (
     MEME_OPERATIONS,
     MEMORY_LIFECYCLE_OPERATIONS,
     is_memory_lifecycle,
+    canonical_operation_field,
 )
 from services.api_ninjas import NinjasOperandError, execute_operation as execute_ninjas_operation
 from services.glot import RUN_FILENAMES, execute_run, truncate_output
@@ -6088,7 +6089,7 @@ class AIChatCog(commands.Cog):
             query=query,
             lookup_type="general",
             max_sources=int(getattr(getattr(self.bot, "settings", None), "xai_web_search_max_sources", 3) or 3),
-            request_date=self._web_request_date(message),
+            request_date=self._football_request_temporal_context(message)[0],
             enable_image_understanding=bool(visual_objective),
             enable_image_search=bool(visual_objective),
             visual_objective=visual_objective,
@@ -6146,9 +6147,6 @@ class AIChatCog(commands.Cog):
         """xAI decides whether to search and writes the question from the typed failure state; code only validates and runs the existing web provider."""
 
         plan = execution_context.execution_plan
-        objectives = {
-            item.owner_task_id: item.objective for item in plan.semantic_plan.requirements if item.owner_task_id
-        }
         failed: dict[str, tuple[Any, CapabilityTerminalResult]] = {}
         for request in plan.ordered_capabilities:
             result = execution_context.results.get(request.task_id)
@@ -6161,25 +6159,32 @@ class AIChatCog(commands.Cog):
                 and result.native_outcome in self._RECOVERABLE_OUTCOMES
             ):
                 failed[request.task_id] = (request, result)
-        planner = getattr(getattr(self.bot, "llm_client", None), "plan_information_recovery", None)
-        if not failed or not callable(planner):
+        client = getattr(self.bot, "llm_client", None)
+        planner = getattr(client, "plan_information_recovery", None)
+        assessor = getattr(client, "assess_information_recovery", None)
+        if not failed or not callable(planner) or not callable(assessor):
             return
+        failures = {
+            task_id: {
+                "task_id": task_id,
+                "capability": request.name,
+                "operation": str(request.operands.get(canonical_operation_field(request.name) or "operation") or ""),
+                "provider": result.provider,
+                "outcome": result.native_outcome,
+                "objective": "\n".join(item.objective for item in plan.semantic_plan.requirements if item.required and item.owner_task_id == task_id),
+                "satisfaction_criterion": "\n".join(item.satisfaction_criterion for item in plan.semantic_plan.requirements if item.required and item.owner_task_id == task_id),
+            }
+            for task_id, (request, result) in failed.items()
+        }
+        request_date = self._football_request_temporal_context(message)[0]
         guild_id = getattr(message.guild, "id", 0)
         channel_id = getattr(message.channel, "id", 0)
         try:
             searches = await planner(
                 user_message=user_message,
                 conversation_history=self._build_conversation_history(self._conversation_key(guild_id, channel_id))[-8:],
-                failures=[
-                    {
-                        "task_id": task_id,
-                        "capability": request.name,
-                        "outcome": result.native_outcome,
-                        "objective": objectives.get(task_id, ""),
-                    }
-                    for task_id, (request, result) in failed.items()
-                ],
-                request_date=self._web_request_date(message),
+                failures=list(failures.values()),
+                request_date=request_date,
             )
         except Exception:
             logging.exception("AI information recovery planning failed")
@@ -6202,6 +6207,23 @@ class AIChatCog(commands.Cog):
                     "AI information recovery rejected capability=%s api_outcome=%s reason=no_grounded_answer",
                     request.name,
                     prior.native_outcome,
+                )
+                continue
+            try:
+                satisfied = await assessor(
+                    user_message=user_message,
+                    failure=failures[request.task_id],
+                    answer=payload.answer,
+                    sources=[source.url for source in payload.sources] or list(payload.citations),
+                    request_date=request_date,
+                )
+            except Exception:
+                logging.exception("AI information recovery assessment failed")
+                satisfied = False
+            if satisfied is not True:
+                logging.info(
+                    "AI information recovery rejected capability=%s api_outcome=%s reason=requirement_not_satisfied",
+                    request.name, prior.native_outcome,
                 )
                 continue
             execution_context.record(
@@ -8230,15 +8252,19 @@ class AIChatCog(commands.Cog):
                 getattr(operation.capability_intent, "operation_family", None),
             )
 
+            football_request_text = str(user_prompt or getattr(decision, "resolved_request", None) or "")
+            football_history = self._build_conversation_history(
+                self._conversation_key(getattr(message.guild, "id", 0), getattr(message.channel, "id", 0))
+            )[-8:]
             football_service = FootballOperationService(
                 client,
                 player_canonicalizer=self._football_player_canonicalizer(),
                 player_alias_cache=self._football_player_alias_cache(),
                 player_selector=self._football_player_selector(
-                    request_text=str(getattr(decision, "resolved_request", None) or user_prompt or "")[:500],
-                    history=self._build_conversation_history(
-                        self._conversation_key(getattr(message.guild, "id", 0), getattr(message.channel, "id", 0))
-                    )[-8:],
+                    request_text=football_request_text, history=football_history,
+                ),
+                identity_selector=self._football_identity_selector(
+                    request_text=football_request_text, history=football_history,
                 ),
             )
             result = await football_service.execute(
@@ -8251,6 +8277,7 @@ class AIChatCog(commands.Cog):
                 football_service, operation, result,
                 replan_method=getattr(getattr(self.bot, "llm_client", None), "replan_football_identity", None),
                 league_id=league_id, season=season, data_focus=data_focus,
+                request_text=football_request_text, history=football_history,
             )
             row_count, sample_digest, sample_length, compact_sample = self._football_standings_diagnostic(
                 result.standings_table
@@ -8916,6 +8943,12 @@ class AIChatCog(commands.Cog):
                     )
             except (TypeError, ValueError):
                 return None
+        if not scopes and all(
+            football_resolver.normalize_key(name) == football_resolver.normalize_key(slots[slot_index].name)
+            for name in names
+        ):
+            logging.info("AI football identity repair skipped slot_kind=%s slot_index=%s reason=no_new_candidates", slot_kind, slot_index)
+            return None
         return FootballIdentityReplan(
             slot_kind=slot_kind,
             slot_index=slot_index,
@@ -8925,6 +8958,7 @@ class AIChatCog(commands.Cog):
 
     async def _apply_bounded_football_identity_repairs(
         self, service, operation, result, *, replan_method, league_id, season, data_focus,
+        request_text=None, history=None,
     ):
         if not callable(replan_method):
             return result
@@ -8937,7 +8971,10 @@ class AIChatCog(commands.Cog):
         raw = await self._request_football_identity_replan(
             replan_method, operation, first, first_feedback,
             provider_progress=self._football_repair_progress({}, {}),
+            request_text=request_text, history=history,
         )
+        if raw is None:
+            return result
         first = self._football_identity_replan_candidate(
             operation, result, raw=raw, repair_feedback=first_feedback,
         )
@@ -8970,7 +9007,10 @@ class AIChatCog(commands.Cog):
         raw_second = await self._request_football_identity_replan(
             replan_method, operation, second, second_feedback,
             provider_progress=progress,
+            request_text=request_text, history=history,
         )
+        if raw_second is None:
+            return result
         second = self._football_identity_replan_candidate(
             operation, result, raw=raw_second, repair_feedback=second_feedback,
         )
@@ -9042,6 +9082,7 @@ class AIChatCog(commands.Cog):
 
     async def _request_football_identity_replan(
         self, method, operation, replan, feedback, *, provider_progress,
+        request_text=None, history=None,
     ):
         return await method(
             operation=operation.operation_type,
@@ -9058,6 +9099,7 @@ class AIChatCog(commands.Cog):
             season_hint=operation.season_hint,
             repair_feedback=feedback,
             provider_progress=provider_progress,
+            **({"request_text": request_text, "conversation_history": history} if request_text is not None else {}),
         )
 
     @staticmethod
@@ -9410,32 +9452,15 @@ class AIChatCog(commands.Cog):
 
         return _canonicalize
 
+    def _football_identity_selector(self, *, request_text: str, history: list[dict[str, str]]):
+        return football_resolver.make_identity_selector(
+            getattr(self.bot, "llm_client", None), request_text=request_text, history=history,
+        )
+
     def _football_player_selector(self, *, request_text: str, history: list[dict[str, str]]):
-        method = getattr(getattr(self.bot, "llm_client", None), "select_football_player_candidate", None)
-        if method is None:
-            return None
-
-        async def _select(candidates: tuple[dict[str, Any], ...]) -> int | None:
-            offered: list[dict[str, Any]] = []
-            for index, row in enumerate(candidates, start=1):
-                player = row.get("player") if isinstance(row, dict) and isinstance(row.get("player"), dict) else {}
-                stats = row.get("statistics") if isinstance(row, dict) and isinstance(row.get("statistics"), list) else []
-                team = stats[0].get("team") if stats and isinstance(stats[0], dict) and isinstance(stats[0].get("team"), dict) else {}
-                offered.append({
-                    "ref": f"p{index}",
-                    "name": player.get("name"),
-                    "firstname": player.get("firstname"),
-                    "lastname": player.get("lastname"),
-                    "age": player.get("age"),
-                    "nationality": player.get("nationality"),
-                    "team": team.get("name"),
-                })
-            chosen = await method(request_text=request_text, conversation_history=history, candidates=offered)
-            ref = chosen.get("ref") if isinstance(chosen, dict) else None
-            refs = [item["ref"] for item in offered]
-            return refs.index(ref) if ref in refs else None
-
-        return _select
+        return football_resolver.make_player_selector(
+            getattr(self.bot, "llm_client", None), request_text=request_text, history=history,
+        )
 
     @staticmethod
     def _football_generic_context(

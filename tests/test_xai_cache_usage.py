@@ -58,16 +58,32 @@ _COMPLETION = {
 
 class CompletionCacheKeyAndUsageTests(unittest.TestCase):
     def test_a_key_is_sent_only_when_given_and_usage_is_logged(self) -> None:
-        for cache_key, expected_role in (("nitori-chat", "nitori-chat"), (None, "other")):
-            with self.subTest(cache_key=cache_key):
+        for kind, cache_key, expected_role in (
+            ("completion", "nitori-chat", "nitori-chat"), ("completion", None, "other"),
+            ("json", "nitori-recovery-planner", "nitori-recovery-planner"),
+            ("web", "nitori-web-research", "nitori-web-research"),
+        ):
+            with self.subTest(kind=kind, cache_key=cache_key):
                 captured: dict = {}
-                client = _client(captured, body=_COMPLETION)
+                body = {**_COMPLETION, "output": [{"type": "message", "content": [{"type": "output_text", "text": '{"ok":true}'}]}]} if kind == "json" else _COMPLETION
+                client = _client(captured, body=body)
                 with self.assertLogs(level="INFO") as logs:
-                    result = asyncio.run(client._create_completion(
-                        [{"role": "user", "content": "hi"}], temperature=0.2, max_tokens=20, cache_key=cache_key,
-                    ))
-                self.assertEqual(str(result), "hola")
+                    if kind == "completion":
+                        result = asyncio.run(client._create_completion(
+                            [{"role": "user", "content": "hi"}], temperature=0.2, max_tokens=20, cache_key=cache_key,
+                        ))
+                        self.assertEqual(str(result), "hola")
+                    elif kind == "json":
+                        result = asyncio.run(client._small_json_call(
+                            system_prompt="Return JSON.", request={"query": "hi"}, max_output_tokens=20,
+                            label="Offline helper", cache_key=cache_key,
+                        ))
+                        self.assertEqual(result, {"ok": True})
+                    else:
+                        result = asyncio.run(client.web_research(query="current football standings"))
+                        self.assertEqual(result["answer"], "hola")
                 self.assertEqual(captured["payload"].get("prompt_cache_key"), cache_key)
+                self.assertEqual(sum("AI xAI usage role=" in line for line in logs.output), 1)
                 self.assertIn(
                     f"AI xAI usage role={expected_role} input=4731 cached=4096 output=318 reasoning=290 cost_usd=0.0066",
                     "\n".join(logs.output),
@@ -107,19 +123,24 @@ class ReactionRequestShapeTests(unittest.TestCase):
 class ChatPromptOrderTests(unittest.TestCase):
     def test_the_per_message_sentence_comes_after_the_stable_server_parts(self) -> None:
         systems = []
-        for mode in ("mention", "continuation"):
+        for mode, request_date in (("mention", "2026-10-26"), ("continuation", "2026-10-27")):
             captured: dict = {}
             client = _client(captured, body=_COMPLETION)
             asyncio.run(client.chat(
                 server_context="Tone: casual", user_message="hi", author_name="tester", channel_name="general",
                 available_channels=["#general"], available_emojis=["nitori: <:nitori:1>"],
                 author_permissions="administrator=no", conversation_mode=mode,
+                request_date=request_date,
             ))
-            systems.append(captured["payload"]["input"][0]["content"])
+            system = captured["payload"]["input"][0]["content"]
+            self.assertIn(f"Current request date: {request_date}.", system)
+            self.assertEqual(system.count("Current request date:"), 1)
+            systems.append(system)
         for system in systems:
             stable_end = system.index("Available custom server emojis")
             self.assertLess(system.index("Server context provided"), system.index("Conversation mode:"))
             self.assertLess(stable_end, system.index("Conversation mode:"))
+            self.assertLess(stable_end, system.index("Current request date:"))
             self.assertLess(system.index("Conversation mode:"), system.index("Trusted facts about the person"))
         common = 0
         while systems[0][common] == systems[1][common]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from unittest.mock import patch
 
 from services.api_football import ApiFootballClient, FootballApiError, FootballApiPage
 from services.football_api_request_compiler import InvalidFootballApiRequest, build_coach_search_request, build_injury_request, build_odds_reference_request, build_odds_request, build_league_search_request, build_player_profile_request, build_player_search_request, build_team_search_request
@@ -124,6 +125,47 @@ class ApiFootballClientTests(unittest.TestCase):
         self.assertEqual(session.calls[1][1]["timezone"], "America/Mexico_City")
         self.assertEqual(session.calls[2][1]["timezone"], "America/Mexico_City")
         self.assertEqual(session.calls[3][1]["timezone"], "America/Mexico_City")
+        async def verify_calendar_filters():
+            await client.get_fixtures_on_date(league_id=262, season=2025, round_name="Regular Season - 12")
+            self.assertEqual(session.calls[-1][1], {"league": 262, "season": 2025,
+                "round": "Regular Season - 12", "timezone": "America/Mexico_City"})
+            await client.get_fixtures_on_date(league_id=262, season=2025, team_id=1,
+                                            date_iso="2025-10-27", round_name="Regular Season - 12")
+            self.assertEqual(session.calls[-1][1]["date"], "2025-10-27")
+            self.assertEqual(session.calls[-1][1]["team"], 1)
+            count = len(session.calls)
+            with self.assertRaises(InvalidFootballApiRequest):
+                await client.get_fixtures_on_date(league_id=262, season=2025)
+            with self.assertRaises(InvalidFootballApiRequest):
+                await client.get_fixtures_on_date(round_name="Regular Season - 12")
+            self.assertEqual(len(session.calls), count)
+        asyncio.run(verify_calendar_filters())
+        async def verify_fixture_ttl():
+            with patch("services.api_football.time.monotonic",return_value=100) as clock:
+                await client.get_fixture_by_id(fixture_id=456)
+                count = len(session.calls)
+                clock.return_value = 120
+                await client.get_fixture_by_id(fixture_id=456,cache_ttl_seconds=30)
+                self.assertEqual(len(session.calls),count)
+                clock.return_value = 131
+                await client.get_fixture_by_id(fixture_id=456,cache_ttl_seconds=30)
+                self.assertEqual(len(session.calls),count+1)
+                clock.return_value = 200
+                await client.get_fixture_by_id(fixture_id=456)
+                self.assertEqual(len(session.calls),count+1)
+                clock.return_value = 252
+                await client.get_fixture_by_id(fixture_id=456)
+                self.assertEqual(len(session.calls),count+2)
+        asyncio.run(verify_fixture_ttl())
+        async def verify_live_scopes():
+            scoped_client, transport = _client_with_fake_transport()
+            for league, team in [(262,1),(262,2),(262,None),(None,1),(None,None)]:
+                await scoped_client.get_live_fixtures(league_id=league,team_id=team)
+            self.assertEqual(len(transport.calls),5)
+            await scoped_client.get_live_fixtures(league_id=262,team_id=1)
+            self.assertEqual(len(transport.calls),5)
+        asyncio.run(verify_live_scopes())
+
 
 
     def test_today_iso_uses_configured_football_timezone(self) -> None:
@@ -157,6 +199,11 @@ class ApiFootballClientTests(unittest.TestCase):
 
         self.assertEqual(session.calls[0][0], "https://example.test/teams")
         self.assertEqual(session.calls[0][1], {"search": "Club America"})
+
+        for scope in ({"league_id": 71}, {"season": 2026}, {"league_id": 71, "season": 2026}):
+            with self.subTest(scope=scope), self.assertRaises(InvalidFootballApiRequest):
+                build_team_search_request(_team_slot("Northbank"), search=True, **scope)
+        self.assertEqual(len(session.calls), 1)
 
 
     def test_player_profile_wrapper_uses_profiles_endpoint_with_validated_lastname(self) -> None:

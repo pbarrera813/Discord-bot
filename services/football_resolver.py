@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 from typing import Any, Awaitable, Callable, Final
 
@@ -21,6 +21,7 @@ from services.football_api_request_compiler import (
     build_league_search_request,
     build_player_profile_request,
     build_player_search_request,
+    build_player_squads_request,
     build_team_search_request,
 )
 
@@ -255,6 +256,100 @@ class FootballTeamLookup:
 FootballPlayerCanonicalizer = Callable[[PlayerQuery], Awaitable[dict[str, Any] | None]]
 # Chooses one of the offered typed API rows (by index) for an otherwise unresolved player; the caller owns the model call.
 FootballPlayerSelector = Callable[[tuple[dict[str, Any], ...]], Awaitable[int | None]]
+FootballIdentitySelector = Callable[[str, Any, tuple[dict[str, Any], ...]], Awaitable[int | None]]
+
+
+def make_identity_selector(llm_client: Any, *, request_text: str, history: list[dict[str, str]]) -> FootballIdentitySelector | None:
+    method = getattr(llm_client, "select_football_candidate", None)
+    if not callable(method):
+        return None
+
+    async def _select(entity_type, slot, candidates):
+        offered = []
+        for index, row in enumerate(candidates, start=1):
+            entity = row.get(entity_type, {})
+            country = row.get("country")
+            venue = row.get("venue")
+            offered.append({
+                "ref": f"c{index}",
+                "name": entity.get("name"),
+                "code": entity.get("code"),
+                "country": country.get("name") if isinstance(country, dict) else entity.get("country"),
+                "city": venue.get("city") if isinstance(venue, dict) else None,
+                "type": entity.get("type"),
+                "national": entity.get("national"),
+            })
+        chosen = await method(
+            entity_type=entity_type, candidate_name=slot.name, request_text=request_text,
+            conversation_history=history, candidates=offered,
+        )
+        ref = chosen.get("ref") if isinstance(chosen, dict) else None
+        refs = [item["ref"] for item in offered]
+        return refs.index(ref) if ref in refs else None
+
+    return _select
+
+
+def make_player_selector(
+    llm_client: Any, *, request_text: str, history: list[dict[str, str]],
+) -> FootballPlayerSelector | None:
+    method = getattr(llm_client, "select_football_player_candidate", None)
+    if method is None:
+        return None
+
+    async def _select(candidates: tuple[dict[str, Any], ...]) -> int | None:
+        offered: list[dict[str, Any]] = []
+        for index, row in enumerate(candidates, start=1):
+            player = row.get("player") if isinstance(row, dict) and isinstance(row.get("player"), dict) else {}
+            stats = row.get("statistics") if isinstance(row, dict) and isinstance(row.get("statistics"), list) else []
+            team = stats[0].get("team") if stats and isinstance(stats[0], dict) and isinstance(stats[0].get("team"), dict) else row.get("team") or {}
+            offered.append({
+                "ref": f"p{index}",
+                "name": player.get("name"),
+                "firstname": player.get("firstname"),
+                "lastname": player.get("lastname"),
+                "age": player.get("age"),
+                "nationality": player.get("nationality"),
+                "team": team.get("name"),
+            })
+        chosen = await method(request_text=request_text, conversation_history=history, candidates=offered)
+        ref = chosen.get("ref") if isinstance(chosen, dict) else None
+        refs = [item["ref"] for item in offered]
+        return refs.index(ref) if ref in refs else None
+
+    return _select
+
+
+async def select_football_identity(
+    rows: list[dict[str, Any]], query: Any, *, entity_type: str,
+    selector: FootballIdentitySelector, country_name: str | None = None,
+) -> FootballResolution:
+    country_key = normalize_key(country_name or getattr(query, "country_hint", None))
+    eligible: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        entity = row.get(entity_type) if isinstance(row, dict) else None
+        if not isinstance(entity, dict) or type(entity.get("id")) is not int or entity["id"] <= 0:
+            continue
+        country = row.get("country", {}).get("name") if entity_type == "league" and isinstance(row.get("country"), dict) else entity.get("country")
+        if country_key and normalize_key(country) != country_key:
+            continue
+        eligible.setdefault(entity["id"], row)
+    offered = tuple(eligible.values())[:50]
+    exact = [row for row in offered if normalize_key(row[entity_type].get("name")) == normalize_key(query.name)]
+    if len(exact) == 1:
+        return FootballResolution(exact[0], (exact[0],))
+    chosen = None
+    if offered:
+        try:
+            chosen = await selector(entity_type, query, offered)
+        except Exception:
+            logger.exception("AI football identity selection failed entity_type=%s", entity_type)
+    selected = offered[chosen] if type(chosen) is int and 0 <= chosen < len(offered) else None
+    logger.info(
+        "AI football identity selection entity_type=%s candidate_count=%s selected_id=%s",
+        entity_type, len(offered), selected[entity_type]["id"] if selected else None,
+    )
+    return FootballResolution(selected, (selected,) if selected else offered[:5], ambiguous=selected is None and len(offered) > 1)
 
 
 def normalize_key(value: str | None) -> str:
@@ -299,7 +394,7 @@ def slot_allows_static_alias(slot: Any) -> bool:
     return str(getattr(slot, "source", "") or "") in {"slash_arg", "alias", "canonicalizer"}
 
 
-async def resolve_league_candidate(client: Any, query: LeagueSlot, *, country: CountrySlot | None = None, season: int | None = None) -> FootballLeagueLookup:
+async def resolve_league_candidate(client: Any, query: LeagueSlot, *, country: CountrySlot | None = None, season: int | None = None, selector: FootballIdentitySelector | None = None) -> FootballLeagueLookup:
     if not isinstance(query, LeagueSlot):
         raise InvalidFootballApiRequest("resolve_league_candidate requires a FootballQuerySpec league slot.")
     cleaned = query.name
@@ -411,7 +506,10 @@ async def resolve_league_candidate(client: Any, query: LeagueSlot, *, country: C
                     matching_by_id.setdefault(league_id, row)
             selected_query = cleaned
             rows = list(matching_by_id.values())
-    picked = pick_league(rows, selected_query)
+    picked = (
+        await select_football_identity(rows, query, entity_type="league", selector=selector, country_name=getattr(country, "name", None))
+        if selector is not None else pick_league(rows, selected_query)
+    )
     league = picked.selected.get("league") if isinstance(picked.selected, dict) else {}
     league_id = league.get("id") if isinstance(league, dict) else None
     resolved_season = season
@@ -473,7 +571,7 @@ async def resolve_team_candidate(
             continue
         seen_scope.add(scope)
         scope_rows: list[dict[str, Any]] = []
-        for use_search in ((False, True) if use_search_fallback else (False,)):
+        for use_search in ((False, True) if use_search_fallback and scope == (None, None) else (False,)):
             for search_slot in search_slots:
                 search_name = search_slot.name
                 try:
@@ -498,7 +596,7 @@ async def resolve_team_candidate(
                         if not isinstance(team, dict):
                             team = {}
                         venue = team.get("venue") if isinstance(team.get("venue"), dict) else {}
-                        logger.info(
+                        logger.debug(
                             "AI football team search candidate evaluated query=%s candidate_index=%s team_id=%r team_name=%r team_code=%r country=%r national=%r venue_name=%r league_id=%s season=%s",
                             search_slot.name,
                             index,
@@ -628,21 +726,8 @@ async def resolve_player(
 
     rows[:] = _merge_player_identity_rows(rows)
 
-    if not rows:
-        await _search_player_candidates(
-            client,
-            tuple(compiled_candidates),
-            rows=rows,
-            searches=searches,
-            seen_ids=seen_ids,
-            league_id=league_id,
-            season=season,
-            team_id=team_id,
-            explicit_context=explicit_context,
-            stage="api_search",
-        )
-    rows[:] = _merge_player_identity_rows(rows)
-
+    rows = await _scope_player_rows(client, rows, tuple(compiled_candidates), league_id=league_id,
+                                    season=season, team_id=team_id, searches=searches)
     resolution = pick_player_identity(
         rows,
         compiled_candidates[0],
@@ -659,7 +744,6 @@ async def resolve_player(
             canonicalizer_used = True
             validated_rows: list[dict[str, Any]] = []
             validated_searches: list[dict[str, Any]] = []
-            validated_seen_ids: set[int] = set()
             suggested_compiled: list[PlayerCandidate] = []
             for suggested in suggested_candidates:
                 try:
@@ -679,20 +763,10 @@ async def resolve_player(
                     if found_profiles:
                         break
             validated_rows[:] = _merge_player_identity_rows(validated_rows)
-            if not validated_rows:
-                await _search_player_candidates(
-                    client,
-                    tuple(suggested_compiled),
-                    rows=validated_rows,
-                    searches=validated_searches,
-                    seen_ids=validated_seen_ids,
-                    league_id=league_id,
-                    season=season,
-                    team_id=team_id,
-                    explicit_context=explicit_context,
-                    stage="api_validation",
-                )
-            validated_rows[:] = _merge_player_identity_rows(validated_rows)
+            validated_rows = await _scope_player_rows(
+                client, validated_rows, tuple(suggested_compiled), league_id=league_id,
+                season=season, team_id=team_id, searches=validated_searches,
+            )
             validated_resolution = (
                 pick_player_identity(
                     validated_rows,
@@ -732,6 +806,56 @@ async def resolve_player(
         searches=tuple(searches),
         canonicalizer_used=canonicalizer_used,
     )
+
+
+async def _scope_player_rows(
+    client: Any, rows: list[dict[str, Any]], candidates: tuple[PlayerSlot, ...], *,
+    league_id: int | None, season: int | None, team_id: int | None,
+    searches: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not candidates or (team_id is None and (league_id is None or
+            pick_player_identity(rows, candidates[0]).selected is not None)):
+        return rows
+    profiles = {row["player"]["id"]: {**row, "statistics": []} for row in rows
+                if isinstance(row.get("player"), dict) and type(row["player"].get("id")) is int}
+    if team_id is not None and league_id is None and season is None:
+        # Current squad membership is useful only when no historical season was requested.
+        squads = await client.get_player_squads(build_player_squads_request(team_id=team_id))
+        members = [{"player": player, "team": squad["team"]} for squad in squads
+                   if (squad.get("team") or {}).get("id") == team_id
+                   for player in squad.get("players") or [] if type(player.get("id")) is int]
+        searches.append({"stage": "squad_scope", "team_id": team_id, "response_count": len(members)})
+        return [{**profiles.get(member["player"]["id"], {}), **member,
+                 "player": {**profiles.get(member["player"]["id"], {}).get("player", {}), **member["player"]}}
+                for member in members if not profiles or member["player"]["id"] in profiles]
+
+    for scoped_league, scoped_season, scoped_team in await _player_search_scopes(
+        client, league_id=league_id, season=season, team_id=team_id, explicit_context=True,
+    ):
+        for candidate in candidates:
+            request = build_player_search_request(candidate, league_id=scoped_league,
+                                                  season=scoped_season, team_id=scoped_team)
+            try:
+                # Provider display names may abbreviate first names; the typed surname remains searchable.
+                request = replace(request, name=build_player_profile_request(candidate).lastname)
+            except InvalidFootballApiRequest:
+                pass
+            found = await client.search_players(request)
+            scoped = []
+            for row in found:
+                statistics = [stat for stat in row.get("statistics") or []
+                              if isinstance(stat, dict)
+                              and (scoped_league is None or (stat.get("league") or {}).get("id") == scoped_league)
+                              and (stat.get("league") or {}).get("season") == scoped_season
+                              and (scoped_team is None or (stat.get("team") or {}).get("id") == scoped_team)]
+                if statistics:
+                    scoped.append({**row, "statistics": statistics})
+            searches.append({"stage": "scope_search", "team_id": scoped_team, "league_id": scoped_league,
+                             "season": scoped_season, "response_count": len(scoped)})
+            if scoped:
+                ids = {(row.get("player") or {}).get("id") for row in scoped}
+                return _merge_player_identity_rows([*[profile for key, profile in profiles.items() if key in ids], *scoped])
+    return [] if team_id is not None else rows
 
 
 def _merge_player_identity_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -890,77 +1014,6 @@ def _ascii_words(value: str) -> list[str]:
     text = unicodedata.normalize("NFKD", str(value or ""))
     text = "".join(ch for ch in text if not unicodedata.combining(ch))
     return re.findall(r"[a-z0-9]+", text.casefold())
-
-
-async def _search_player_candidates(
-    client: Any,
-    candidates: tuple[PlayerCandidate, ...],
-    *,
-    rows: list[dict[str, Any]],
-    searches: list[dict[str, Any]],
-    seen_ids: set[int],
-    league_id: int | None,
-    season: int | None,
-    team_id: int | None,
-    explicit_context: bool,
-    stage: str,
-) -> None:
-    search_method = getattr(client, "search_players", None)
-    if search_method is None:
-        return
-    scopes = await _player_search_scopes(
-        client,
-        league_id=league_id,
-        season=season,
-        team_id=team_id,
-        explicit_context=explicit_context,
-    )
-    for candidate in candidates:
-        for scope in scopes:
-            scoped_league_id, scoped_season, scoped_team_id = scope
-            try:
-                request = build_player_search_request(
-                    candidate,
-                    league_id=scoped_league_id,
-                    season=scoped_season,
-                    team_id=scoped_team_id,
-                )
-                found = await search_method(request)
-            except (FootballApiError, InvalidFootballApiRequest) as exc:
-                searches.append(
-                    {
-                        "name": candidate.full_name,
-                        "league_id": scoped_league_id,
-                        "season": scoped_season,
-                        "team_id": scoped_team_id,
-                        "stage": stage,
-                        "response_count": 0,
-                        "error": str(exc)[:160],
-                    }
-                )
-                continue
-            searches.append(
-                {
-                    "name": candidate.full_name,
-                    "league_id": scoped_league_id,
-                    "season": scoped_season,
-                    "team_id": scoped_team_id,
-                    "stage": stage,
-                    "response_count": len(found),
-                }
-            )
-            for row in found:
-                player = row.get("player") if isinstance(row, dict) else {}
-                player_id = player.get("id") if isinstance(player, dict) else None
-                if isinstance(player_id, int):
-                    if player_id in seen_ids:
-                        continue
-                    seen_ids.add(player_id)
-                rows.append(row)
-            if found:
-                break
-        if rows:
-            break
 
 
 async def _player_search_scopes(

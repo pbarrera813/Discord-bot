@@ -202,7 +202,7 @@ class ApiFootballClient:
         self._session: aiohttp.ClientSession | None = None
         self._league_id_cache: dict[str, tuple[float, int]] = {}
         self._season_cache: dict[int, tuple[float, int]] = {}
-        self._live_cache: dict[int, tuple[float, list[dict[str, Any]]]] = {}
+        self._live_cache: dict[tuple[int | None, int | None], tuple[float, list[dict[str, Any]]]] = {}
         self._response_cache: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[float, list[dict[str, Any]]]] = {}
         self._page_cache: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[float, FootballApiPage]] = {}
 
@@ -505,14 +505,14 @@ class ApiFootballClient:
         team_id: int | None = None,
         cache_ttl_seconds: int = 30,
     ) -> list[dict[str, Any]]:
+        league_id = _optional_positive_int(league_id, "league_id")
+        team_id = _optional_positive_int(team_id, "team_id")
         now = time.monotonic()
-        cache_id = league_id or -(team_id or 1)
+        cache_id = (league_id, team_id)
         cached = self._live_cache.get(cache_id)
         if cached and now - cached[0] <= cache_ttl_seconds:
             return [dict(item) for item in cached[1]]
 
-        league_id = _optional_positive_int(league_id, "league_id")
-        team_id = _optional_positive_int(team_id, "team_id")
         rows = await self._request(
             _envelope("/fixtures", {"league": league_id, "team": team_id, "live": "all", "timezone": self.timezone_name})
         )
@@ -524,18 +524,25 @@ class ApiFootballClient:
         *,
         league_id: int | None = None,
         season: int | None = None,
-        date_iso: str,
+        date_iso: str | None = None,
         team_id: int | None = None,
+        round_name: str | None = None,
     ) -> list[dict[str, Any]]:
         league_id = _optional_positive_int(league_id, "league_id")
         season = _optional_season_int(season)
         team_id = _optional_positive_int(team_id, "team_id")
         _season_required_for_league_scope(league_id, season, "fixture date lookup", team_id=team_id)
-        date_iso = _date_string(date_iso)
+        date_iso = _date_string(date_iso) if date_iso is not None else None
+        if round_name is not None:
+            if league_id is None or season is None or not isinstance(round_name, str) or not 1 <= len(round_name.strip()) <= 100:
+                raise InvalidFootballApiRequest("round requires a league, season and provider round name.")
+            round_name = round_name.strip()
+        if date_iso is None and round_name is None:
+            raise InvalidFootballApiRequest("fixture calendar lookup requires a date or round.")
         return await self._request(
             _envelope(
                 "/fixtures",
-                {"league": league_id, "season": season, "team": team_id, "date": date_iso, "timezone": self.timezone_name},
+                {"league": league_id, "season": season, "team": team_id, "date": date_iso, "round": round_name, "timezone": self.timezone_name},
                 cache_ttl_seconds=120,
             )
         )
@@ -615,9 +622,9 @@ class ApiFootballClient:
         season = _season_int(season)
         return await self._request(_envelope("/players/topscorers", {"league": league_id, "season": season}, cache_ttl_seconds=900))
 
-    async def get_fixture_by_id(self, *, fixture_id: int) -> list[dict[str, Any]]:
+    async def get_fixture_by_id(self, *, fixture_id: int, cache_ttl_seconds: int = 120) -> list[dict[str, Any]]:
         fixture_id = validate_positive_int(fixture_id, "fixture_id")
-        return await self._request(_envelope("/fixtures", {"id": fixture_id, "timezone": self.timezone_name}, cache_ttl_seconds=120))
+        return await self._request(_envelope("/fixtures", {"id": fixture_id, "timezone": self.timezone_name}, cache_ttl_seconds=cache_ttl_seconds))
 
     async def get_fixtures_by_ids(self, request: FixtureIdsRequest) -> list[dict[str, Any]]:
         if not isinstance(request, FixtureIdsRequest):

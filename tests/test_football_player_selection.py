@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
+from types import SimpleNamespace
 
+from cogs.ai_chat import AIChatCog
 from services import football_resolver
+from services.xai_client import XAIClient
+from services.football_query_service import compile_football_operation
 from tests.test_football_commands import _FakeFootballClient, _player_slot, _value
 
 
@@ -29,6 +34,45 @@ def _client(*rows: dict[str, object]):
 
 
 class ResolverSelectorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_model_identity_choices_stay_within_provider_rows_and_country_scope(self) -> None:
+        slot = compile_football_operation("FOOTBALL_LOOKUP", "Northbank Town", {
+            "semantic_source": "router", "operation_family": "team_seasons",
+            "team_candidates": ["Northbank Town"],
+        }).team_slots[0]
+        rows = [{"team": {"id": n, "name": f"Other club {n}", "country": "France"}} for n in range(1, 7)]
+        rows += [{"team": {"id": 7, "name": "Northbank", "country": "Ireland"}},
+                 {"team": {"id": 8, "name": "Northbank", "country": "Canada"}}]
+        client = XAIClient("test-key", "test-model")
+        captured = []
+        verdict = {}
+
+        async def choose(**kwargs):
+            captured.append(kwargs["request"])
+            return verdict
+
+        client._small_json_call = choose
+        cog = AIChatCog.__new__(AIChatCog)
+        cog.bot = SimpleNamespace(llm_client=client)
+        request = "Which seasons are registered for Northbank Town?"
+        history = [{"role": "user", "content": "We were discussing Canadian football."}]
+        selector = cog._football_identity_selector(request_text=request, history=history)
+        for ref, confidence, expected in (("c8", 0.95, 8), ("unknown", 0.95, None),
+                                          (None, 0.95, None), ("c8", float("nan"), None)):
+            with self.subTest(ref=ref, confidence=confidence):
+                verdict = {"ref": ref, "confidence": confidence}
+                result = await football_resolver.select_football_identity(rows, slot, entity_type="team", selector=selector)
+                self.assertEqual(result.selected["team"]["id"] if result.selected else None, expected)
+                self.assertEqual(captured[-1]["request"], request)
+                self.assertEqual(captured[-1]["conversation"], history)
+                self.assertEqual(len(captured[-1]["candidates"]), 8)
+
+        verdict = {"ref": "c1", "confidence": 0.95}
+        result = await football_resolver.select_football_identity(
+            rows, replace(slot, country_hint="Ireland"), entity_type="team", selector=selector,
+        )
+        self.assertEqual(result.selected["team"]["id"], 7)
+        self.assertEqual([row["country"] for row in captured[-1]["candidates"]], ["Ireland"])
+
     async def _resolve(self, rows, selector, query="J. Bellingham"):
         return await football_resolver.resolve_player(_client(*rows), _player_slot(query), selector=selector)
 

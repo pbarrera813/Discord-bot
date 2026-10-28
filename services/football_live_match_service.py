@@ -686,6 +686,39 @@ class FootballLiveMatchService:
             return _match_or_empty(filtered, "next_match", team_id, opponent_id, ["/fixtures?next"])
         return await self.find_last_finished_fixture_for_team(team_id, opponent_id, league_id=league_id, season=season)
 
+    async def get_team_fixture_choices(
+        self, team_id: int, *, when: str = "auto", league_id: int | None = None, season: int | None = None,
+        count: int = 10,
+    ) -> list[dict[str, Any]]:
+        if when not in {"auto", "live", "next", "last"}:
+            raise ValueError("Invalid fixture selection mode")
+        if type(count) is not int or not 1 <= count <= 50:
+            raise ValueError("Match count must be between 1 and 50")
+
+        def scoped(rows):
+            return [row for row in filter_fixtures(rows, team_id=team_id)
+                    if league_id is None or (row.get("league") or {}).get("id") in {None, league_id}]
+
+        if when in {"auto", "live"}:
+            rows = scoped(await self.client.get_live_fixtures(league_id=league_id, team_id=team_id))
+            live = [row for row in rows if build_lifecycle(row).is_live or build_lifecycle(row).is_paused]
+            if live or when == "live":
+                return live
+            today = _client_today_iso(self.client)
+            rows = scoped(await self.client.get_fixtures_on_date(
+                league_id=league_id, season=season, team_id=team_id, date_iso=today))
+            rows = [row for row in rows if fixture_date_matches(row, today)]
+            if rows:
+                return rows
+        if when in {"auto", "next"}:
+            rows = scoped(await self.client.get_next_fixtures(
+                league_id=league_id, season=season, team_id=team_id, next_count=count))
+            if rows or when == "next":
+                return rows
+        rows = scoped(await self.client.get_last_fixtures(
+            league_id=league_id, season=season, team_id=team_id, last_count=count))
+        return [row for row in rows if build_lifecycle(row).is_terminal]
+
     async def get_match_center(
         self,
         fixture_id: int,
@@ -696,10 +729,22 @@ class FootballLiveMatchService:
         include_lineups: bool = False,
         include_players: bool = False,
         include_half_stats: bool = False,
+        fixture: dict[str, Any] | None = None,
+        cache_ttl_seconds: int | None = None,
     ) -> MatchData:
-        fixtures = await self.client.get_fixture_by_id(fixture_id=fixture_id)
-        fixture = fixtures[0] if fixtures else None
-        endpoints = ["/fixtures?id"]
+        endpoints = []
+        if fixture is not None and (fixture.get("fixture") or {}).get("id") != fixture_id:
+            raise ValueError("Fixture identity does not match the requested fixture")
+        if fixture is None:
+            ttl = cache_ttl_seconds if cache_ttl_seconds is not None else (30 if time_scope in {"live", "live_watch"} else None)
+            kwargs = {"cache_ttl_seconds": ttl} if ttl is not None else {}
+            fixtures = await self.client.get_fixture_by_id(fixture_id=fixture_id, **kwargs)
+            fixture = fixtures[0] if fixtures else None
+            endpoints.append("/fixtures?id")
+        if fixture is None:
+            return build_match_data(None, time_scope=time_scope, source_endpoints=endpoints)
+        if (fixture.get("fixture") or {}).get("id") != fixture_id:
+            raise ValueError("Provider returned a different fixture identity")
         embedded_events = _embedded_list(fixture, "events")
         embedded_stats = _embedded_list(fixture, "statistics")
         embedded_lineups = _embedded_list(fixture, "lineups")

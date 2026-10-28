@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from dataclasses import replace
+import asyncio
 import logging
+from textwrap import wrap
 from typing import Any, Final
 
 import discord
@@ -10,8 +13,12 @@ from discord.ext import commands
 
 from services import football_formatter as football_fmt
 from services import football_resolver
-from services.football_live_match_service import normalize_match_statistics
-from services.football_operation_service import FootballOperationService, FootballOutcome
+from services import football_cards
+from services.api_football import ApiFootballClient, FootballApiError
+from services.football_api_request_compiler import _make_league_slot, build_league_search_request
+from services.football_api_request_compiler import build_prediction_request
+from services.football_live_match_service import FootballLiveMatchService, build_lifecycle
+from services.football_operation_service import FootballOperationService, FootballOutcome, FootballRetrievalResult
 from services.football_query_service import compile_football_operation
 from utils.i18n import tr
 
@@ -24,14 +31,233 @@ LEAGUE_CHOICES: Final[list[app_commands.Choice[str]]] = [
     app_commands.Choice(name="worldcup", value="worldcup"),
 ]
 LEAGUE_CODES: Final[tuple[str, ...]] = tuple(choice.value for choice in LEAGUE_CHOICES)
-LEAGUE_HELP_TEXT: Final[str] = f"League: {', '.join(LEAGUE_CODES)}"
-LEAGUE_INVALID_TEXT_EN: Final[str] = f"Invalid league. Use one of: {', '.join(LEAGUE_CODES)}."
+LEAGUE_HELP_TEXT: Final[str] = f"Search a league or use: {', '.join(LEAGUE_CODES)}"
+LEAGUE_INVALID_TEXT_EN: Final[str] = f"Could not identify the league. Choose a suggestion or use: {', '.join(LEAGUE_CODES)}."
 ODDS_REFERENCE_CHOICES: Final[list[app_commands.Choice[str]]] = [
     app_commands.Choice(name="bookmakers", value="bookmakers"),
     app_commands.Choice(name="pre-match markets", value="bets"),
     app_commands.Choice(name="live markets", value="live_bets"),
 ]
-LEAGUE_INVALID_TEXT_ES: Final[str] = f"Liga inválida. Usa una de estas: {', '.join(LEAGUE_CODES)}."
+LEAGUE_INVALID_TEXT_ES: Final[str] = f"No se pudo identificar la liga. Elige una sugerencia o usa: {', '.join(LEAGUE_CODES)}."
+
+
+class FootballCardView(discord.ui.View):
+    def __init__(self, *, author_id: int, lang: str, pages: dict, labels: dict[str, str],
+                 section: str, media_cache: dict[str, bytes], can_attach: bool,
+                 refresh, load_section=None, fixtures: list[dict] | None = None, select_fixture=None, refresh_list=None,
+                 load_more=None) -> None:
+        super().__init__(timeout=180)
+        self.author_id, self.lang = author_id, lang
+        self.pages, self.labels, self.section = pages, labels, section
+        self.media_cache, self.can_attach = media_cache, can_attach
+        self.refresh, self.load_section = refresh, load_section
+        self.load_more = load_more
+        self.index = 0
+        self.message = None
+        self.lock = asyncio.Lock()
+        self.expired = False
+        self.pending_fixture = bool(fixtures)
+        self.fixtures, self.fixture_page = fixtures, 0
+        self.refresh_list = refresh_list
+        self.select_fixture = select_fixture
+        self.fixture_menu = None
+        if fixtures:
+            controls = list(self.children)
+            for child in controls:
+                self.remove_item(child)
+            for child in controls:
+                child.row += 1
+                self.add_item(child)
+            self.fixture_menu = discord.ui.Select(placeholder=tr(lang, "Choose a match", "Elige un partido"), row=0)
+            self.fixture_menu.callback = self._choose_fixture
+            self.add_item(self.fixture_menu)
+        self.section_menu.options = [discord.SelectOption(label=label, value=key) for key, label in labels.items()]
+        self.section_menu.placeholder = tr(lang, "Section", "Seccion")
+        self.previous.label = tr(lang, "Previous", "Anterior")
+        self.next_page.label = tr(lang, "Next", "Siguiente")
+        self.text.label = tr(lang, "Text", "Texto")
+        self.refresh_button.label = tr(lang, "Refresh", "Actualizar")
+        self._controls()
+
+    @property
+    def current(self) -> dict:
+        return self.pages[self.section][self.index]
+
+    def _controls(self) -> None:
+        list_mode = "fixtures" in self.pages
+        blocked = self.pending_fixture and not list_mode
+        self.section_menu.options = [discord.SelectOption(label=label, value=key) for key, label in self.labels.items()
+                                     if not (list_mode and self.pending_fixture) or key in {"fixtures", "comparison"}]
+        self.section_menu.disabled = blocked
+        self.text.disabled = self.refresh_button.disabled = blocked
+        self.previous.disabled = blocked or self.index == 0
+        self.next_page.disabled = blocked or (self.index + 1 >= len(self.pages.get(self.section) or [])
+                                              and not self.current.get("more"))
+        if self.fixture_menu is not None:
+            shown = self.fixtures
+            if list_mode:
+                shown = self.pages["fixtures"][self.fixture_page].get("fixtures") or []
+            selected = next((option.value for option in self.fixture_menu.options if option.default), None)
+            self.fixture_menu.options = []
+            for item in shown:
+                home, away = football_fmt.fixture_teams(item)
+                label = f"{home} {football_fmt.fixture_score(item)} {away}"
+                details = f"{(item.get('league') or {}).get('name') or 'Football'} / {football_fmt.fixture_datetime(item)} / {football_fmt.fixture_status(item.get('fixture') or {})}"
+                value = str(item["fixture"]["id"])
+                self.fixture_menu.add_option(label=label if len(label) <= 100 else label[:99] + "…",
+                                             description=details if len(details) <= 100 else details[:99] + "…",
+                                             value=value, default=value == selected)
+            self.fixture_menu.disabled = not shown
+            if not shown:
+                self.fixture_menu.add_option(label=tr(self.lang, "No matches", "Sin partidos"), value="none")
+        for option in self.section_menu.options:
+            option.default = option.value == self.section
+
+    def text_pages(self) -> list[str]:
+        paginator = commands.Paginator(prefix="", suffix="", max_size=1900)
+        for line in football_cards.page_text(self.current).splitlines():
+            for part in wrap(line, width=1800, break_on_hyphens=False) or [""]:
+                paginator.add_line(part)
+        return paginator.pages
+
+    def text_payload(self) -> dict:
+        pages = self.text_pages()
+        content = pages[0]
+        if len(pages) > 1:
+            content += tr(self.lang, "\nUse Text for the complete view.", "\nUsa Texto para ver toda la informacion.")
+        return {"content": content, "attachments": [], "view": self,
+                "allowed_mentions": discord.AllowedMentions.none()}
+
+    async def payload(self) -> dict:
+        if not self.can_attach or self.current.get("text"):
+            return self.text_payload()
+        try:
+            logos = await football_cards.load_logos(self.current.get("media", []), self.media_cache)
+            image = await asyncio.to_thread(football_cards.render_profile, self.current, lang=self.lang,
+                                           logos=logos, number=self.index + 1, total=len(self.pages[self.section]))
+            return {"content": None, "attachments": [discord.File(image, filename="football.png",
+                    description=football_cards.page_text(self.current)[:1024])], "view": self,
+                    "allowed_mentions": discord.AllowedMentions.none()}
+        except Exception:
+            logging.exception("Football card rendering failed; using text")
+            return self.text_payload()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id or self.expired:
+            await interaction.response.send_message(
+                tr(self.lang, "These controls have expired or belong to another user.",
+                   "Estos controles han caducado o pertenecen a otro usuario."), ephemeral=True)
+            return False
+        return True
+
+    async def _update(self, interaction: discord.Interaction, action: str) -> None:
+        if not await self.interaction_check(interaction):
+            return
+        selection = (self.fixture_menu.values[0] if action == "fixture" else
+                     self.section_menu.values[0] if action == "section" else None)
+        await interaction.response.defer()
+        async with self.lock:
+            if self.expired:
+                return
+            try:
+                if action == "fixture":
+                    choice = selection
+                    if choice not in {option.value for option in self.fixture_menu.options}:
+                        raise ValueError("Unknown fixture selection")
+                    self.pages = await self.select_fixture(int(choice))
+                    self.pending_fixture = False
+                    self.section, self.index = "overview", 0
+                    for option in self.fixture_menu.options:
+                        option.default = option.value == choice
+                elif self.pending_fixture and "fixtures" not in self.pages:
+                    return
+                elif action == "refresh":
+                    if self.section in {"fixtures", "comparison"}:
+                        self.pages = await self.refresh_list()
+                        self.pending_fixture = True
+                        self.fixture_page = 0
+                        for option in self.fixture_menu.options:
+                            option.default = False
+                    else:
+                        self.pages = await self.refresh()
+                    self.index = 0
+                elif action == "section":
+                    if selection not in {option.value for option in self.section_menu.options}:
+                        raise ValueError("Unknown section selection")
+                    self.section = selection
+                    self.index = self.fixture_page if self.section == "fixtures" else 0
+                else:
+                    if action == "next" and self.index + 1 == len(self.pages[self.section]) and self.current.get("more"):
+                        extra = await self.load_more(self.section, self.current["more"])
+                        self.current.pop("more")
+                        self.pages[self.section].extend(extra)
+                    self.index = max(0, min(self.index + (1 if action == "next" else -1),
+                                            len(self.pages[self.section]) - 1))
+                    if self.section == "fixtures":
+                        self.fixture_page = self.index
+                if self.pages[self.section] is None:
+                    self.pages[self.section] = await self.load_section(self.section)
+            except Exception:
+                logging.exception("Football card section loading failed")
+                retry = tr(self.lang, "Could not open that match. Select a match again.",
+                           "No se pudo abrir ese partido. Selecciona un partido otra vez.") if self.pending_fixture and self.section != "fixtures" else tr(
+                    self.lang, "Could not load this section. Use Refresh to try again.",
+                    "No se pudo cargar esta seccion. Usa Actualizar para reintentar.")
+                self.pages[self.section] = [{"title": self.labels[self.section], "text": retry}]
+                self.index = 0
+                if self.section == "fixtures":
+                    self.fixture_page = 0
+            self._controls()
+            payload = await self.payload()
+            try:
+                await interaction.edit_original_response(**payload)
+            except discord.HTTPException:
+                if not payload["attachments"]:
+                    raise
+                await interaction.edit_original_response(**self.text_payload())
+
+    async def _choose_fixture(self, interaction: discord.Interaction) -> None:
+        await self._update(interaction, "fixture")
+
+    @discord.ui.select(placeholder="Section", row=0)
+    async def section_menu(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:
+        await self._update(interaction, "section")
+
+    @discord.ui.button(label="Previous", row=1)
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._update(interaction, "previous")
+
+    @discord.ui.button(label="Next", row=1)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._update(interaction, "next")
+
+    @discord.ui.button(label="Text", row=1)
+    async def text(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self.interaction_check(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with self.lock:
+            if self.expired:
+                await interaction.followup.send(tr(self.lang, "These controls have expired.",
+                                                   "Estos controles han caducado."), ephemeral=True)
+                return
+            for page in self.text_pages():
+                await interaction.followup.send(page, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+    @discord.ui.button(label="Refresh", row=1)
+    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._update(interaction, "refresh")
+
+    async def on_timeout(self) -> None:
+        self.expired = True
+        async with self.lock:
+            for child in self.children:
+                child.disabled = True
+            if self.message is not None:
+                try:
+                    await self.message.edit(view=self)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
 
 
 class FootballCog(commands.Cog):
@@ -61,6 +287,7 @@ class FootballCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self._table_logo_cache: dict[str, bytes] = {}
         if not hasattr(bot, "football_player_alias_cache"):
             setattr(bot, "football_player_alias_cache", {})
 
@@ -123,9 +350,21 @@ class FootballCog(commands.Cog):
         client: Any,
         lang: str,
         raw_league: str,
+        season: int | None = None,
+        identity_selector=None,
     ) -> tuple[str, int, int] | None:
+        if raw_league.strip().isdigit():
+            league_id = int(raw_league.strip())
+            rows = await client.get_league_by_id(league_id=league_id)
+            rows = [row for row in rows if (row.get("league") or {}).get("id") == league_id]
+            year = season if season is not None else ApiFootballClient._extract_current_season(rows)
+            if rows and year is not None:
+                return str(rows[0]["league"].get("name") or raw_league), league_id, year
+            await ctx.send(tr(lang, "The provider has no league/season data for that selection.",
+                              "El proveedor no tiene datos de liga/temporada para esa seleccion."))
+            return None
         league_key = self._normalize_league_key(raw_league)
-        service = FootballOperationService(client)
+        service = FootballOperationService(client, identity_selector=identity_selector)
         if league_key is None:
             operation = compile_football_operation(
                 "FOOTBALL_LOOKUP",
@@ -136,7 +375,7 @@ class FootballCog(commands.Cog):
                 resolved_league_id, resolved_season, row, outcome = await service.resolve_league_and_season(
                     operation,
                     league_id=None,
-                    season=None,
+                    season=season,
                 )
                 if outcome == FootballOutcome.SELECTED and resolved_league_id is not None and resolved_season is not None:
                     league = row.get("league") if isinstance(row, dict) else {}
@@ -152,8 +391,9 @@ class FootballCog(commands.Cog):
                 )
             )
             return None
-        league_id, season = await service.resolve_league_key(league_key)
-        return league_key, league_id, season
+        league_id = await client.resolve_league_id(league_key)
+        resolved_season = season if season is not None else await client.get_current_season(league_id)
+        return league_key, league_id, resolved_season
 
     @staticmethod
     def _fixture_status(fixture: dict[str, Any]) -> str:
@@ -183,56 +423,6 @@ class FootballCog(commands.Cog):
     def _match_datetime(item: dict[str, Any]) -> str:
         return football_fmt.fixture_datetime(item)
 
-    def _build_match_embed(
-        self,
-        *,
-        lang: str,
-        league_label: str,
-        item: dict[str, Any],
-        title_en: str,
-        title_es: str,
-        color: discord.Color,
-        index: int,
-        total: int,
-    ) -> discord.Embed:
-        fixture = item.get("fixture")
-        if not isinstance(fixture, dict):
-            fixture = {}
-        home, away = self._fixture_teams(item)
-        home_logo, away_logo = self._fixture_team_logos(item)
-        score = self._fixture_score(item)
-        status = self._fixture_status(fixture)
-        round_name = self._fixture_round(item)
-        match_time = self._match_datetime(item)
-
-        page_suffix = f" ({index}/{total})" if total > 1 else ""
-        title = tr(
-            lang,
-            f"{league_label} - {title_en}{page_suffix}",
-            f"{league_label} - {title_es}{page_suffix}",
-        )
-        embed = discord.Embed(
-            title=title,
-            color=color,
-            timestamp=datetime.now(timezone.utc),
-        )
-        if home_logo:
-            embed.set_author(name=home, icon_url=home_logo)
-        else:
-            embed.set_author(name=home)
-
-        details = [f"**{home} vs {away}**", f"**{score}**", status, match_time]
-        if round_name:
-            details.append(round_name)
-        embed.description = "\n".join(details)[:4096]
-
-        if away_logo:
-            embed.set_footer(text=away, icon_url=away_logo)
-        else:
-            embed.set_footer(text=away)
-
-        return embed
-
     async def _defer_if_needed(self, ctx: commands.Context) -> None:
         if ctx.interaction and not ctx.interaction.response.is_done():
             try:
@@ -242,568 +432,94 @@ class FootballCog(commands.Cog):
 
     @commands.hybrid_group(
         name="football",
-        description="Football commands for selected leagues.",
+        description="Football fixtures, results and statistics.",
         fallback="live",
         invoke_without_command=True,
     )
     @app_commands.describe(league=LEAGUE_HELP_TEXT)
-    @app_commands.choices(league=LEAGUE_CHOICES)
     async def football(self, ctx: commands.Context, league: str) -> None:
         await self._run_football_live(ctx, league)
 
     async def _run_football_live(self, ctx: commands.Context, raw_league: str) -> None:
-        lang = await self._lang(ctx.guild)
-        client = await self._client_or_message(ctx, lang)
-        if client is None:
-            return
-        await self._defer_if_needed(ctx)
+        await self._run_fixture_list(ctx, league=raw_league, kind="live")
 
-        try:
-            context = await self._resolve_league_context(
-                ctx,
-                client=client,
-                lang=lang,
-                raw_league=raw_league,
-            )
-            if context is None:
-                return
-            league_key, league_id, _season = context
-            operation = compile_football_operation(
-                "FOOTBALL_WATCH_TODAY",
-                "",
-                {"data_focus": "live_fixtures", "league_candidates": [raw_league]},
-            )
-            result = await FootballOperationService(client).execute(
-                operation,
-                league_id=league_id,
-                season=None,
-                data_focus="live_fixtures",
-            )
-            fixtures = result.fixtures
-        except Exception as exc:
-            await ctx.send(
-                tr(
-                    lang,
-                    f"Failed to get live matches: {exc}",
-                    f"No se pudieron obtener los partidos en vivo: {exc}",
-                )
-            )
-            return
-
-        league_label = self._league_label(league_key, lang)
-        if not fixtures:
-            await ctx.send(
-                tr(
-                    lang,
-                    f"No live matches in {league_label} right now.",
-                    f"No hay partidos en vivo de {league_label} en este momento.",
-                )
-            )
-            return
-
-        shown = min(len(fixtures), 10)
-        embeds: list[discord.Embed] = []
-        for idx, item in enumerate(fixtures[:shown], start=1):
-            embeds.append(
-                self._build_match_embed(
-                    lang=lang,
-                    league_label=league_label,
-                    item=item,
-                    title_en="Live",
-                    title_es="En vivo",
-                    color=discord.Color.green(),
-                    index=idx,
-                    total=shown,
-                )
-            )
-
-        if len(fixtures) > shown:
-            embeds[-1].add_field(
-                name=tr(lang, "Notice", "Aviso"),
-                value=tr(
-                    lang,
-                    f"Showing {shown} of {len(fixtures)} live matches.",
-                    f"Mostrando {shown} de {len(fixtures)} partidos en vivo.",
-                ),
-                inline=False,
-            )
-
-        await ctx.send(embeds=embeds)
-
-    @football.command(
-        name="today",
-        description="Get today's fixtures for a selected league.",
-    )
+    @football.command(name="today", description="Browse today's fixtures for a league.")
     @app_commands.describe(league=LEAGUE_HELP_TEXT)
-    @app_commands.choices(league=LEAGUE_CHOICES)
     async def football_today(self, ctx: commands.Context, league: str) -> None:
+        await self._run_fixture_list(ctx, league=league, kind="today")
+
+    @football.command(name="next", description="Browse upcoming fixtures for a league or team.")
+    @app_commands.describe(league=LEAGUE_HELP_TEXT, target="Optional fixture count (1-50) or team name", season="Season start year")
+    async def football_next(self, ctx: commands.Context, league: str, *, target: str | None = None,
+                            season: int | None = None) -> None:
+        target = (target or "").strip()
+        await self._run_fixture_list(ctx, league=league, kind="next", season=season,
+                                     team="" if target.isdigit() else target, count=int(target) if target.isdigit() else 10)
+
+    @football.command(name="last", description="Browse finished fixtures for a league or team.")
+    @app_commands.describe(league=LEAGUE_HELP_TEXT, team="Optional team name", count="Number of fixtures (1-50)", season="Season start year")
+    async def football_last(self, ctx: commands.Context, league: str, *, team: str = "", count: int = 10,
+                            season: int | None = None) -> None:
+        await self._run_fixture_list(ctx, league=league, kind="last", team=team, season=season, count=count)
+
+    async def _run_fixture_list(self, ctx: commands.Context, *, league: str, kind: str, team: str = "",
+                                season: int | None = None, count: int = 10) -> None:
         lang = await self._lang(ctx.guild)
         client = await self._client_or_message(ctx, lang)
         if client is None:
             return
-        await self._defer_if_needed(ctx)
-
-        try:
-            context = await self._resolve_league_context(
-                ctx,
-                client=client,
-                lang=lang,
-                raw_league=league,
-            )
-            if context is None:
-                return
-            league_key, league_id, season = context
-            operation = compile_football_operation(
-                "FOOTBALL_WATCH_TODAY",
-                "today fixtures",
-                {"data_focus": "today_fixtures", "league_candidates": [league]},
-            )
-            result = await FootballOperationService(client).execute(
-                operation,
-                league_id=league_id,
-                season=season,
-                data_focus="today_fixtures",
-            )
-            fixtures = result.fixtures
-        except Exception as exc:
-            await ctx.send(
-                tr(
-                    lang,
-                    f"Failed to get today's fixtures: {exc}",
-                    f"No se pudieron obtener los partidos de hoy: {exc}",
-                )
-            )
-            return
-
-        league_label = self._league_label(league_key, lang)
-        if not fixtures:
-            await ctx.send(
-                tr(
-                    lang,
-                    f"No fixtures for today in {league_label}.",
-                    f"No hay partidos de hoy en {league_label}.",
-                )
-            )
-            return
-
-        shown = min(len(fixtures), 10)
-        embeds: list[discord.Embed] = []
-        for idx, item in enumerate(fixtures[:shown], start=1):
-            embeds.append(
-                self._build_match_embed(
-                    lang=lang,
-                    league_label=league_label,
-                    item=item,
-                    title_en="Today",
-                    title_es="Hoy",
-                    color=discord.Color.blurple(),
-                    index=idx,
-                    total=shown,
-                )
-            )
-
-        await ctx.send(embeds=embeds)
-
-    @football.command(
-        name="next",
-        description="Get next fixtures (or next match for a team) in a selected league.",
-    )
-    @app_commands.describe(
-        league=LEAGUE_HELP_TEXT,
-        target="Optional: number of matches (1-10) or a team name",
-    )
-    @app_commands.choices(league=LEAGUE_CHOICES)
-    async def football_next(
-        self,
-        ctx: commands.Context,
-        league: str,
-        *,
-        target: str | None = None,
-    ) -> None:
-        lang = await self._lang(ctx.guild)
-        client = await self._client_or_message(ctx, lang)
-        if client is None:
+        if type(count) is not int or not 1 <= count <= 50 or (season is not None and not 1900 <= season <= 2100):
+            await ctx.send(tr(lang, "Use a count from 1 to 50 and a season from 1900 to 2100.",
+                              "Usa una cantidad de 1 a 50 y una temporada de 1900 a 2100."))
             return
         await self._defer_if_needed(ctx)
-
-        target_text = (target or "").strip()
-        if target_text and not target_text.isdigit():
-            await self._run_next_for_team(
-                ctx,
-                client=client,
-                lang=lang,
-                raw_league=league,
-                team_query=target_text,
-            )
-            return
-
-        count = 5
-        if target_text.isdigit():
-            count = int(target_text)
-        count = max(1, min(count, 10))
         try:
-            context = await self._resolve_league_context(
-                ctx,
-                client=client,
-                lang=lang,
-                raw_league=league,
-            )
+            selector = football_resolver.make_identity_selector(
+                getattr(self.bot, "llm_client", None), request_text=" / ".join(value for value in (team, league) if value), history=[])
+            context = await self._resolve_league_context(ctx, client=client, lang=lang, raw_league=league,
+                                                          season=season, identity_selector=selector)
             if context is None:
                 return
             league_key, league_id, season = context
-            operation = compile_football_operation(
-                "FOOTBALL_LOOKUP",
-                f"next fixtures {league}",
-                {"data_focus": "next_fixtures", "league_candidates": [league]},
-            )
-            result = await FootballOperationService(client).execute(
-                operation,
-                league_id=league_id,
-                season=season,
-                data_focus="schedule_next_fixtures",
-            )
-            fixtures = result.fixtures[:count]
+            focus = {"live": "live_fixtures", "today": "today_fixtures", "next": "next_fixtures", "last": "last_fixtures"}[kind]
+            operation = compile_football_operation("FOOTBALL_WATCH_TODAY" if kind in {"live", "today"} else "FOOTBALL_LOOKUP",
+                team or "", {"data_focus": focus, "team_candidates": [team] if team else []})
+            operation = replace(operation, fixture_count=count if kind in {"next", "last"} else None)
+
+            async def fetch():
+                result = await FootballOperationService(client, identity_selector=selector).execute(
+                    operation, league_id=league_id, season=season, data_focus=focus)
+                if result.outcome not in {FootballOutcome.SELECTED, FootballOutcome.NO_DATA_FOR_SCOPE}:
+                    raise ValueError(self._football_result_message(result, lang))
+                return list({item["fixture"]["id"]: item for item in result.fixtures
+                             if type((item.get("fixture") or {}).get("id")) is int and item["fixture"]["id"] > 0}.values())
+
+            fixtures = await fetch()
         except Exception as exc:
-            await ctx.send(
-                tr(
-                    lang,
-                    f"Failed to get upcoming fixtures: {exc}",
-                    f"No se pudieron obtener los proximos partidos: {exc}",
-                )
-            )
+            await ctx.send(tr(lang, f"Could not load fixtures: {exc}", f"No se pudieron cargar los partidos: {exc}"))
             return
-
-        league_label = self._league_label(league_key, lang)
+        label = self._league_label(league_key, lang)
         if not fixtures:
-            await ctx.send(
-                tr(
-                    lang,
-                    f"No upcoming fixtures found in {league_label}.",
-                    f"No se encontraron proximos partidos en {league_label}.",
-                )
-            )
+            description = tr(lang, *{"live": ("live", "en vivo"), "today": ("today's", "de hoy"),
+                                     "next": ("upcoming", "proximos"), "last": ("finished", "finalizados")}[kind])
+            await ctx.send(tr(lang, f"No {description} fixtures are listed for {team or label} in the selected scope.",
+                              f"No hay partidos {description} registrados para {team or label} en el alcance seleccionado."))
             return
-
-        shown = min(len(fixtures), count)
-        embeds: list[discord.Embed] = []
-        for idx, item in enumerate(fixtures[:shown], start=1):
-            embeds.append(
-                self._build_match_embed(
-                    lang=lang,
-                    league_label=league_label,
-                    item=item,
-                    title_en="Upcoming",
-                    title_es="Proximos",
-                    color=discord.Color.gold(),
-                    index=idx,
-                    total=shown,
-                )
-            )
-
-        await ctx.send(embeds=embeds)
-
-    async def _run_next_for_team(
-        self,
-        ctx: commands.Context,
-        *,
-        client: Any,
-        lang: str,
-        raw_league: str,
-        team_query: str,
-    ) -> None:
-        try:
-            context = await self._resolve_league_context(
-                ctx,
-                client=client,
-                lang=lang,
-                raw_league=raw_league,
-            )
-            if context is None:
-                return
-            league_key, league_id, season = context
-            operation = compile_football_operation(
-                "FOOTBALL_LOOKUP",
-                team_query,
-                {"data_focus": "next_fixtures", "team_candidates": [team_query]},
-            )
-            result = await FootballOperationService(client).execute(
-                operation,
-                league_id=league_id,
-                season=season,
-                data_focus="next_fixtures",
-            )
-            if result.outcome == FootballOutcome.AMBIGUOUS:
-                await ctx.send(tr(lang, "Multiple teams matched. Please be more specific.", "Varios equipos coinciden. Se mas especifico."))
-                return
-            team_row = result.team_context_row or {}
-            team_info = team_row.get("team") if isinstance(team_row, dict) else {}
-            team_name = str(team_info.get("name", team_query)) if isinstance(team_info, dict) else team_query
-            fixtures = result.fixtures[:1]
-        except Exception as exc:
-            await ctx.send(
-                tr(
-                    lang,
-                    f"Failed to get upcoming team match: {exc}",
-                    f"No se pudo obtener el proximo partido del equipo: {exc}",
-                )
-            )
-            return
-
-        if not fixtures:
-            await ctx.send(
-                tr(
-                    lang,
-                    "No upcoming match found for that team.",
-                    "No se encontro un proximo partido para ese equipo.",
-                )
-            )
-            return
-        league_label = self._league_label(league_key, lang)
-        item = fixtures[0]
-        title, details = self._format_fixture_line(item)
-        match_time = self._match_datetime(item)
-        round_name = self._fixture_round(item)
-        home, away = self._fixture_teams(item)
-        home_logo, away_logo = self._fixture_team_logos(item)
-
-        embed = discord.Embed(
-            title=tr(
-                lang,
-                f"{league_label} Next Match: {team_name}",
-                f"Proximo partido de {league_label}: {team_name}",
-            ),
-            color=discord.Color.gold(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        if home_logo:
-            embed.set_author(name=home, icon_url=home_logo)
-        elif home:
-            embed.set_author(name=home)
-        embed.add_field(
-            name=tr(lang, "Match", "Partido"),
-            value=title,
-            inline=False,
-        )
-        embed.add_field(
-            name=tr(lang, "Date", "Fecha"),
-            value=match_time,
-            inline=False,
-        )
-        embed.add_field(
-            name=tr(lang, "Details", "Detalles"),
-            value=details[:1024],
-            inline=False,
-        )
-        if round_name:
-            embed.add_field(
-                name=tr(lang, "Round", "Jornada"),
-                value=round_name,
-                inline=False,
-            )
-        if away_logo:
-            embed.set_footer(text=away, icon_url=away_logo)
-        elif away:
-            embed.set_footer(text=away)
-
-        await ctx.send(embed=embed)
-
-    @football.command(
-        name="last",
-        description="Get the last played match for a team in a selected league.",
-    )
-    @app_commands.describe(
-        league=LEAGUE_HELP_TEXT,
-        team="Team name",
-    )
-    @app_commands.choices(league=LEAGUE_CHOICES)
-    async def football_last(self, ctx: commands.Context, league: str, *, team: str) -> None:
-        lang = await self._lang(ctx.guild)
-        client = await self._client_or_message(ctx, lang)
-        if client is None:
-            return
-        await self._defer_if_needed(ctx)
-
-        query = team.strip()
-        if not query:
-            await ctx.send(tr(lang, "Provide a team name.", "Proporciona un nombre de equipo."))
-            return
-
-        try:
-            context = await self._resolve_league_context(
-                ctx,
-                client=client,
-                lang=lang,
-                raw_league=league,
-            )
-            if context is None:
-                return
-            league_key, league_id, season = context
-            operation = compile_football_operation(
-                "FOOTBALL_LOOKUP",
-                query,
-                {"data_focus": "last_fixtures", "team_candidates": [query]},
-            )
-            result = await FootballOperationService(client).execute(
-                operation,
-                league_id=league_id,
-                season=season,
-                data_focus="last_fixtures",
-            )
-            if result.outcome == FootballOutcome.AMBIGUOUS:
-                await ctx.send(tr(lang, "Multiple teams matched. Please be more specific.", "Varios equipos coinciden. Se mas especifico."))
-                return
-            team_row = result.team_context_row or {}
-            team_info = team_row.get("team") if isinstance(team_row, dict) else {}
-            team_name = str(team_info.get("name", query)) if isinstance(team_info, dict) else query
-            fixtures = result.fixtures[:1]
-        except Exception as exc:
-            await ctx.send(
-                tr(
-                    lang,
-                    f"Failed to get last match data: {exc}",
-                    f"No se pudieron obtener los datos del ultimo partido: {exc}",
-                )
-            )
-            return
-
-        if not fixtures:
-            await ctx.send(
-                tr(
-                    lang,
-                    "No last match data found for that team.",
-                    "No se encontraron datos del ultimo partido para ese equipo.",
-                )
-            )
-            return
-
-        league_label = self._league_label(league_key, lang)
-        item = fixtures[0]
-        home, away = self._fixture_teams(item)
-        home_logo, away_logo = self._fixture_team_logos(item)
-        score = self._fixture_score(item)
-        fixture = item.get("fixture") if isinstance(item.get("fixture"), dict) else {}
-        status = self._fixture_status(fixture)
-        round_name = self._fixture_round(item)
-        match_time = self._match_datetime(item)
-
-        embed = discord.Embed(
-            title=tr(
-                lang,
-                f"{league_label} Last Match: {team_name}",
-                f"Ultimo partido de {league_label}: {team_name}",
-            ),
-            color=discord.Color.green(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        if home_logo:
-            embed.set_author(name=home, icon_url=home_logo)
-        elif home:
-            embed.set_author(name=home)
-        embed.add_field(
-            name=tr(lang, "Match", "Partido"),
-            value=f"{home} vs {away}",
-            inline=False,
-        )
-        embed.add_field(
-            name=tr(lang, "Result", "Resultado"),
-            value=f"**{score}**",
-            inline=True,
-        )
-        embed.add_field(
-            name=tr(lang, "Status", "Estado"),
-            value=status,
-            inline=True,
-        )
-        embed.add_field(
-            name=tr(lang, "Date", "Fecha"),
-            value=match_time,
-            inline=False,
-        )
-        if round_name:
-            embed.add_field(
-                name=tr(lang, "Round", "Jornada"),
-                value=round_name,
-                inline=False,
-            )
-        if away_logo:
-            embed.set_footer(text=away, icon_url=away_logo)
-        elif away:
-            embed.set_footer(text=away)
-
-        await ctx.send(embed=embed)
+        heading = tr(lang, *{"live": ("Live matches", "Partidos en vivo"), "today": ("Today's matches", "Partidos de hoy"),
+                              "next": ("Upcoming matches", "Proximos partidos"), "last": ("Finished matches", "Partidos finalizados")}[kind])
+        scope = f"{label} / {season}" if kind in {"next", "last"} else label
+        title = f"{scope} / {team or heading}" + (f" / {heading}" if team else "")
+        await self._send_match_card(ctx, client=client, lang=lang, fixture_id=fixtures[0]["fixture"]["id"],
+                                    section="fixtures", fixture=fixtures[0], fixtures=fixtures,
+                                    list_title=title, reload_fixtures=fetch)
 
     @football.command(
         name="table",
         description="Get standings for a selected league.",
     )
     @app_commands.describe(league=LEAGUE_HELP_TEXT)
-    @app_commands.choices(league=LEAGUE_CHOICES)
     async def football_table(self, ctx: commands.Context, league: str) -> None:
-        lang = await self._lang(ctx.guild)
-        client = await self._client_or_message(ctx, lang)
-        if client is None:
-            return
-        await self._defer_if_needed(ctx)
-
-        try:
-            context = await self._resolve_league_context(
-                ctx,
-                client=client,
-                lang=lang,
-                raw_league=league,
-            )
-            if context is None:
-                return
-            league_key, league_id, season = context
-            operation = compile_football_operation(
-                "FOOTBALL_TABLE",
-                league,
-                {"data_focus": "standings", "league_candidates": [league]},
-            )
-            result = await FootballOperationService(client).execute(
-                operation,
-                league_id=league_id,
-                season=season,
-                data_focus="standings",
-            )
-        except Exception as exc:
-            await ctx.send(
-                tr(
-                    lang,
-                    f"Failed to get standings: {exc}",
-                    f"No se pudieron obtener las posiciones: {exc}",
-                )
-            )
-            return
-
-        table = result.standings_table
-        if not table:
-            await ctx.send(
-                tr(
-                    lang,
-                    "No standings data available right now.",
-                    "No hay datos de tabla disponibles en este momento.",
-                )
-            )
-            return
-
-        lines = []
-        for row in table[:20]:
-            rank = row.get("rank", "-")
-            team_name = self._team_name_from_row(row)
-            points = row.get("points", 0)
-            played = row.get("all", {}).get("played", 0) if isinstance(row.get("all"), dict) else 0
-            gd = row.get("goalsDiff", 0)
-            lines.append(f"`{rank:>2}` {team_name} - {points} pts | PJ {played} | DG {gd}")
-
-        league_label = self._league_label(league_key, lang)
-        embed = discord.Embed(
-            title=tr(lang, f"{league_label} - Table", f"{league_label} - Tabla"),
-            description="\n".join(lines)[:4000],
-            color=discord.Color.blue(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        await ctx.send(embed=embed)
+        await self._send_league_card(ctx, league=league, focus="standings")
 
     @football.command(
         name="team",
@@ -812,12 +528,15 @@ class FootballCog(commands.Cog):
     @app_commands.describe(
         league=LEAGUE_HELP_TEXT,
         team="Team name",
+        season="Season start year; defaults to the league's current season",
     )
-    @app_commands.choices(league=LEAGUE_CHOICES)
-    async def football_team(self, ctx: commands.Context, league: str, *, team: str) -> None:
+    async def football_team(self, ctx: commands.Context, league: str, *, team: str, season: int | None = None) -> None:
         lang = await self._lang(ctx.guild)
         client = await self._client_or_message(ctx, lang)
         if client is None:
+            return
+        if season is not None and not 1900 <= season <= 2100:
+            await ctx.send(tr(lang, "Season must be between 1900 and 2100.", "La temporada debe estar entre 1900 y 2100."))
             return
         await self._defer_if_needed(ctx)
 
@@ -832,6 +551,7 @@ class FootballCog(commands.Cog):
                 client=client,
                 lang=lang,
                 raw_league=league,
+                season=season,
             )
             if context is None:
                 return
@@ -854,11 +574,7 @@ class FootballCog(commands.Cog):
                 await ctx.send(tr(lang, "Team not found in that league.", "No se encontro ese equipo en esa liga."))
                 return
             team_row = result.team_context_row
-            team = team_row.get("team") if isinstance(team_row, dict) else {}
-            team_id = team.get("id") if isinstance(team, dict) else None
-            team_name = str(team.get("name", query)) if isinstance(team, dict) else query
-            standing_row = result.standing_row
-            next_fixture = result.fixtures[0] if result.fixtures else None
+            team_id = team_row["team"]["id"]
         except Exception as exc:
             await ctx.send(
                 tr(
@@ -870,283 +586,116 @@ class FootballCog(commands.Cog):
             return
 
         league_label = self._league_label(league_key, lang)
-        embed = discord.Embed(
-            title=tr(
-                lang,
-                f"{league_label} Team: {team_name}",
-                f"Equipo de {league_label}: {team_name}",
-            ),
-            color=discord.Color.purple(),
-            timestamp=datetime.now(timezone.utc),
-        )
+        labels = {"overview": tr(lang, "Overview", "Resumen"),
+                  "season": tr(lang, "Season statistics", "Estadisticas de temporada"),
+                  "team_squad": tr(lang, "Current squad", "Plantilla actual"),
+                  "team_seasons": tr(lang, "Registered seasons", "Temporadas registradas"),
+                  "team_coach": tr(lang, "Coach", "Entrenador"),
+                  "team_venue": tr(lang, "Venue", "Estadio")}
 
-        if standing_row:
-            form = standing_row.get("form") or "N/A"
-            all_data = standing_row.get("all")
-            played = won = drawn = lost = 0
-            gf = ga = 0
-            if isinstance(all_data, dict):
-                played = int(all_data.get("played", 0) or 0)
-                won = int(all_data.get("win", 0) or 0)
-                drawn = int(all_data.get("draw", 0) or 0)
-                lost = int(all_data.get("lose", 0) or 0)
-                goals = all_data.get("goals")
-                if isinstance(goals, dict):
-                    gf = int(goals.get("for", 0) or 0)
-                    ga = int(goals.get("against", 0) or 0)
-            embed.add_field(
-                name=tr(lang, "Position", "Posicion"),
-                value=str(standing_row.get("rank", "-")),
-                inline=True,
-            )
-            embed.add_field(
-                name=tr(lang, "Points", "Puntos"),
-                value=str(standing_row.get("points", 0)),
-                inline=True,
-            )
-            embed.add_field(name=tr(lang, "Form", "Forma"), value=str(form), inline=True)
-            embed.add_field(
-                name=tr(lang, "Record", "Registro"),
-                value=f"PJ {played} | G {won} E {drawn} P {lost}",
-                inline=False,
-            )
-            embed.add_field(
-                name=tr(lang, "Goals", "Goles"),
-                value=f"GF {gf} | GC {ga}",
-                inline=False,
-            )
+        def overview(snapshot):
+            pages = football_cards.team_pages(
+                snapshot.team_context_row, snapshot.standing_row, snapshot.fixtures,
+                league=league_label, season=season, lang=lang)
+            if snapshot.outcome != FootballOutcome.SELECTED:
+                pages[0]["rows"].append((tr(lang, "Data availability", "Disponibilidad de datos"),
+                                         self._football_result_message(snapshot, lang)))
+            return {key: pages if key == "overview" else None for key in labels}
 
-        if isinstance(next_fixture, dict):
-            title, details = self._format_fixture_line(next_fixture)
-            match_time = self._match_datetime(next_fixture)
-            embed.add_field(
-                name=tr(lang, "Next match", "Proximo partido"),
-                value=f"{title}\n{match_time}\n{details}"[:1024],
-                inline=False,
-            )
+        async def refresh():
+            nonlocal team_row
+            snapshot = await FootballOperationService(client).execute(
+                operation, league_id=league_id, season=season, data_focus="team")
+            if (snapshot.team_context_row or {}).get("team", {}).get("id") != team_id:
+                raise ValueError("Team identity changed during refresh")
+            team_row = snapshot.team_context_row
+            return overview(snapshot)
 
-        await ctx.send(embed=embed)
+        async def load_section(section):
+            snapshot = FootballRetrievalResult(team_context_row=team_row,
+                requested_scope={"operation_type": "team_season_statistics" if section == "season" else section,
+                                 "league_id": league_id, "season": season})
+            service = FootballOperationService(client)
+            if section != "season":
+                await service.load_profile_section(snapshot, section)
+                if snapshot.outcome != FootballOutcome.SELECTED:
+                    return [{"title": labels[section], "text": self._football_result_message(snapshot, lang)}]
+                return football_cards.profile_section_pages(snapshot, section, lang=lang)
+            await service.load_team_statistics(snapshot, team_row=team_row, league_id=league_id, season=season)
+            if snapshot.outcome != FootballOutcome.SELECTED or not snapshot.team_season_statistics:
+                return [{"title": team_row["team"]["name"], "text": self._football_result_message(snapshot, lang)}]
+            return football_cards.team_statistics_pages(team_row, snapshot.team_season_statistics,
+                                                       league=league_label, season=season, lang=lang)
 
-    @football.command(
-        name="scorers",
-        description="Get top scorers for a selected league.",
-    )
-    @app_commands.describe(league=LEAGUE_HELP_TEXT)
-    @app_commands.choices(league=LEAGUE_CHOICES)
-    async def football_scorers(self, ctx: commands.Context, league: str) -> None:
+        await self._send_card(ctx, lang=lang, pages=overview(result),
+                              labels=labels,
+                              section="overview", refresh=refresh, load_section=load_section)
+
+    @football.command(name="match", description="Find a team's match and open its scoreboard and details.")
+    @app_commands.describe(team="Team name", when="Auto, live, next or last match",
+                           league="Optional competition filter")
+    @app_commands.choices(when=[app_commands.Choice(name=label, value=value) for label,value in
+                                [("Auto", "auto"), ("Live", "live"), ("Next", "next"), ("Last", "last")]])
+    async def football_match(self, ctx: commands.Context, team: str, league: str = "",
+                             when: str = "auto") -> None:
         lang = await self._lang(ctx.guild)
         client = await self._client_or_message(ctx, lang)
         if client is None:
             return
+        name = team.strip()
+        if not name:
+            await ctx.send(tr(lang, "Enter a team name.", "Escribe el nombre de un equipo."))
+            return
+        if when not in {"auto", "live", "next", "last"}:
+            await ctx.send(tr(lang, "Choose Auto, Live, Next or Last.", "Elige Auto, Live, Next o Last."))
+            return
         await self._defer_if_needed(ctx)
-
         try:
-            context = await self._resolve_league_context(
-                ctx,
-                client=client,
-                lang=lang,
-                raw_league=league,
-            )
-            if context is None:
+            league_id = season = None
+            selector = football_resolver.make_identity_selector(
+                getattr(self.bot, "llm_client", None), request_text=name, history=[])
+            if league.strip():
+                context = await self._resolve_league_context(ctx, client=client, lang=lang, raw_league=league,
+                                                              identity_selector=selector)
+                if context is None:
+                    return
+                _label, league_id, season = context
+            operation = compile_football_operation("FOOTBALL_TEAM_QUERY", name,
+                {"data_focus": "team", "team_candidates": [name]})
+            service = FootballOperationService(client, identity_selector=selector)
+            rows, outcome = await service.resolve_team_rows(operation, league_id=league_id, season=season,
+                                                            max_teams=1, allow_global=not bool(league.strip()))
+            if outcome != FootballOutcome.SELECTED or not rows:
+                await ctx.send(tr(lang, "The team could not be identified clearly. Try its full name or add a league.",
+                                  "No se pudo identificar el equipo con claridad. Prueba su nombre completo o agrega una liga."))
                 return
-            league_key, league_id, season = context
-            operation = compile_football_operation(
-                "FOOTBALL_LOOKUP",
-                league,
-                {"data_focus": "scorers", "league_candidates": [league]},
-            )
-            result = await FootballOperationService(client).execute(
-                operation,
-                league_id=league_id,
-                season=season,
-                data_focus="top_scorers",
-            )
-            scorers = result.generic_rows
-        except Exception as exc:
-            await ctx.send(
-                tr(
-                    lang,
-                    f"Failed to get top scorers: {exc}",
-                    f"No se pudieron obtener los goleadores: {exc}",
-                )
-            )
-            return
-
-        if not scorers:
-            await ctx.send(
-                tr(
-                    lang,
-                    "No top scorer data available right now.",
-                    "No hay datos de goleadores disponibles en este momento.",
-                )
-            )
-            return
-
-        lines = []
-        for index, row in enumerate(scorers[:10], start=1):
-            player = row.get("player") if isinstance(row, dict) else {}
-            stats_list = row.get("statistics") if isinstance(row, dict) else None
-            stats = stats_list[0] if isinstance(stats_list, list) and stats_list else {}
-            team = stats.get("team") if isinstance(stats, dict) else {}
-            goals_data = stats.get("goals") if isinstance(stats, dict) else {}
-            assists = goals_data.get("assists") if isinstance(goals_data, dict) else None
-            goals = goals_data.get("total") if isinstance(goals_data, dict) else None
-            name = str(player.get("name", "Unknown")) if isinstance(player, dict) else "Unknown"
-            team_name = str(team.get("name", "N/A")) if isinstance(team, dict) else "N/A"
-            assists_text = assists if isinstance(assists, int) else 0
-            goals_text = goals if isinstance(goals, int) else 0
-            lines.append(
-                tr(
-                    lang,
-                    f"`{index:>2}.` {name} ({team_name}) - Goals {goals_text} | Assists {assists_text}",
-                    f"`{index:>2}.` {name} ({team_name}) - Goles {goals_text} | Asistencias {assists_text}",
-                )
-            )
-
-        league_label = self._league_label(league_key, lang)
-        embed = discord.Embed(
-            title=tr(lang, f"{league_label} - Top Scorers", f"{league_label} - Goleadores"),
-            description="\n".join(lines)[:4000],
-            color=discord.Color.orange(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        await ctx.send(embed=embed)
-
-    @football.command(name="match", description="Show a fixture match center by fixture ID or team.")
-    @app_commands.describe(query="Fixture ID or team name", league=LEAGUE_HELP_TEXT)
-    @app_commands.choices(league=LEAGUE_CHOICES)
-    async def football_match(self, ctx: commands.Context, query: str, league: str = "ligamx") -> None:
-        lang = await self._lang(ctx.guild)
-        client = await self._client_or_message(ctx, lang)
-        if client is None:
-            return
-        await self._defer_if_needed(ctx)
-        try:
-            events = []
-            stats = []
-            if query.strip().isdigit():
-                fixtures = await self._fixtures_for_query(client, query=query, league=league, lang=lang, ctx=ctx)
-                if not fixtures:
-                    await ctx.send(tr(lang, "No match found.", "No se encontro partido."))
-                    return
-                item = fixtures[0]
-                fixture = item.get("fixture") if isinstance(item.get("fixture"), dict) else {}
-                fixture_id = fixture.get("id")
-                events = await client.get_fixture_events(fixture_id=fixture_id) if isinstance(fixture_id, int) else []
-                stats = await client.get_fixture_statistics(fixture_id=fixture_id) if isinstance(fixture_id, int) else []
-            else:
-                fixtures = await self._fixtures_for_query(client, query=query, league=league, lang=lang, ctx=ctx)
-                if not fixtures:
-                    await ctx.send(tr(lang, "No match found.", "No se encontro partido."))
-                    return
-                item = fixtures[0]
+            provider_team = rows[0]["team"]
+            fixtures = await FootballLiveMatchService(client).get_team_fixture_choices(
+                provider_team["id"], when=when, league_id=league_id, season=season)
+            fixtures = list({item["fixture"]["id"]: item for item in fixtures
+                             if type((item.get("fixture") or {}).get("id")) is int and item["fixture"]["id"] > 0}.values())
         except Exception as exc:
             await ctx.send(tr(lang, f"Failed to get match data: {exc}", f"No se pudo obtener el partido: {exc}"))
             return
-        embed = self._build_match_embed(
-            lang=lang,
-            league_label=str((item.get("league") or {}).get("name", self._league_label(self._normalize_league_key(league) or league, lang))),
-            item=item,
-            title_en="Match Center",
-            title_es="Centro del Partido",
-            color=discord.Color.teal(),
-            index=1,
-            total=1,
-        )
-        if events:
-            embed.add_field(name=tr(lang, "Key events", "Eventos"), value=self._format_events(events), inline=False)
-        if stats:
-            embed.add_field(name=tr(lang, "Stats", "Estadisticas"), value=self._format_statistics(stats), inline=False)
-        await ctx.send(embed=embed)
-
-    @football.command(name="odds", description="Show pre-match odds for a fixture, league, or date.")
-    @app_commands.describe(
-        fixture_id="Fixture ID",
-        league="League",
-        date="Date in YYYY-MM-DD format",
-        bookmaker="Optional bookmaker name",
-        bet="Optional pre-match market name",
-        page="Provider page number",
-    )
-    @app_commands.choices(league=LEAGUE_CHOICES)
-    async def football_odds(
-        self,
-        ctx: commands.Context,
-        fixture_id: int | None = None,
-        league: str = "",
-        date: str = "",
-        bookmaker: str = "",
-        bet: str = "",
-        page: int = 1,
-    ) -> None:
-        lang = await self._lang(ctx.guild)
-        client = await self._client_or_message(ctx, lang)
-        if client is None:
+        if not fixtures:
+            target = provider_team.get("name") or name
+            en, es = {
+                "live": (f"{target} is not playing a match right now. Check its schedule with next or last.",
+                         f"{target} no esta disputando un partido ahora. Revisa su calendario con next o last."),
+                "next": (f"No upcoming fixtures are listed for {target}.", f"No hay proximos partidos registrados para {target}."),
+                "last": (f"No finished fixtures are recorded for {target}.", f"No hay partidos finalizados registrados para {target}."),
+                "auto": (f"No fixtures are available for {target} in the selected scope.",
+                         f"No hay partidos disponibles para {target} en el alcance seleccionado."),
+            }[when]
+            await ctx.send(tr(lang, en, es))
             return
-        if fixture_id is None and not league.strip() and not date.strip():
-            await ctx.send(tr(lang, "Provide a fixture, league, or date scope.", "Indica un partido, liga o fecha."))
+        if len(fixtures) > 25:
+            await ctx.send(tr(lang, "Several matches were found. Add a league to narrow the selection.",
+                              "Se encontraron varios partidos. Agrega una liga para reducir la seleccion."))
             return
-        await self._defer_if_needed(ctx)
-        operation = compile_football_operation(
-            "FOOTBALL_LOOKUP",
-            "pre-match odds",
-            {
-                "data_focus": "pre_match_odds",
-                "fixture_focus": str(fixture_id) if fixture_id is not None else None,
-                "league_candidates": [league] if league.strip() else [],
-                "bookmaker_candidates": [bookmaker] if bookmaker.strip() else [],
-                "bet_candidates": [bet] if bet.strip() else [],
-                "date_hint": date.strip() or None,
-                "reference_page": page,
-            },
-        )
-        try:
-            result = await FootballOperationService(client).execute(operation, league_id=None, season=None, data_focus="pre_match_odds")
-        except Exception as exc:
-            await ctx.send(tr(lang, f"Failed to get odds: {exc}", f"No se pudieron obtener las cuotas: {exc}"))
-            return
-        if result.outcome != FootballOutcome.SELECTED:
-            await ctx.send(self._football_result_message(result, lang))
-            return
-        await ctx.send(embed=self._build_odds_embed(result.odds, result.requested_scope.get("paging"), lang=lang, live=False))
-
-    @football.command(name="live-odds", description="Show in-play odds for a fixture, league, or market.")
-    @app_commands.describe(fixture_id="Fixture ID", league="League", bet="Optional live market name")
-    @app_commands.choices(league=LEAGUE_CHOICES)
-    async def football_live_odds(
-        self,
-        ctx: commands.Context,
-        fixture_id: int | None = None,
-        league: str = "",
-        bet: str = "",
-    ) -> None:
-        lang = await self._lang(ctx.guild)
-        client = await self._client_or_message(ctx, lang)
-        if client is None:
-            return
-        if fixture_id is None and not league.strip() and not bet.strip():
-            await ctx.send(tr(lang, "Provide a fixture, league, or live market scope.", "Indica un partido, liga o mercado en vivo."))
-            return
-        await self._defer_if_needed(ctx)
-        operation = compile_football_operation(
-            "FOOTBALL_LOOKUP",
-            "live odds",
-            {
-                "data_focus": "live_odds",
-                "fixture_focus": str(fixture_id) if fixture_id is not None else None,
-                "league_candidates": [league] if league.strip() else [],
-                "bet_candidates": [bet] if bet.strip() else [],
-            },
-        )
-        try:
-            result = await FootballOperationService(client).execute(operation, league_id=None, season=None, data_focus="live_odds")
-        except Exception as exc:
-            await ctx.send(tr(lang, f"Failed to get live odds: {exc}", f"No se pudieron obtener las cuotas en vivo: {exc}"))
-            return
-        if result.outcome != FootballOutcome.SELECTED:
-            await ctx.send(self._football_result_message(result, lang))
-            return
-        await ctx.send(embed=self._build_odds_embed(result.odds, None, lang=lang, live=True))
+        await self._send_match_card(ctx, client=client, lang=lang, fixture_id=fixtures[0]["fixture"]["id"],
+                                    section="overview", fixture=fixtures[0],
+                                    fixtures=fixtures if len(fixtures) > 1 else None)
 
     @football.command(name="odds-reference", description="List or search bookmakers and odds markets.")
     @app_commands.describe(scope="bookmakers, pre-match markets, or live markets", query="Optional reference search")
@@ -1182,67 +731,116 @@ class FootballCog(commands.Cog):
     async def football_seasons(self, ctx: commands.Context) -> None:
         await self._send_football_reference(ctx, focus="league_seasons")
 
-    @football.command(name="schedule", description="Show next or last fixtures for a team or league.")
-    @app_commands.describe(target="Team name or 'league'", mode="next or last", league=LEAGUE_HELP_TEXT)
-    @app_commands.choices(
-        league=LEAGUE_CHOICES,
-        mode=[app_commands.Choice(name="next", value="next"), app_commands.Choice(name="last", value="last")],
-    )
-    async def football_schedule(self, ctx: commands.Context, target: str = "league", mode: str = "next", league: str = "ligamx") -> None:
+    @football.command(name="schedule", description="Find a team's next or last match.")
+    @app_commands.describe(team="Team name", date="Choose next or last", league="Optional competition; otherwise use the team's domestic league",
+                           count="Match position: 1 = nearest, 2 = second nearest (1-50)")
+    @app_commands.choices(date=[app_commands.Choice(name="next", value="next"), app_commands.Choice(name="last", value="last")])
+    async def football_schedule(self, ctx: commands.Context, team: str, date: str, league: str = "",
+                                count: app_commands.Range[int, 1, 50] = 1) -> None:
         lang = await self._lang(ctx.guild)
         client = await self._client_or_message(ctx, lang)
         if client is None:
             return
-        await self._defer_if_needed(ctx)
-        mode_key = mode.strip().casefold()
-        try:
-            context = await self._resolve_league_context(ctx, client=client, lang=lang, raw_league=league)
-            if context is None:
-                return
-            league_key, league_id, season = context
-            target_text = target.strip()
-            is_team_target = bool(target_text and target_text.casefold() not in {"league", "liga", "all"})
-            data_focus = "last_fixtures" if mode_key in {"last", "previous", "pasados", "ultimos"} else "next_fixtures"
-            operation = compile_football_operation(
-                "FOOTBALL_LOOKUP",
-                target_text if is_team_target else f"{data_focus} {league}",
-                {"data_focus": data_focus, "team_candidates": [target_text] if is_team_target else []},
-            )
-            result = await FootballOperationService(client).execute(operation, league_id=league_id, season=season, data_focus=f"schedule_{data_focus}")
-            if result.outcome != FootballOutcome.SELECTED:
-                await ctx.send(tr(lang, "No fixtures found.", "No se encontraron partidos."))
-                return
-            fixtures = result.fixtures
-            if data_focus == "last_fixtures":
-                title_en, title_es = "Last Fixtures", "Ultimos Partidos"
-            else:
-                title_en, title_es = "Upcoming Fixtures", "Proximos Partidos"
-        except Exception as exc:
-            await ctx.send(tr(lang, f"Failed to get schedule: {exc}", f"No se pudo obtener el calendario: {exc}"))
+        team, league, date = team.strip(), league.strip(), date.strip().casefold()
+        if not team or date not in {"next", "last"} or type(count) is not int or not 1 <= count <= 50:
+            await ctx.send(tr(lang, "Enter a team, choose next or last, and use a match position from 1 to 50.",
+                              "Escribe un equipo, elige next o last y usa una posicion de partido de 1 a 50."))
             return
-        await self._send_fixture_embeds(ctx, fixtures, lang=lang, league_label=self._league_label(league_key, lang), title_en=title_en, title_es=title_es)
+        await self._defer_if_needed(ctx)
+        try:
+            selector = football_resolver.make_identity_selector(getattr(self.bot, "llm_client", None),
+                request_text=f"{team} / {date} / {league or 'domestic league'}", history=[])
+            service = FootballOperationService(client, identity_selector=selector)
+            league_id = season = None
+            if league:
+                context = await self._resolve_league_context(ctx, client=client, lang=lang, raw_league=league,
+                                                              identity_selector=selector)
+                if context is None:
+                    return
+                _label, league_id, season = context
+            operation = compile_football_operation("FOOTBALL_TEAM_QUERY", team,
+                {"data_focus": "team", "team_candidates": [team]})
+            rows, outcome = await service.resolve_team_rows(operation, league_id=league_id, season=season,
+                                                            max_teams=1, allow_global=not bool(league))
+            if outcome != FootballOutcome.SELECTED or not rows:
+                await ctx.send(tr(lang, "The team could not be identified clearly. Try its full name or add a league.",
+                                  "No se pudo identificar el equipo con claridad. Prueba su nombre completo o agrega una liga."))
+                return
+            if not league:
+                league_row, outcome = await service.resolve_current_domestic_league(rows[0])
+                if outcome != FootballOutcome.SELECTED:
+                    await ctx.send(tr(lang, "The team's domestic league could not be identified clearly. Add the optional league field.",
+                                      "No se pudo identificar la liga nacional del equipo con claridad. Agrega el campo opcional league."))
+                    return
+                league_id = league_row["league"]["id"]
+                season = ApiFootballClient._extract_current_season([league_row])
+            fixtures = await FootballLiveMatchService(client).get_team_fixture_choices(
+                rows[0]["team"]["id"], when=date, league_id=league_id, season=season, count=count)
+            fixtures = list({item["fixture"]["id"]: item for item in fixtures
+                             if type((item.get("fixture") or {}).get("id")) is int and item["fixture"]["id"] > 0
+                             and (date == "last" or build_lifecycle(item).is_scheduled)}.values())
+
+            def kickoff(item):
+                value = item["fixture"].get("timestamp")
+                if type(value) in {int, float}:
+                    return value
+                value = datetime.fromisoformat(item["fixture"]["date"].replace("Z", "+00:00"))
+                return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).timestamp()
+
+            fixtures.sort(key=kickoff, reverse=date == "last")
+        except Exception as exc:
+            await ctx.send(tr(lang, f"Could not load the match: {exc}", f"No se pudo cargar el partido: {exc}"))
+            return
+        if len(fixtures) < count:
+            direction = tr(lang, "upcoming" if date == "next" else "finished", "proximos" if date == "next" else "finalizados")
+            if not fixtures:
+                await ctx.send(tr(lang, f"No {direction} fixtures are listed for {team} in the selected competition.",
+                                  f"No hay partidos {direction} registrados para {team} en la competicion seleccionada."))
+            else:
+                await ctx.send(tr(lang, f"Only {len(fixtures)} {direction} matches are available for {team}; match {count} is unavailable.",
+                                  f"Solo hay {len(fixtures)} partidos {direction} disponibles para {team}; el partido {count} no esta disponible."))
+            return
+        fixture = fixtures[count - 1]
+        self._log_football_diagnostic(
+            command="schedule", resolver_input=team, normalized_query=team, explicit_context=bool(league),
+            endpoint="/fixtures", params={"team": rows[0]["team"]["id"], "league": league_id,
+                "season": season, "direction": date, "position": count}, response_count=len(fixtures),
+            top_candidates=[f"{index + 1}: fixture={item['fixture']['id']} date={item['fixture'].get('date')} "
+                            f"timestamp={item['fixture'].get('timestamp')} "
+                            f"match={' vs '.join(football_fmt.fixture_teams(item))} "
+                            f"status={football_fmt.fixture_status(item['fixture'])} round={(item.get('league') or {}).get('round')}"
+                            for index, item in enumerate(fixtures)],
+            final_decision=f"selected_fixture={fixture['fixture']['id']}",
+        )
+        await self._send_match_card(ctx, client=client, lang=lang, fixture_id=fixture["fixture"]["id"],
+                                    section="overview", fixture=fixture)
 
     @football.command(name="player", description="Show a player profile and season stats.")
-    @app_commands.describe(player="Player name", league=LEAGUE_HELP_TEXT)
-    @app_commands.choices(league=LEAGUE_CHOICES)
-    async def football_player(self, ctx: commands.Context, player: str, league: str = "") -> None:
+    @app_commands.describe(player="Player name", league=LEAGUE_HELP_TEXT, team="Optional team name to narrow the player lookup",
+                           season="Season start year; defaults to the league's current season or the player's latest registered season")
+    async def football_player(self, ctx: commands.Context, player: str, league: str = "", season: int | None = None, team: str = "") -> None:
         lang = await self._lang(ctx.guild)
         client = await self._client_or_message(ctx, lang)
         if client is None:
             return
+        if season is not None and not 1900 <= season <= 2100:
+            await ctx.send(tr(lang, "Season must be between 1900 and 2100.", "La temporada debe estar entre 1900 y 2100."))
+            return
         await self._defer_if_needed(ctx)
         try:
-            league_id = season = None
-            explicit_context = bool(str(league or "").strip())
-            if explicit_context:
-                context = await self._resolve_league_context(ctx, client=client, lang=lang, raw_league=league)
+            league_id = None
+            team = team.strip()
+            explicit_context = bool(str(league or "").strip() or team)
+            if str(league or "").strip():
+                context = await self._resolve_league_context(ctx, client=client, lang=lang, raw_league=league, season=season)
                 if context is None:
                     return
                 _league_key, league_id, season = context
+            request_text = " / ".join(str(value) for value in (player, team, league, season) if value)
             operation = compile_football_operation(
                 "FOOTBALL_PLAYER_QUERY",
-                player,
-                {"data_focus": "player", "player_candidates": [player]},
+                request_text,
+                {"data_focus": "player_recent_stats", "player_candidates": [player], "team_candidates": [team] if team else []},
             )
             if not operation.player_slots:
                 await ctx.send(tr(lang, "I need a clearer player name.", "Necesito un nombre de jugador mas claro."))
@@ -1251,14 +849,20 @@ class FootballCog(commands.Cog):
                 client,
                 player_canonicalizer=self._football_player_canonicalizer(),
                 player_alias_cache=self._football_player_alias_cache(),
-            ).execute(operation, league_id=league_id, season=season, data_focus="player")
+                player_selector=football_resolver.make_player_selector(
+                    getattr(self.bot, "llm_client", None), request_text=request_text, history=[],
+                ),
+                identity_selector=football_resolver.make_identity_selector(
+                    getattr(self.bot, "llm_client", None), request_text=request_text, history=[],
+                ),
+            ).execute(operation, league_id=league_id, season=season, data_focus="player_recent_stats")
             self._log_football_diagnostic(
                 command="player",
                 resolver_input=player,
                 normalized_query=" | ".join(operation.player_candidates),
                 explicit_context=explicit_context,
                 endpoint=",".join(result.endpoints),
-                params={"league": league_id, "season": season},
+                params={"league": league_id, "season": season, "team": team or None},
                 response_count=len(result.generic_rows) or (1 if result.player_context_row else 0),
                 top_candidates=self._player_candidate_names(list(result.generic_rows)),
                 final_decision="ambiguous" if result.outcome == FootballOutcome.AMBIGUOUS else ("selected" if result.player_context_row else "not_found"),
@@ -1267,55 +871,72 @@ class FootballCog(commands.Cog):
         except Exception as exc:
             await ctx.send(tr(lang, f"Failed to get player data: {exc}", f"No se pudo obtener el jugador: {exc}"))
             return
+        if result.player_context_row is None and ("team" in result.missing_inputs or
+                result.outcome not in {FootballOutcome.AMBIGUOUS, FootballOutcome.NOT_FOUND}):
+            await ctx.send(self._football_result_message(result, lang))
+            return
         if result.outcome == FootballOutcome.AMBIGUOUS:
             await ctx.send(self._format_player_disambiguation(list(result.generic_rows), lang))
             return
         if result.player_context_row is None:
             await ctx.send(tr(lang, "Player not found.", "No se encontro el jugador."))
             return
-        await ctx.send(embed=self._build_player_embed(result.player_context_row, lang=lang))
+        player_id = result.player_context_row["player"]["id"]
+        selected_team_id = (result.team_context_row or {}).get("team", {}).get("id")
+        player_row = result.player_context_row
+        labels = {"profile": tr(lang, "Profile", "Perfil"),
+                  "statistics": tr(lang, "Statistics", "Estadisticas"),
+                  "player_teams": tr(lang, "Career teams", "Trayectoria"),
+                  "player_transfers": tr(lang, "Transfers", "Transferencias"),
+                  "player_trophies": tr(lang, "Trophies", "Palmarés"),
+                  "player_sidelined": tr(lang, "Absence history", "Historial de ausencias")}
 
-    @football.command(name="lineup", description="Show confirmed lineups for a fixture ID.")
-    @app_commands.describe(fixture_id="Fixture ID, for example from /football today")
-    async def football_lineup(self, ctx: commands.Context, fixture_id: int) -> None:
-        await self._send_fixture_detail(ctx, fixture_id=fixture_id, kind="lineup")
+        def pages(snapshot):
+            result_pages = football_cards.player_pages(snapshot.player_context_row,
+                season=snapshot.requested_scope.get("season"), lang=lang,
+                notice=self._football_result_message(snapshot, lang), latest=league_id is None and season is None)
+            return {key: result_pages.get(key) for key in labels}
 
-    @football.command(name="stats", description="Show fixture statistics for a fixture ID.")
-    @app_commands.describe(fixture_id="Fixture ID, for example from /football today")
-    async def football_stats(self, ctx: commands.Context, fixture_id: int) -> None:
-        await self._send_fixture_detail(ctx, fixture_id=fixture_id, kind="stats")
+        async def refresh():
+            nonlocal player_row
+            snapshot = await FootballOperationService(
+                client, player_canonicalizer=self._football_player_canonicalizer(),
+                player_alias_cache=self._football_player_alias_cache(),
+                player_selector=football_resolver.make_player_selector(
+                    getattr(self.bot, "llm_client", None), request_text=request_text, history=[]),
+                identity_selector=football_resolver.make_identity_selector(
+                    getattr(self.bot, "llm_client", None), request_text=request_text, history=[]),
+            ).execute(operation, league_id=league_id, season=season, data_focus="player_recent_stats")
+            if (snapshot.player_context_row or {}).get("player", {}).get("id") != player_id:
+                raise ValueError("Player identity changed during refresh")
+            if (snapshot.team_context_row or {}).get("team", {}).get("id") != selected_team_id:
+                raise ValueError("Team identity changed during refresh")
+            player_row = snapshot.player_context_row
+            return pages(snapshot)
+
+        async def load_section(section):
+            snapshot = FootballRetrievalResult(player_context_row=player_row)
+            await FootballOperationService(client).load_profile_section(snapshot, section)
+            if snapshot.outcome != FootballOutcome.SELECTED:
+                return [{"title": labels[section], "text": self._football_result_message(snapshot, lang)}]
+            return football_cards.profile_section_pages(snapshot, section, lang=lang)
+
+        await self._send_card(ctx, lang=lang, pages=pages(result),
+                              labels=labels,
+                              section="statistics" if result.player_context_row.get("statistics") else "profile",
+                              refresh=refresh, load_section=load_section)
 
     @football.command(name="injuries", description="Show injuries/unavailable players for a team.")
     @app_commands.describe(team="Team name", league=LEAGUE_HELP_TEXT)
-    @app_commands.choices(league=LEAGUE_CHOICES)
     async def football_injuries(self, ctx: commands.Context, team: str, league: str = "ligamx") -> None:
-        lang = await self._lang(ctx.guild)
-        client = await self._client_or_message(ctx, lang)
-        if client is None:
-            return
-        await self._defer_if_needed(ctx)
-        try:
-            context = await self._resolve_league_context(ctx, client=client, lang=lang, raw_league=league)
-            if context is None:
-                return
-            _league_key, league_id, season = context
-            operation = compile_football_operation("FOOTBALL_LOOKUP", team, {"data_focus": "injuries", "team_candidates": [team]})
-            result = await FootballOperationService(client).execute(operation, league_id=league_id, season=season, data_focus="injuries")
-            if result.outcome != FootballOutcome.SELECTED:
-                return
-            rows = result.generic_rows
-            team_row = result.team_context_row or {}
-            team_info = team_row.get("team") if isinstance(team_row, dict) else {}
-            team_name = str(team_info.get("name", team)) if isinstance(team_info, dict) else team
-        except Exception as exc:
-            await ctx.send(tr(lang, f"Failed to get injuries: {exc}", f"No se pudieron obtener lesionados: {exc}"))
-            return
-        await ctx.send(embed=self._build_simple_rows_embed(title=f"Injuries - {team_name}", rows=rows, lang=lang))
+        await self._send_team_records(ctx, team=team, league=league, focus="injuries")
 
-    @football.command(name="transfers", description="Show recent transfers for a team.")
+    @football.command(name="transfers", description="Show latest transfers for a team.")
     @app_commands.describe(team="Team name", league=LEAGUE_HELP_TEXT)
-    @app_commands.choices(league=LEAGUE_CHOICES)
     async def football_transfers(self, ctx: commands.Context, team: str, league: str = "ligamx") -> None:
+        await self._send_team_records(ctx, team=team, league=league, focus="transfers")
+
+    async def _send_team_records(self, ctx: commands.Context, *, team: str, league: str, focus: str) -> None:
         lang = await self._lang(ctx.guild)
         client = await self._client_or_message(ctx, lang)
         if client is None:
@@ -1325,48 +946,89 @@ class FootballCog(commands.Cog):
             context = await self._resolve_league_context(ctx, client=client, lang=lang, raw_league=league)
             if context is None:
                 return
-            _league_key, league_id, season = context
-            operation = compile_football_operation("FOOTBALL_LOOKUP", team, {"data_focus": "transfers", "team_candidates": [team]})
-            result = await FootballOperationService(client).execute(operation, league_id=league_id, season=season, data_focus="transfers")
-            if result.outcome != FootballOutcome.SELECTED:
-                return
-            rows = result.generic_rows
-            team_row = result.team_context_row or {}
-            team_info = team_row.get("team") if isinstance(team_row, dict) else {}
-            team_name = str(team_info.get("name", team)) if isinstance(team_info, dict) else team
+            _key, league_id, season = context
+            operation = compile_football_operation("FOOTBALL_LOOKUP", team,
+                {"data_focus": focus, "team_candidates": [team]})
+
+            async def retrieve():
+                return await FootballOperationService(client).execute(operation, league_id=league_id,
+                                                                       season=season, data_focus=focus)
+
+            def build(snapshot):
+                if snapshot.outcome != FootballOutcome.SELECTED:
+                    return [{"title": team, "text": self._football_result_message(snapshot, lang)}]
+                pages = football_cards.record_pages(snapshot.generic_rows, team=(snapshot.team_context_row or {}).get("team") or {},
+                                                     season=season, focus=focus, lang=lang)
+                return pages or [{"title": team, "text": self._football_result_message(
+                    replace(snapshot, outcome=FootballOutcome.NO_DATA_FOR_SCOPE), lang)}]
+
+            result = await retrieve()
+            pages = build(result)
         except Exception as exc:
-            await ctx.send(tr(lang, f"Failed to get transfers: {exc}", f"No se pudieron obtener transferencias: {exc}"))
+            await ctx.send(tr(lang, f"Failed to load team records: {exc}", f"No se pudieron obtener los registros: {exc}"))
             return
-        await ctx.send(embed=self._build_simple_rows_embed(title=f"Transfers - {team_name}", rows=rows, lang=lang))
+        if pages[0].get("text"):
+            await ctx.send(pages[0]["text"])
+            return
+        team_id = (result.team_context_row or {}).get("team", {}).get("id")
+
+        async def refresh():
+            snapshot = await retrieve()
+            if (snapshot.team_context_row or {}).get("team", {}).get("id") != team_id:
+                raise ValueError("Team identity changed during refresh")
+            return {"records": build(snapshot)}
+
+        await self._send_card(ctx, lang=lang, pages={"records": pages},
+                              labels={"records": tr(lang, "Records", "Registros")}, section="records", refresh=refresh)
 
     @football.command(name="h2h", description="Show head-to-head between two teams.")
-    @app_commands.describe(team_a="First team", team_b="Second team", league=LEAGUE_HELP_TEXT)
-    @app_commands.choices(league=LEAGUE_CHOICES)
-    async def football_h2h(self, ctx: commands.Context, team_a: str, team_b: str, league: str = "ligamx") -> None:
+    @app_commands.describe(team="Team name", opponent="Opponent name", league="Optional league context to identify the teams",
+                           matches="Matches that will be looked up. Default 10")
+    async def football_h2h(self, ctx: commands.Context, team: str, opponent: str, league: str = "",
+                           matches: commands.Range[int, 1, 50] = 10) -> None:
         lang = await self._lang(ctx.guild)
         client = await self._client_or_message(ctx, lang)
         if client is None:
             return
         await self._defer_if_needed(ctx)
         try:
-            context = await self._resolve_league_context(ctx, client=client, lang=lang, raw_league=league)
-            if context is None:
-                return
-            _league_key, league_id, season = context
-            operation = compile_football_operation("FOOTBALL_COMPARISON", f"{team_a} vs {team_b}", {"data_focus": "h2h", "team_candidates": [team_a, team_b]})
-            result = await FootballOperationService(client).execute(operation, league_id=league_id, season=season, data_focus="h2h")
+            selector = football_resolver.make_identity_selector(getattr(self.bot, "llm_client", None),
+                                                               request_text=f"{team} vs {opponent}", history=[])
+            league_id = season = None
+            if league:
+                context = await self._resolve_league_context(ctx, client=client, lang=lang, raw_league=league,
+                                                              identity_selector=selector)
+                if context is None:
+                    return
+                _league_key, league_id, season = context
+            operation = compile_football_operation("FOOTBALL_COMPARISON", f"{team} vs {opponent}",
+                                                   {"data_focus": "h2h", "team_candidates": [team, opponent]})
+            operation = replace(operation, fixture_count=matches)
+            result = await FootballOperationService(client, identity_selector=selector).execute(
+                operation, league_id=league_id, season=season, data_focus="h2h")
             if result.outcome != FootballOutcome.SELECTED:
+                await ctx.send(self._football_result_message(result, lang))
                 return
             fixtures = result.generic_rows
         except Exception as exc:
             await ctx.send(tr(lang, f"Failed to get H2H: {exc}", f"No se pudo obtener H2H: {exc}"))
             return
-        await self._send_fixture_embeds(ctx, fixtures, lang=lang, league_label=f"{team_a} vs {team_b}", title_en="Head to Head", title_es="Historial")
+        if not fixtures:
+            await ctx.send(tr(lang, f"No meetings are recorded between {team} and {opponent}.", f"No hay enfrentamientos registrados entre {team} y {opponent}."))
+            return
+        teams = (result.resolved_entities["team"], result.resolved_entities["opponent"])
+
+        async def reload_fixtures():
+            return await client.get_head_to_head(team_a_id=teams[0]["id"], team_b_id=teams[1]["id"], last=matches)
+
+        await self._send_match_card(ctx, client=client, lang=lang, fixture_id=fixtures[0]["fixture"]["id"],
+                                    section="comparison", fixture=fixtures[0], fixtures=fixtures,
+                                    list_title=tr(lang, "Head to head", "Historial"),
+                                    reload_fixtures=reload_fixtures, h2h_teams=teams)
 
     @football.command(name="top", description="Show top scorers, assists, or cards.")
     @app_commands.describe(category="scorers, assists, yellowcards, redcards", league=LEAGUE_HELP_TEXT)
     @app_commands.choices(
-        league=LEAGUE_CHOICES,
         category=[
             app_commands.Choice(name="scorers", value="scorers"),
             app_commands.Choice(name="assists", value="assists"),
@@ -1375,72 +1037,81 @@ class FootballCog(commands.Cog):
         ],
     )
     async def football_top(self, ctx: commands.Context, category: str = "scorers", league: str = "ligamx") -> None:
-        lang = await self._lang(ctx.guild)
-        client = await self._client_or_message(ctx, lang)
-        if client is None:
-            return
-        await self._defer_if_needed(ctx)
+        key = category.strip().casefold()
+        if key in {"assists", "asistencias"}:
+            focus = "top_assists"
+        elif key in {"yellowcards", "yellow", "amarillas"}:
+            focus = "top_yellow_cards"
+        elif key in {"redcards", "red", "rojas"}:
+            focus = "top_red_cards"
+        else:
+            focus = "top_scorers"
+        await self._send_league_card(ctx, league=league, focus=focus)
+
+    @football.autocomplete("league")
+    @football_today.autocomplete("league")
+    @football_next.autocomplete("league")
+    @football_last.autocomplete("league")
+    @football_table.autocomplete("league")
+    @football_team.autocomplete("league")
+    @football_schedule.autocomplete("league")
+    @football_player.autocomplete("league")
+    @football_injuries.autocomplete("league")
+    @football_transfers.autocomplete("league")
+    @football_h2h.autocomplete("league")
+    @football_top.autocomplete("league")
+    @football_match.autocomplete("league")
+    async def football_match_league_autocomplete(self, interaction: discord.Interaction, current: str):
+        query = current.strip()
+        choices = [app_commands.Choice(name=self._league_label(code, "en"), value=code) for code in LEAGUE_CODES
+                   if not query or query.casefold() in code.casefold() or query.casefold() in self._league_label(code, "en").casefold()]
+        client = getattr(self.bot, "api_football_client", None)
+        if client is None or len(query) < 3 or self._normalize_league_key(query):
+            return choices
         try:
-            context = await self._resolve_league_context(ctx, client=client, lang=lang, raw_league=league)
-            if context is None:
-                return
-            league_key, league_id, season = context
-            key = category.strip().casefold()
-            data_focus = "top_scorers"
-            if key in {"assists", "asistencias"}:
-                data_focus = "top_assists"
-                label = "Top Assists"
-            elif key in {"yellowcards", "yellow", "amarillas"}:
-                data_focus = "top_yellow_cards"
-                label = "Top Yellow Cards"
-            elif key in {"redcards", "red", "rojas"}:
-                data_focus = "top_red_cards"
-                label = "Top Red Cards"
-            else:
-                label = "Top Scorers"
-            operation = compile_football_operation("FOOTBALL_LOOKUP", f"{category} {league}", {"data_focus": data_focus, "league_candidates": [league]})
-            result = await FootballOperationService(client).execute(operation, league_id=league_id, season=season, data_focus=data_focus)
-            rows = result.generic_rows
-        except Exception as exc:
-            await ctx.send(tr(lang, f"Failed to get leaderboard: {exc}", f"No se pudo obtener la tabla: {exc}"))
-            return
-        await ctx.send(embed=self._build_player_leaderboard_embed(rows, title=f"{self._league_label(league_key, lang)} - {label}", lang=lang))
+            request = build_league_search_request(search=_make_league_slot(query, source="slash_arg"))
+            rows = await client.search_leagues(request)
+            seen = set()
+            for row in rows:
+                item = row.get("league") or {}
+                league_id, name = item.get("id"), item.get("name")
+                if type(league_id) is not int or not name or league_id in seen:
+                    continue
+                seen.add(league_id)
+                country = (row.get("country") or {}).get("name")
+                label = f"{name} ({country})" if country else name
+                choices.append(app_commands.Choice(name=label[:100], value=str(league_id)))
+                if len(choices) == 25:
+                    break
+        except Exception:
+            logging.debug("Football league autocomplete unavailable", exc_info=True)
+        return choices
 
-    @football.command(name="preview", description="Show data-only preview for a fixture ID.")
-    @app_commands.describe(fixture_id="Fixture ID, for example from /football today")
-    async def football_preview(self, ctx: commands.Context, fixture_id: int) -> None:
-        await self._send_fixture_detail(ctx, fixture_id=fixture_id, kind="preview")
+    async def _autocomplete_league_id(self, interaction: discord.Interaction, client: Any) -> int | None:
+        raw = str(getattr(interaction.namespace, "league", None) or "ligamx").strip()
+        if raw.isdigit():
+            return int(raw)
+        key = self._normalize_league_key(raw)
+        return await client.resolve_league_id(key) if key else None
 
-    @football.command(name="summary", description="Show data-only summary for a fixture ID.")
-    @app_commands.describe(fixture_id="Fixture ID, for example from /football today")
-    async def football_summary(self, ctx: commands.Context, fixture_id: int) -> None:
-        await self._send_fixture_detail(ctx, fixture_id=fixture_id, kind="summary")
-
-    async def _fixtures_for_query(
-        self,
-        client: Any,
-        *,
-        query: str,
-        league: str,
-        lang: str,
-        ctx: commands.Context,
-    ) -> list[dict[str, Any]]:
-        stripped = query.strip()
-        if stripped.isdigit():
-            return await client.get_fixture_by_id(fixture_id=int(stripped))
-        context = await self._resolve_league_context(ctx, client=client, lang=lang, raw_league=league)
-        if context is None:
+    @football_next.autocomplete("season")
+    @football_last.autocomplete("season")
+    async def football_fixture_season_autocomplete(self, interaction: discord.Interaction, current: str):
+        client = getattr(self.bot, "api_football_client", None)
+        if client is None:
             return []
-        _league_key, league_id, season = context
-        operation = compile_football_operation(
-            "FOOTBALL_LOOKUP",
-            stripped,
-            {"data_focus": "next_fixtures", "team_candidates": [stripped]},
-        )
-        result = await FootballOperationService(client).execute(operation, league_id=league_id, season=season, data_focus="single_next_fixtures")
-        if result.outcome != FootballOutcome.SELECTED:
+        try:
+            league_id = await self._autocomplete_league_id(interaction, client)
+            if league_id is None:
+                return []
+            rows = await client.get_league_by_id(league_id=league_id)
+            years = {season.get("year") for row in rows if (row.get("league") or {}).get("id") == league_id
+                     for season in row.get("seasons") or [] if type(season.get("year")) is int}
+            return [app_commands.Choice(name=str(year), value=year) for year in sorted(years, reverse=True)
+                    if str(year).startswith(str(current))][:25]
+        except Exception:
+            logging.debug("Football season autocomplete unavailable", exc_info=True)
             return []
-        return result.fixtures[:1]
 
     @staticmethod
     def _player_candidate_names(rows: list[dict[str, Any]]) -> list[str]:
@@ -1495,100 +1166,272 @@ class FootballCog(commands.Cog):
             fallback_reason,
         )
 
-    async def _send_fixture_embeds(
-        self,
-        ctx: commands.Context,
-        fixtures: list[dict[str, Any]],
-        *,
-        lang: str,
-        league_label: str,
-        title_en: str,
-        title_es: str,
-    ) -> None:
-        if not fixtures:
-            await ctx.send(tr(lang, "No fixtures found.", "No se encontraron partidos."))
+    async def _send_match_card(self, ctx: commands.Context, *, client: Any, lang: str,
+                               fixture_id: int, section: str, fixture: dict | None = None,
+                               fixtures: list[dict] | None = None, list_title: str | None = None,
+                               reload_fixtures=None, h2h_teams: tuple[dict, dict] | None = None) -> None:
+        service = FootballLiveMatchService(client)
+        labels = {"overview": tr(lang, "Match", "Partido"),
+                  "statistics": tr(lang, "Statistics", "Estadisticas"),
+                  "lineups": tr(lang, "Lineups", "Alineaciones"),
+                  "events": tr(lang, "Events", "Eventos"),
+                  "players": tr(lang, "Player performances", "Actuaciones de jugadores"),
+                  "periods": tr(lang, "Period scores", "Marcadores por periodo"),
+                  "preview": tr(lang, "Preview", "Previa"),
+                  "season_comparison": tr(lang, "Season comparison", "Comparación de temporada"),
+                  "predictions": tr(lang, "Provider forecast", "Pronóstico"),
+                  "odds": tr(lang, "Odds", "Cuotas")}
+        if list_title is not None:
+            labels = {"fixtures": tr(lang, "Fixtures", "Partidos"), **labels}
+        if h2h_teams is not None:
+            labels = {"comparison": tr(lang, "Comparison", "Comparación"), **labels}
+        try:
+            base = await service.get_match_center(fixture_id, time_scope="fixture_id", fixture=fixture,
+                                                   cache_ttl_seconds=30)
+        except Exception as exc:
+            await ctx.send(tr(lang, f"Failed to get fixture details: {exc}", f"No se pudo obtener detalles: {exc}"))
             return
-        shown = min(len(fixtures), 10)
-        embeds = [
-            self._build_match_embed(
-                lang=lang,
-                league_label=league_label,
-                item=item,
-                title_en=title_en,
-                title_es=title_es,
-                color=discord.Color.blurple(),
-                index=index,
-                total=shown,
-            )
-            for index, item in enumerate(fixtures[:shown], start=1)
-        ]
-        await ctx.send(embeds=embeds)
+        if base.fixture is None:
+            await ctx.send(tr(lang, "Fixture not found.", "No se encontro el partido."))
+            return
 
-    async def _send_fixture_detail(self, ctx: commands.Context, *, fixture_id: int, kind: str) -> None:
+        def overview():
+            pages = {key: football_cards.match_pages(base, key, lang=lang) if key in {"overview", "periods"}
+                     else None for key in labels}
+            if not pages["periods"]:
+                pages["periods"] = [{"title": labels["periods"], "text": tr(lang,
+                    "The provider has not supplied period scores for this fixture.",
+                    "El proveedor no ha proporcionado marcadores por periodo para este partido.")}]
+            if list_title is not None:
+                pages["fixtures"] = football_cards.fixture_list_pages(fixtures, title=list_title, lang=lang)
+            if h2h_teams is not None:
+                pages["comparison"] = football_cards.h2h_summary_pages(fixtures, h2h_teams, lang=lang)
+            return pages
+
+        async def refresh_list():
+            fixtures[:] = await reload_fixtures()
+            return overview()
+
+        async def refresh():
+            nonlocal base
+            snapshot = await service.get_match_center(fixture_id, time_scope="fixture_id", cache_ttl_seconds=30)
+            if snapshot.fixture_id != fixture_id:
+                raise ValueError("The selected fixture is no longer available")
+            base = snapshot
+            if fixtures is not None:
+                for index, item in enumerate(fixtures):
+                    if item["fixture"]["id"] == fixture_id:
+                        fixtures[index] = snapshot.fixture
+            return overview()
+
+        async def select_fixture(selected_id):
+            nonlocal base, fixture_id
+            selected = next(item for item in fixtures if item["fixture"]["id"] == selected_id)
+            snapshot = await service.get_match_center(selected_id, time_scope="fixture_id", fixture=selected)
+            base, fixture_id = snapshot, selected_id
+            return overview()
+
+        async def load_odds(page_number=1):
+            league = base.fixture.get("league") or {}
+            if type(league.get("id")) is not int or type(league.get("season")) is not int:
+                return [{"title": labels["odds"], "text": tr(lang, "Competition/season scope is unavailable for these odds.",
+                    "No hay contexto de competición/temporada para estas cuotas.")}]
+            live = base.lifecycle.is_live
+            focus = "live_odds" if live else "pre_match_odds"
+            operation = compile_football_operation("FOOTBALL_LOOKUP", focus,
+                {"data_focus": focus, "fixture_focus": str(fixture_id), "reference_page": None if live else page_number})
+            result = await FootballOperationService(client).execute(operation, league_id=league["id"],
+                                                                    season=league["season"], data_focus=focus)
+            if result.outcome != FootballOutcome.SELECTED:
+                message = self._football_result_message(result, lang)
+                if result.outcome == FootballOutcome.NO_DATA_FOR_SCOPE:
+                    message = tr(lang, "No odds are published for this match in the selected feed.",
+                                 "No hay cuotas publicadas para este partido en la fuente seleccionada.")
+                return [{"title": labels["odds"], "text": message}]
+            pages = football_cards.odds_pages(result.odds, fixture=base.fixture, lang=lang, live=live)
+            pages = pages or [{"title": labels["odds"], "text": tr(lang, "No market selections are published for this match.",
+                                "No hay selecciones de mercado publicadas para este partido.")}]
+            paging = result.requested_scope.get("paging") or {}
+            current, total = paging.get("current"), paging.get("total")
+            if not live and type(current) is int and type(total) is int and page_number <= current < total:
+                pages[-1]["more"] = current + 1
+            return pages
+
+        async def load_section(key):
+            if key == "odds":
+                return await load_odds()
+            if key == "preview":
+                result = await FootballOperationService(client).get_fixture_preview(base)
+                return football_cards.preview_pages(base, result, lang=lang)
+            if key in {"predictions", "season_comparison"}:
+                league = base.fixture.get("league") or {}
+                if type(league.get("id")) is not int or type(league.get("season")) is not int:
+                    return [{"title": labels[key], "text": tr(lang, "Competition/season details are unavailable.",
+                                                              "No hay datos de competición/temporada.")}]
+                operations = FootballOperationService(client)
+                if key == "predictions":
+                    guard = FootballRetrievalResult(match_data=base)
+                    if await operations.check_coverage(guard, "predictions", league_id=league["id"], season=league["season"]):
+                        return [{"title": labels[key], "text": self._football_result_message(guard, lang)}]
+                    rows = await client.get_predictions(build_prediction_request(fixture_id=fixture_id))
+                    return football_cards.prediction_pages(rows, fixture=base.fixture, lang=lang) or [
+                        {"title": labels[key], "text": tr(lang, "No provider forecast is published for this match.",
+                                                          "No hay pronóstico del proveedor publicado para este partido.")}]
+                metadata = await client.get_league_by_id(league_id=league["id"], season=league["season"])
+                if not any((row.get("league") or {}).get("id") == league["id"] and
+                           any(item.get("year") == league["season"] for item in row.get("seasons") or []) for row in metadata):
+                    return [{"title": labels[key], "text": tr(lang, "The provider has no data for this competition/season.",
+                        "El proveedor no tiene datos para esta competición/temporada.")}]
+                snapshots = []
+                for side in ("home", "away"):
+                    snapshot = FootballRetrievalResult()
+                    try:
+                        await operations.load_team_statistics(snapshot, team_row={"team": base.fixture["teams"][side]},
+                                                              league_id=league["id"], season=league["season"])
+                    except FootballApiError:
+                        snapshot.outcome = FootballOutcome.PROVIDER_FAILURE
+                    snapshots.append(snapshot)
+                pages = football_cards.season_comparison_pages(base.fixture, snapshots, lang=lang) if any(
+                    item.team_season_statistics for item in snapshots) else []
+                pages.extend({"title": base.fixture["teams"][side].get("name") or labels[key],
+                              "text": self._football_result_message(item, lang)}
+                             for side, item in zip(("home", "away"), snapshots) if item.outcome != FootballOutcome.SELECTED)
+                return pages
+            flag, capability, embedded = {
+                "statistics": ("include_stats", "statistics_fixtures", "statistics"),
+                "events": ("include_events", "events", "events"),
+                "lineups": ("include_lineups", "lineups", "lineups"),
+                "players": ("include_players", "statistics_players", "players"),
+            }[key]
+            league = base.fixture.get("league") or {}
+            if not base.fixture.get(embedded) and type(league.get("id")) is int and type(league.get("season")) is int:
+                guard = FootballRetrievalResult(match_data=base)
+                unsupported = await FootballOperationService(client).check_coverage(
+                    guard, capability, league_id=league.get("id"), season=league.get("season"))
+                if unsupported:
+                    return [{"title": labels[key], "text": self._football_result_message(guard, lang)}]
+            snapshot = await service.get_match_center(fixture_id, time_scope="fixture_id", fixture=base.fixture,
+                                                       **{flag: True})
+            pages = football_cards.match_pages(snapshot, key, lang=lang)
+            empty = {
+                "statistics": ("The provider has not supplied statistics for this fixture yet.",
+                               "El proveedor todavia no ha proporcionado estadisticas de este partido."),
+                "events": ("No events are recorded for this fixture yet.",
+                           "Todavia no hay eventos registrados para este partido."),
+                "lineups": ("No lineups have been published for this fixture yet.",
+                            "Todavia no se han publicado alineaciones para este partido."),
+                "players": ("No player performance records are available for this fixture yet.",
+                            "Todavia no hay registros de actuaciones de jugadores para este partido."),
+            }
+            return pages or [{"title": labels[key], "text": tr(lang, *empty[key])}]
+
+        pages = overview()
+        if fixtures and list_title is None:
+            section = "overview"
+            pages["overview"] = [{"title": tr(lang, "Choose a match", "Elige un partido"), "text": tr(lang,
+                "Select a match below to open its scoreboard and details.",
+                "Selecciona un partido para abrir su marcador y detalles.")}]
+        elif pages[section] is None:
+            try:
+                pages[section] = await load_section(section)
+            except Exception:
+                logging.exception("Football match section loading failed fixture=%s section=%s", fixture_id, section)
+                pages[section] = [{"title": labels[section], "text": tr(lang,
+                    "Could not load this section. Use Refresh to try again.",
+                    "No se pudo cargar esta seccion. Usa Actualizar para reintentar.")}]
+        await self._send_card(ctx, lang=lang, pages=pages, labels=labels, section=section,
+                              refresh=refresh, load_section=load_section,
+                              fixtures=fixtures, select_fixture=select_fixture,
+                              refresh_list=refresh_list if list_title is not None else None,
+                              load_more=lambda key, page: load_odds(page))
+
+    async def _send_card(self, ctx: commands.Context, *, lang: str, pages: dict,
+                         labels: dict[str, str], section: str, refresh, load_section=None,
+                         fixtures: list[dict] | None = None, select_fixture=None, refresh_list=None, load_more=None) -> None:
+        view = FootballCardView(author_id=ctx.author.id, lang=lang, pages=pages, labels=labels,
+                                section=section, media_cache=self._table_logo_cache,
+                                can_attach=getattr(ctx, "bot_permissions", discord.Permissions.all()).attach_files,
+                                refresh=refresh, load_section=load_section,
+                                fixtures=fixtures, select_fixture=select_fixture, refresh_list=refresh_list,
+                                load_more=load_more)
+        payload = await view.payload()
+        files = payload.pop("attachments")
+        try:
+            view.message = await ctx.send(**payload, files=files)
+        except discord.HTTPException:
+            if not files:
+                raise
+            payload = view.text_payload()
+            payload.pop("attachments")
+            view.message = await ctx.send(**payload)
+
+    async def _send_league_card(self, ctx: commands.Context, *, league: str, focus: str) -> None:
         lang = await self._lang(ctx.guild)
         client = await self._client_or_message(ctx, lang)
         if client is None:
             return
         await self._defer_if_needed(ctx)
         try:
-            fixtures = await client.get_fixture_by_id(fixture_id=fixture_id)
-            item = fixtures[0] if fixtures else {}
-            events = await client.get_fixture_events(fixture_id=fixture_id) if kind in {"summary", "preview"} else []
-            stats = await client.get_fixture_statistics(fixture_id=fixture_id) if kind in {"stats", "summary", "preview"} else []
-            lineups = await client.get_fixture_lineups(fixture_id=fixture_id) if kind in {"lineup", "preview"} else []
+            context = await self._resolve_league_context(ctx, client=client, lang=lang, raw_league=league)
+            if context is None:
+                return
+            league_key, league_id, season = context
+            is_table = focus == "standings"
+            operation = compile_football_operation("FOOTBALL_TABLE" if is_table else "FOOTBALL_LOOKUP", league,
+                {"data_focus": "scorers" if focus == "top_scorers" else focus, "league_candidates": [league]})
+
+            async def retrieve():
+                return await FootballOperationService(client).execute(operation, league_id=league_id,
+                                                                       season=season, data_focus=focus)
+
+            def build(snapshot):
+                if is_table:
+                    labels = {"compact": tr(lang, "Table", "Tabla"), "detailed": tr(lang, "Detailed", "Detallada"),
+                              "home": tr(lang, "Home", "Local"), "away": tr(lang, "Away", "Visitante")}
+                else:
+                    labels = {"ranking": tr(lang, "Ranking", "Clasificación")}
+                rows = snapshot.standings_table if is_table else snapshot.generic_rows
+                if snapshot.outcome != FootballOutcome.SELECTED:
+                    notice = self._football_result_message(snapshot, lang)
+                elif not rows:
+                    name = self._league_label(league_key, lang)
+                    if is_table:
+                        notice = tr(lang, f"No standings are recorded for {name} (season {season}).",
+                                    f"No hay tabla registrada para {name} (temporada {season}).")
+                    elif focus == "top_scorers":
+                        notice = tr(lang, f"No scorer entries are recorded for {name} (season {season}).",
+                                    f"No hay registros de goleadores para {name} (temporada {season}).")
+                    else:
+                        notice = tr(lang, f"No ranking entries are recorded for {name} (season {season}).",
+                                    f"No hay registros de clasificación para {name} (temporada {season}).")
+                else:
+                    notice = None
+                if notice:
+                    return {key: [{"title": label, "text": notice}] for key, label in labels.items()}, labels
+                branding = dict((snapshot.league_context_row or {}).get("league") or {})
+                branding["name"] = branding.get("name") or self._league_label(league_key, lang)
+                if is_table:
+                    pages = {key: football_cards.standings_pages(rows, league=branding, season=season,
+                                                                 section=key, lang=lang) for key in labels}
+                else:
+                    pages = {"ranking": football_cards.leaderboard_pages(rows, league=branding, season=season,
+                                                                         focus=focus, lang=lang)}
+                return pages, labels
+
+            result = await retrieve()
+            pages, labels = build(result)
         except Exception as exc:
-            await ctx.send(tr(lang, f"Failed to get fixture details: {exc}", f"No se pudo obtener detalles: {exc}"))
+            await ctx.send(tr(lang, f"Failed to get league data: {exc}", f"No se pudieron obtener los datos de liga: {exc}"))
             return
-        if not item:
-            await ctx.send(tr(lang, "Fixture not found.", "No se encontro el partido."))
+        if pages[next(iter(labels))][0].get("text"):
+            await ctx.send(pages[next(iter(labels))][0]["text"])
             return
-        league = item.get("league") if isinstance(item.get("league"), dict) else {}
-        embed = self._build_match_embed(
-            lang=lang,
-            league_label=str(league.get("name", "Football")),
-            item=item,
-            title_en=kind.title(),
-            title_es=kind.title(),
-            color=discord.Color.teal(),
-            index=1,
-            total=1,
-        )
-        if lineups:
-            embed.add_field(name=tr(lang, "Lineups", "Alineaciones"), value=self._format_lineups(lineups), inline=False)
-        if stats:
-            embed.add_field(name=tr(lang, "Stats", "Estadisticas"), value=self._format_statistics(stats), inline=False)
-        if events:
-            embed.add_field(name=tr(lang, "Events", "Eventos"), value=self._format_events(events), inline=False)
-        await ctx.send(embed=embed)
 
-    def _build_player_embed(self, row: dict[str, Any], *, lang: str) -> discord.Embed:
-        player = row.get("player") if isinstance(row, dict) else {}
-        stats_list = row.get("statistics") if isinstance(row, dict) else []
-        stats = stats_list[0] if isinstance(stats_list, list) and stats_list else {}
-        team = stats.get("team") if isinstance(stats, dict) else {}
-        games = stats.get("games") if isinstance(stats, dict) else {}
-        goals = stats.get("goals") if isinstance(stats, dict) else {}
-        name = str(player.get("name", "Unknown")) if isinstance(player, dict) else "Unknown"
-        embed = discord.Embed(title=tr(lang, f"Player: {name}", f"Jugador: {name}"), color=discord.Color.purple(), timestamp=datetime.now(timezone.utc))
-        embed.add_field(name=tr(lang, "Team", "Equipo"), value=str(team.get("name", "N/A")) if isinstance(team, dict) else "N/A", inline=True)
-        embed.add_field(name=tr(lang, "Position", "Posicion"), value=str(games.get("position", "N/A")) if isinstance(games, dict) else "N/A", inline=True)
-        embed.add_field(name=tr(lang, "Appearances", "Partidos"), value=str(games.get("appearences", 0)) if isinstance(games, dict) else "0", inline=True)
-        embed.add_field(name=tr(lang, "Goals", "Goles"), value=str(goals.get("total", 0)) if isinstance(goals, dict) else "0", inline=True)
-        embed.add_field(name=tr(lang, "Assists", "Asistencias"), value=str(goals.get("assists", 0)) if isinstance(goals, dict) else "0", inline=True)
-        return embed
+        async def refresh():
+            return build(await retrieve())[0]
 
-    def _build_player_leaderboard_embed(self, rows: list[dict[str, Any]], *, title: str, lang: str) -> discord.Embed:
-        lines = []
-        for index, row in enumerate(rows[:10], start=1):
-            player = row.get("player") if isinstance(row, dict) else {}
-            stats_list = row.get("statistics") if isinstance(row, dict) else []
-            stats = stats_list[0] if isinstance(stats_list, list) and stats_list else {}
-            team = stats.get("team") if isinstance(stats, dict) else {}
-            goals = stats.get("goals") if isinstance(stats, dict) else {}
-            cards = stats.get("cards") if isinstance(stats, dict) else {}
-            total = goals.get("total", goals.get("assists", cards.get("yellow", cards.get("red", 0)))) if isinstance(goals, dict) and isinstance(cards, dict) else 0
-            lines.append(f"`{index:>2}.` {player.get('name', 'Unknown') if isinstance(player, dict) else 'Unknown'} ({team.get('name', 'N/A') if isinstance(team, dict) else 'N/A'}) - {total}")
-        return discord.Embed(title=title, description=("\n".join(lines) or tr(lang, "No data.", "Sin datos."))[:4000], color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
+        await self._send_card(ctx, lang=lang, pages=pages, labels=labels,
+                              section=next(iter(labels)), refresh=refresh)
 
     async def _send_football_reference(
         self,
@@ -1614,137 +1457,96 @@ class FootballCog(commands.Cog):
                 "reference_page": page,
             },
         )
+        title = {
+            "odds_mapping": tr(lang, "Available odds fixtures", "Partidos con cuotas"),
+            "odds_bookmakers": tr(lang, "Bookmakers", "Casas de apuestas"),
+            "odds_bets": tr(lang, "Pre-match markets", "Mercados previos"),
+            "odds_live_bets": tr(lang, "Live markets", "Mercados en vivo"),
+            "football_timezones": tr(lang, "Timezones", "Zonas horarias"),
+            "football_countries": tr(lang, "Countries", "Países"),
+            "league_seasons": tr(lang, "Seasons", "Temporadas"),
+        }.get(focus, tr(lang, "Football reference", "Referencia de fútbol"))
+
+        async def retrieve(page_number):
+            request = replace(operation, reference_page=page_number) if focus == "odds_mapping" else operation
+            return await FootballOperationService(client).execute(request, league_id=None, season=None, data_focus=focus)
+
+        def build(result):
+            if result.outcome != FootballOutcome.SELECTED:
+                return [{"title": title, "text": self._football_result_message(result, lang)}]
+            paginator = commands.Paginator(prefix="", suffix="", max_size=1700)
+            for row in result.reference_rows:
+                if focus == "odds_mapping":
+                    text = f"{(row.get('fixture') or {}).get('id', 'N/A')} / {(row.get('league') or {}).get('name') or 'N/A'} / {(row.get('fixture') or {}).get('date') or 'N/A'}"
+                else:
+                    text = " / ".join(str(row[key]) for key in ("id", "name", "code", "season", "value", "label")
+                                      if row.get(key) is not None)
+                for line in wrap(text or "N/A", width=1500, break_on_hyphens=False):
+                    paginator.add_line(line)
+            pages = [{"title": title, "text": text.strip()} for text in paginator.pages]
+            pages = pages or [{"title": title, "text": tr(lang, "No reference entries are published.", "No hay referencias publicadas.")}]
+            paging = result.requested_scope.get("paging") or {}
+            current, total = paging.get("current"), paging.get("total")
+            if type(current) is int and type(total) is int and current < total:
+                pages[-1]["more"] = current + 1
+            return pages
+
         try:
-            result = await FootballOperationService(client).execute(operation, league_id=None, season=None, data_focus=focus)
+            result = await retrieve(page or 1)
         except Exception as exc:
             await ctx.send(tr(lang, f"Failed to get football reference data: {exc}", f"No se pudo obtener la referencia: {exc}"))
             return
         if result.outcome != FootballOutcome.SELECTED:
             await ctx.send(self._football_result_message(result, lang))
             return
-        if focus == "odds_mapping":
-            embed = self._build_reference_embed("Odds Mapping", result.reference_rows, result.requested_scope.get("paging"), lang)
-        else:
-            title = {
-                "odds_bookmakers": "Odds Bookmakers",
-                "odds_bets": "Pre-match Odds Markets",
-                "odds_live_bets": "Live Odds Markets",
-                "football_timezones": "Football Timezones",
-                "football_countries": "Football Countries",
-                "league_seasons": "League Seasons",
-            }.get(focus, "Football Reference")
-            embed = self._build_reference_embed(title, result.reference_rows, None, lang)
-        await ctx.send(embed=embed)
+
+        async def refresh():
+            return {"reference": build(await retrieve(page or 1))}
+
+        async def load_more(key, page_number):
+            return build(await retrieve(page_number))
+
+        await self._send_card(ctx, lang=lang, pages={"reference": build(result)}, labels={"reference": title},
+                              section="reference", refresh=refresh, load_more=load_more)
 
     @staticmethod
     def _football_result_message(result: Any, lang: str) -> str:
         if result.outcome == FootballOutcome.AMBIGUOUS:
-            return tr(lang, "The provider returned multiple exact matches; use the reference command to choose an ID.", "El proveedor devolvio varias coincidencias exactas; usa el comando de referencia para elegir un ID.")
+            return tr(lang, "The provider returned multiple matches. Please provide more specific details.", "El proveedor devolvio varias coincidencias. Proporciona detalles mas especificos.")
         if result.outcome == FootballOutcome.NOT_FOUND:
             return tr(lang, "No matching provider data was found.", "No se encontraron datos del proveedor.")
         if result.outcome == FootballOutcome.NO_DATA_FOR_SCOPE:
-            return tr(lang, "No data is available for that scope right now.", "No hay datos disponibles para ese alcance ahora.")
+            team = (result.team_context_row or {}).get("team") or {}
+            name = team.get("name") or tr(lang, "this team", "este equipo")
+            if "/injuries" in result.endpoints and team:
+                league = (result.league_context_row or {}).get("league") or {}
+                competition = league.get("name") or tr(lang, "the selected competition", "la competicion seleccionada")
+                season = result.requested_scope.get("season")
+                scope = competition + (tr(lang, f" (season {season})", f" (temporada {season})") if season is not None else "")
+                return tr(lang, f"No injuries are recorded for {name} in {scope}.", f"No hay lesiones registradas para {name} en {scope}.")
+            if "/transfers" in result.endpoints and team:
+                return tr(lang, f"No transfers are recorded for {name}.", f"No hay transferencias registradas para {name}.")
+            operation = result.requested_scope.get("operation_type")
+            if operation == "player_recent_stats":
+                season = result.requested_scope.get("season")
+                scope = tr(lang, f"season {season}", f"temporada {season}") if season is not None else tr(lang, "the selected scope", "el alcance seleccionado")
+                return tr(lang, f"No season statistics are recorded for this player in {scope}.",
+                          f"No hay estadisticas de temporada registradas para este jugador en {scope}.")
+            if operation == "team_season_statistics":
+                return tr(lang, "No team season statistics are recorded in the selected scope.",
+                          "No hay estadisticas de temporada del equipo en el alcance seleccionado.")
+            if "/fixtures" in result.endpoints and operation in {"fixture_next", "fixture_last"}:
+                target = team.get("name") or tr(lang, "the selected competition", "la competicion seleccionada")
+                if operation == "fixture_next":
+                    return tr(lang, f"No upcoming fixtures are listed for {target}.", f"No hay proximos partidos registrados para {target}.")
+                return tr(lang, f"No previous fixtures are recorded for {target}.", f"No hay partidos anteriores registrados para {target}.")
+            return tr(lang, "No matching records were returned for this request.", "No se devolvieron registros coincidentes para esta consulta.")
+        if result.outcome == FootballOutcome.UNSUPPORTED_BY_COVERAGE:
+            return tr(lang, "The provider does not cover that data for this competition or season.", "El proveedor no cubre esos datos para esta competicion o temporada.")
+        if result.outcome == FootballOutcome.PROVIDER_FAILURE:
+            return tr(lang, "The provider could not load this data. Please try again.",
+                      "El proveedor no pudo cargar estos datos. Intentalo de nuevo.")
         return tr(lang, "The requested football data could not be resolved.", "No se pudo resolver la informacion de futbol solicitada.")
-
-    @staticmethod
-    def _build_odds_embed(
-        rows: list[dict[str, Any]],
-        paging: Any,
-        *,
-        lang: str,
-        live: bool,
-    ) -> discord.Embed:
-        lines: list[str] = []
-        for row in rows[:10]:
-            fixture = row.get("fixture") if isinstance(row.get("fixture"), dict) else {}
-            fixture_id = fixture.get("id", "?")
-            league = row.get("league") if isinstance(row.get("league"), dict) else {}
-            fixture_name = row.get("fixture_name") or league.get("name") or f"Fixture {fixture_id}"
-            bookmakers = row.get("bookmakers") if isinstance(row.get("bookmakers"), list) else []
-            for bookmaker in bookmakers[:3]:
-                if not isinstance(bookmaker, dict):
-                    continue
-                bookmaker_name = bookmaker.get("name") or f"Bookmaker {bookmaker.get('id', '?')}"
-                bets = bookmaker.get("bets") if isinstance(bookmaker.get("bets"), list) else []
-                for bet in bets[:4]:
-                    if not isinstance(bet, dict):
-                        continue
-                    bet_name = bet.get("name") or f"Market {bet.get('id', '?')}"
-                    values = bet.get("values") if isinstance(bet.get("values"), list) else []
-                    selections = []
-                    for value in values[:6]:
-                        if isinstance(value, dict):
-                            label = value.get("value") or value.get("name") or "?"
-                            odd = value.get("odd", "?")
-                            selections.append(f"{label}: {odd}")
-                    if selections:
-                        lines.append(f"**{fixture_name}** | {bookmaker_name} | {bet_name}\n" + " · ".join(selections))
-        title = "Live Odds" if live else "Pre-match Odds"
-        description = "\n\n".join(lines) or tr(lang, "No odds data.", "No hay datos de cuotas.")
-        if isinstance(paging, dict) and paging.get("total"):
-            description += f"\n\nPage {paging.get('current', 1)} of {paging['total']}"
-        return discord.Embed(title=title, description=description[:4000], color=discord.Color.green() if live else discord.Color.gold(), timestamp=datetime.now(timezone.utc))
-
-    @staticmethod
-    def _build_reference_embed(title: str, rows: list[dict[str, Any]], paging: Any, lang: str) -> discord.Embed:
-        lines: list[str] = []
-        for row in rows[:25]:
-            if not isinstance(row, dict):
-                continue
-            item_id = row.get("id", row.get("value", "?"))
-            name = row.get("name", row.get("label", ""))
-            if title == "Odds Mapping":
-                fixture = row.get("fixture") if isinstance(row.get("fixture"), dict) else {}
-                league = row.get("league") if isinstance(row.get("league"), dict) else {}
-                lines.append(f"{fixture.get('id', item_id)} - {league.get('name', name or 'Fixture')}")
-            else:
-                lines.append(f"`{item_id}` - {name or 'Unknown'}")
-        if isinstance(paging, dict) and paging.get("total"):
-            lines.append(f"Page {paging.get('current', 1)} of {paging['total']}")
-        return discord.Embed(title=title, description=("\n".join(lines) or tr(lang, "No data.", "Sin datos."))[:4000], color=discord.Color.dark_teal(), timestamp=datetime.now(timezone.utc))
-
-    def _build_simple_rows_embed(self, *, title: str, rows: list[dict[str, Any]], lang: str) -> discord.Embed:
-        lines = []
-        for item in rows[:10]:
-            player = item.get("player") if isinstance(item, dict) else {}
-            team = item.get("team") if isinstance(item, dict) else {}
-            reason = item.get("reason") or item.get("type") or item.get("date") or ""
-            name = player.get("name") if isinstance(player, dict) else None
-            team_name = team.get("name") if isinstance(team, dict) else None
-            lines.append(f"{name or team_name or 'Unknown'} - {reason or 'N/A'}")
-        return discord.Embed(title=title, description=("\n".join(lines) or tr(lang, "No data.", "Sin datos."))[:4000], color=discord.Color.dark_teal(), timestamp=datetime.now(timezone.utc))
-
-    @staticmethod
-    def _format_events(events: list[dict[str, Any]]) -> str:
-        lines = []
-        for item in events[:10]:
-            time_data = item.get("time") if isinstance(item.get("time"), dict) else {}
-            player = item.get("player") if isinstance(item.get("player"), dict) else {}
-            team = item.get("team") if isinstance(item.get("team"), dict) else {}
-            minute = time_data.get("elapsed", "?")
-            lines.append(f"{minute}' {team.get('name', '')} - {player.get('name', '')} ({item.get('type', '')} {item.get('detail', '')})")
-        return ("\n".join(lines) or "N/A")[:1024]
-
-    @staticmethod
-    def _format_statistics(stats: list[dict[str, Any]]) -> str:
-        lines = []
-        for team_stats in list(normalize_match_statistics(stats).values())[:2]:
-            compact = []
-            team_name = "Team"
-            for stat in list(team_stats.values())[:6]:
-                team_name = stat.team_name or team_name
-                compact.append(f"{stat.original_label}: {stat.display_value}")
-            lines.append(f"**{team_name}**\n" + "\n".join(compact))
-        return ("\n\n".join(lines) or "N/A")[:1024]
-
-    @staticmethod
-    def _format_lineups(lineups: list[dict[str, Any]]) -> str:
-        lines = []
-        for item in lineups[:2]:
-            team = item.get("team") if isinstance(item.get("team"), dict) else {}
-            coach = item.get("coach") if isinstance(item.get("coach"), dict) else {}
-            lines.append(f"**{team.get('name', 'Team')}** - {item.get('formation', 'N/A')} | {coach.get('name', 'N/A')}")
-        return ("\n".join(lines) or "N/A")[:1024]
 
     @staticmethod
     def _team_name_from_row(row: dict[str, Any]) -> str:

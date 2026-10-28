@@ -19,6 +19,7 @@ from services.football_api_request_compiler import (
     _make_league_slot,
     _make_player_slot,
     _make_team_slot,
+    validate_positive_int,
 )
 
 
@@ -95,6 +96,15 @@ class FootballQueryOperation:
     player_slots: tuple[PlayerSlot, ...] = ()
     capability_intent: FootballCapabilityIntent | None = None
     semantic_source: str = "compatibility"
+    fixture_count: int | None = None
+    fixture_round: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.fixture_count is not None and validate_positive_int(self.fixture_count, "fixture_count") > 50:
+            raise InvalidFootballApiRequest("fixture_count must be between 1 and 50.")
+        if self.fixture_round is not None and (not isinstance(self.fixture_round, str) or
+                not 1 <= len(self.fixture_round.strip()) <= 100 or any(ord(char) < 32 for char in self.fixture_round)):
+            raise InvalidFootballApiRequest("fixture_round must be a provider round name.")
 
 
 @dataclass(frozen=True)
