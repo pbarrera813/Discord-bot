@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 import hashlib
 import logging
@@ -53,6 +53,9 @@ class WebResearchResult:
     citations: tuple[str, ...] = ()
     failure_reason: str | None = None
     cache_hit: bool = False
+    provider_status: str | None = None
+    finish_reason: str | None = None
+    incomplete_reason: str | None = None
     source_content_authoritative: bool = False
     tool_used: str = "none"
     media_candidates: tuple[WebMediaCandidate, ...] = ()
@@ -83,7 +86,7 @@ class WebResearchService:
         self.cooldown_seconds = max(0.0, float(cooldown_seconds or 0.0))
         self.cache_ttl_seconds = max(0.0, float(cache_ttl_seconds or 0.0))
         self._cache: dict[str, tuple[float, WebResearchResult]] = {}
-        self._cooldowns: dict[tuple[int, int], float] = {}
+        self._cooldowns: dict[tuple[int, int], tuple[float, int | None]] = {}
 
     async def research(
         self,
@@ -91,6 +94,7 @@ class WebResearchService:
         *,
         guild_id: int | None = None,
         user_id: int | None = None,
+        turn_id: int | None = None,
     ) -> WebResearchResult:
         normalized_query = self._normalize_query(request.query)
         if not normalized_query:
@@ -102,12 +106,6 @@ class WebResearchService:
             return WebResearchResult(query=normalized_query, answer="", failure_reason="not_configured")
 
         now = time.monotonic()
-        cooldown_key = (int(guild_id or 0), int(user_id or 0))
-        if self.cooldown_seconds > 0 and cooldown_key != (0, 0):
-            last = self._cooldowns.get(cooldown_key, 0.0)
-            if now - last < self.cooldown_seconds:
-                return WebResearchResult(query=normalized_query, answer="", failure_reason="rate_limited")
-
         effective = WebResearchRequest(
             query=normalized_query,
             lookup_type=self._clean_lookup_type(request.lookup_type),
@@ -126,26 +124,15 @@ class WebResearchService:
         cached = self._cache.get(cache_key)
         if cached and cached[0] > now:
             result = cached[1]
-            return WebResearchResult(
-                query=result.query,
-                answer=result.answer,
-                sources=result.sources,
-                citations=result.citations,
-                failure_reason=result.failure_reason,
-                cache_hit=True,
-                source_content_authoritative=result.source_content_authoritative,
-                tool_used=result.tool_used,
-                media_candidates=result.media_candidates,
-                server_side_tool_usage=result.server_side_tool_usage,
-                server_side_tool_usage_details=result.server_side_tool_usage_details,
-                view_image_available=result.view_image_available,
-                view_image_attempted=result.view_image_attempted,
-                view_image_succeeded=result.view_image_succeeded,
-                grounded_visual_observation=result.grounded_visual_observation,
-                grounded_visual_source_count=result.grounded_visual_source_count,
-            )
+            return replace(result, cache_hit=True)
 
-        self._cooldowns[cooldown_key] = now
+        cooldown_key = (int(guild_id or 0), int(user_id or 0))
+        last, last_turn = self._cooldowns.get(cooldown_key, (0.0, None))
+        same_turn = turn_id is not None and turn_id == last_turn
+        if self.cooldown_seconds > 0 and cooldown_key != (0, 0) and not same_turn and now - last < self.cooldown_seconds:
+            return WebResearchResult(query=normalized_query, answer="", failure_reason="rate_limited")
+        if not same_turn:
+            self._cooldowns[cooldown_key] = (now, turn_id)
         try:
             raw = await method(
                 query=effective.query,
@@ -192,13 +179,18 @@ class WebResearchService:
         if not isinstance(raw, dict):
             return WebResearchResult(query=request.query, answer="", failure_reason="invalid_response")
         failure = str(raw.get("failure_reason") or "").strip() or None
-        answer = self._bounded_text(raw.get("answer"), limit=1800)
+        answer = str(raw.get("answer") or "")
+        metadata = {key: raw.get(key) for key in ("provider_status", "finish_reason", "incomplete_reason")}
         citations = tuple(
             item
-            for item in (self._bounded_text(value, limit=500) for value in raw.get("citations", []) if value)
-            if item
+            for item in (str(value).strip() for value in raw.get("citations", []) if value)
+            if urlparse(item).scheme in {"http", "https"} and urlparse(item).hostname
         )[: request.max_sources]
         sources = tuple(self._coerce_sources(raw.get("sources"), citations, limit=request.max_sources))
+        if not failure and (str(metadata["provider_status"] or "").upper() not in {"COMPLETED", "COMPLETE", "SUCCESS"}):
+            failure = "provider_completion_unverified"
+        if not failure and not sources and not citations:
+            failure = "ungrounded_response"
         media_candidates = tuple(
             candidate
             for source in sources
@@ -225,6 +217,7 @@ class WebResearchService:
                 sources=sources,
                 citations=citations,
                 failure_reason=failure,
+                **metadata,
                 tool_used=str(raw.get("tool_used") or "web_search"),
                 media_candidates=media_candidates,
                 server_side_tool_usage=tool_usage,
@@ -253,6 +246,7 @@ class WebResearchService:
             sources=sources,
             citations=citations,
             failure_reason=None,
+            **metadata,
             tool_used=str(raw.get("tool_used") or ("x_search" if request.use_x_search else "web_search")),
             media_candidates=media_candidates,
             server_side_tool_usage=tool_usage,
@@ -310,16 +304,16 @@ class WebResearchService:
             for item in raw_sources[:limit]:
                 if not isinstance(item, dict):
                     continue
-                url = self._bounded_text(item.get("url"), limit=500)
-                if not url or url in seen:
+                url = str(item.get("url") or "").strip()
+                if urlparse(url).scheme not in {"http", "https"} or not urlparse(url).hostname or url in seen:
                     continue
                 seen.add(url)
                 sources.append(
                     WebSource(
-                        title=self._bounded_text(item.get("title"), limit=160) or None,
+                        title=str(item.get("title") or "") or None,
                         url=url,
                         domain=self._domain(url),
-                        snippet=self._bounded_text(item.get("snippet"), limit=240) or None,
+                        snippet=str(item.get("snippet") or "") or None,
                         published_at=self._bounded_text(item.get("published_at") or item.get("date"), limit=80) or None,
                         media_urls=tuple(candidate.url for candidate in self._coerce_media_candidates(item)),
                         media_candidates=self._coerce_media_candidates(item),
@@ -378,8 +372,7 @@ class WebResearchService:
 
     @staticmethod
     def _normalize_query(query: str) -> str:
-        cleaned = " ".join(str(query or "").split())
-        return cleaned[:500]
+        return str(query or "").strip()
 
     @staticmethod
     def _clean_lookup_type(value: str) -> str:

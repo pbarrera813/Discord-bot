@@ -54,12 +54,19 @@ from services.ai_operation_catalog import (
     FOOTBALL_MUTATING_OPERATIONS,
     MEME_OPERATIONS,
     MEMORY_LIFECYCLE_OPERATIONS,
+    TOOL_DESCRIPTIONS,
     is_memory_lifecycle,
     canonical_operation_field,
+    canonical_operations,
+    known_output_fields,
+    operand_descriptors,
+    operation_effect,
+    tool_definitions,
+    validate_operands,
 )
 from services.api_ninjas import NinjasOperandError, execute_operation as execute_ninjas_operation
 from services.glot import RUN_FILENAMES, execute_run, truncate_output
-from services.football_analysis_context import _compact_standing, build_fixture_context, build_player_context, build_standings_context, build_team_context, football_grounding_prompt
+from services.football_analysis_context import _compact_fixture, _compact_standing, build_fixture_context, build_player_context, build_standings_context, build_team_context, football_grounding_prompt
 from services.football_formatter import fixture_score, fixture_status, fixture_teams
 from services.football_live_match_service import FootballLiveMatchService, compact_match_data, match_requested_stat
 from services.football_operation_service import (
@@ -71,6 +78,7 @@ from services.football_operation_service import (
     football_web_fallback_eligible,
 )
 from services.football_query_service import FootballQueryOperation, build_operation, compile_football_operation
+from services.football_api_request_compiler import InvalidFootballApiRequest
 from services.football_watch import (
     FootballWatchSnapshot,
     build_watch_updates,
@@ -84,6 +92,7 @@ from services.server_memory import MEMORY_TYPES, SELF_DECIDABLE_MEMORY_TYPES, Se
 from services.server_memory_context import ServerMemoryContextBuilder
 from services.external_sources import (
     ExternalExpectedContent,
+    ExternalMediaArtifact,
     ExternalMediaSource,
     ExternalSourceBundle,
     ExternalSourceIntent,
@@ -106,12 +115,16 @@ from services.voice_messages import (
     VoiceResponseDecision,
     sanitize_tts_text,
 )
-from services.xai_client import ADMIN_ACTION_OPERATIONS, XAITTSAuthorizationError
+from services.xai_client import ADMIN_ACTION_OPERATIONS, XAICompletionError, XAITTSAuthorizationError
 from services.web_research import WebResearchRequest, WebResearchResult, WebResearchService
 from services.web_research_context import football_web_grounding_prompt, format_web_research_context
 from services.ai_capability_orchestrator import (
     CapabilityExecutionPlan,
     CapabilityExecutionContext,
+    CapabilityPlan,
+    CapabilityRequest,
+    CapabilityRequirement,
+    InputBinding,
     CapabilityResultBundle,
     CapabilityTerminalStatus,
     CapabilityTerminalResult,
@@ -122,6 +135,8 @@ from services.ai_capability_orchestrator import (
     normalize_capability_plan,
     plan_from_route_payload,
     reusable_results_for_continuation,
+    evidence_read_key,
+    validate_evidence_response,
 )
 from utils.i18n import tr
 
@@ -583,6 +598,13 @@ class AIChatCog(commands.Cog):
                 ),
             )
         image_urls = image_context.urls
+        # ponytail: the router/plan path below is unreachable and is deleted once the tool loop is operator-accepted.
+        await self._run_tool_turn(
+            message, settings=settings, lang=lang, anchor_type=anchor_type, replied_message=replied_message,
+            is_reply_to_ai=is_reply_to_ai, image_context=image_context, user_prompt=user_prompt,
+            convo_key=convo_key, lease_key=lease_key,
+        )
+        return
         route_decision = await self._route_ai_decision(
             message=message,
             anchor_type=anchor_type,
@@ -1443,38 +1465,7 @@ class AIChatCog(commands.Cog):
         llm_prompt = self._apply_image_context_note(llm_prompt, image_context)
         llm_prompt = self._apply_resolved_request_context(llm_prompt, route_decision)
         available_emojis = self._serialize_custom_emojis(message.guild)
-        if (
-            replied_message is not None
-            and self.bot.user is not None
-            and replied_message.author.id == self.bot.user.id
-            and is_reply_to_ai
-            and replied_message.content.strip()
-        ):
-            cleaned_replied = " ".join(replied_message.content.strip().split())
-            if len(cleaned_replied) > self._history_entry_max_chars:
-                cleaned_replied = cleaned_replied[: self._history_entry_max_chars - 3].rstrip() + "..."
-            expected_prefixed = f"{self.bot.user.display_name}: {cleaned_replied}"
-            already_in_history = any(
-                item.get("role") == "assistant"
-                and item.get("content") == expected_prefixed
-                for item in self._conversation_history[convo_key]
-            )
-            if not already_in_history:
-                prefixed = self._append_conversation_turn(
-                    convo_key,
-                    role="assistant",
-                    speaker=self.bot.user.display_name,
-                    content=replied_message.content.strip(),
-                )
-                if prefixed is not None:
-                    await self._persist_conversation_turn(
-                        guild_id=message.guild.id,
-                        channel_id=message.channel.id,
-                        role="assistant",
-                        speaker=self.bot.user.display_name,
-                        content=prefixed,
-                        message_id=replied_message.id,
-                    )
+        await self._remember_replied_ai_message(message, replied_message, convo_key, is_reply_to_ai=is_reply_to_ai)
 
         conversation_mode = self._conversation_mode_for_trigger(
             replied_message,
@@ -1600,9 +1591,17 @@ class AIChatCog(commands.Cog):
                         else None
                     ),
                 )
-                await self._recover_unavailable_information(
-                    message, execution_context, user_message=llm_prompt, settings=settings,
-                )
+                async def execute_reads(reads):
+                    batch = replace(execution_context.execution_plan, ordered_capabilities=reads)
+                    await self._execute_live_media_composition_result_only(
+                        message, user_prompt, batch, settings=settings,
+                        replied_message=replied_message, football_lang=lang, memory_lang=lang, admin_lang=lang,
+                        football_anchor_type=anchor_type, football_reply_to_trigger=reply_to_trigger,
+                        image_context=image_context, resolution_message=admin_resolution_message,
+                        execution_context=execution_context,
+                        can_continue=lambda: self._pending_can_send(pending_for_send),
+                    )
+
                 self._log_capability_terminal_checkpoint(message, execution_context)
                 minecraft_result = execution_context.bundle.by_capability.get("MINECRAFT")
                 if (
@@ -1672,42 +1671,30 @@ class AIChatCog(commands.Cog):
                         getattr(message, "id", None),
                         visual_result.reason if visual_result is not None else "visual_result_missing",
                     )
-                ordered_names = tuple(
-                    getattr(item, "name", "")
-                    for item in getattr(execution_plan, "ordered_capabilities", ()) or ()
+                reply = await self._synthesize_capability_bundle(
+                    user_prompt=llm_prompt,
+                    message=message, execute_reads=execute_reads,
+                    can_continue=lambda: self._pending_can_send(pending_for_send),
+                    execution_context=execution_context,
+                    server_context=enhanced_server_context,
+                    author_name=message.author.display_name,
+                    channel=message.channel,
+                    guild=message.guild,
+                    available_emojis=available_emojis,
+                    conversation_history=await self._build_branch_conversation_history(
+                        convo_key,
+                        message,
+                        replied_message,
+                        lease=self._continuation_leases.get(lease_key),
+                        is_reply_to_ai=is_reply_to_ai,
+                    ),
+                    mention_hints=[],
+                    relay_instruction="",
+                    is_owner=self.bot.is_owner_user(message.author),
+                    conversation_mode=conversation_mode,
+                    reply_language=lang,
+                    author_permissions=self._author_permissions_text(message),
                 )
-                if ordered_names == ("CHAT",):
-                    chat_result = execution_context.bundle.results[0] if execution_context.bundle.results else None
-                    reply = (
-                        str(chat_result.payload.get("answer") or "")
-                        if chat_result is not None and isinstance(chat_result.payload, dict)
-                        else ""
-                    )
-                    if not reply:
-                        raise RuntimeError("chat_task_answer_missing")
-                else:
-                    reply = await self._synthesize_capability_bundle(
-                        user_prompt=llm_prompt,
-                        execution_context=execution_context,
-                        server_context=enhanced_server_context,
-                        author_name=message.author.display_name,
-                        channel=message.channel,
-                        guild=message.guild,
-                        available_emojis=available_emojis,
-                        conversation_history=await self._build_branch_conversation_history(
-                            convo_key,
-                            message,
-                            replied_message,
-                            lease=self._continuation_leases.get(lease_key),
-                            is_reply_to_ai=is_reply_to_ai,
-                        ),
-                        mention_hints=[],
-                        relay_instruction="",
-                        is_owner=self.bot.is_owner_user(message.author),
-                        conversation_mode=conversation_mode,
-                        reply_language=lang,
-                        author_permissions=self._author_permissions_text(message),
-                    )
             else:
                 reply = await self.bot.llm_client.chat(
                     server_context=enhanced_server_context,
@@ -1745,60 +1732,360 @@ class AIChatCog(commands.Cog):
                 )
             if not self._pending_can_send(pending_for_send):
                 return
-            if self._is_ai_limit_error(exc):
-                await self._send_long_reply(
-                    message,
-                    tr(
-                        lang,
-                        "Wow, I think that's a lot of talking from me right now, try later!",
-                        "Wow, creo que he hablado demasiado por ahora, intenta más tarde!",
-                    ),
-                    reply_to_trigger=reply_to_trigger,
-                    mention_author=True,
-                )
-            elif self._is_empty_completion_error(exc):
-                await self._send_long_reply(
-                    message,
-                    tr(
-                        lang,
-                        "Oops, my brain lagged for a second. Try again!",
-                        "Ups, se me fue la onda por un segundo. Intenta otra vez!",
-                    ),
-                    reply_to_trigger=reply_to_trigger,
-                    mention_author=True,
-                )
-            elif image_urls and self._is_ai_image_access_error(exc):
-                await self._send_long_reply(
-                    message,
-                    tr(
-                        lang,
-                        "I can see you attached an image, but this xAI model/API access is not enabled for image understanding. Ask an admin to set `XAI_VISION_MODEL` to a vision-capable model and confirm image input access.",
-                        "Veo que adjuntaste una imagen, pero este modelo/acceso de xAI no esta habilitado para entender imagenes. Pide a un admin configurar `XAI_VISION_MODEL` con un modelo con vision y revisar el acceso a imagenes.",
-                    ),
-                    reply_to_trigger=reply_to_trigger,
-                    mention_author=True,
-                )
-            else:
-                await self._send_long_reply(
-                    message,
-                    tr(
-                        lang,
-                        "I hit an internal AI error. Please try again in a bit.",
-                        "Tuve un error interno de IA. Intenta de nuevo en un momento.",
-                    ),
-                    reply_to_trigger=reply_to_trigger,
-                    mention_author=True,
-                )
+            await self._send_ai_failure_reply(message, exc, lang=lang, image_urls=image_urls, reply_to_trigger=reply_to_trigger)
             self._store_missed_response_candidate(message, anchor_type, "chat_error")
             self._clear_pending_interaction(pending_for_send, event="error")
             return
 
+        await self._deliver_turn_reply(
+            message, reply=reply, convo_key=convo_key, user_prompt=user_prompt, dispatch_action=dispatch_action,
+            route_decision=route_decision, result_only_composition=result_only_composition, execution_plan=execution_plan,
+            execution_context=execution_context, pending_for_send=pending_for_send, reply_to_trigger=reply_to_trigger,
+            anchor_type=anchor_type, image_context=image_context, available_emojis=available_emojis,
+            conversation_mode=conversation_mode,
+        )
+
+    async def _run_tool_turn(
+        self, message, *, settings, lang: str, anchor_type: str, replied_message, is_reply_to_ai: bool,
+        image_context: ChatImageContext, user_prompt: str, convo_key, lease_key,
+    ) -> None:
+        """Grok decides and answers in one native function-calling loop; code validates and executes each call."""
+        replied_context = (
+            self._build_replied_message_context(replied_message)
+            if anchor_type in STRONG_ANCHORS and replied_message is not None
+            else RepliedMessageContext()
+        )
+        llm_prompt = self._apply_image_context_note(self._apply_replied_message_context(user_prompt, replied_context), image_context)
+        image_sources = self._image_source_projection(image_context)
+        if image_sources:
+            llm_prompt += "\n\n[AVAILABLE_IMAGES] " + json.dumps(
+                [{"ref": item["ref"], "source_kind": item["source_kind"]} for item in image_sources], ensure_ascii=False,
+            )
+        available_emojis = self._serialize_custom_emojis(message.guild)
+        await self._remember_replied_ai_message(message, replied_message, convo_key, is_reply_to_ai=is_reply_to_ai)
+        conversation_mode = self._conversation_mode_for_trigger(
+            replied_message, is_active_followup=anchor_type == "SAME_USER_CONTINUATION", is_reply_to_ai=is_reply_to_ai,
+        )
+        if anchor_type == "SAME_USER_CONTINUATION":
+            conversation_mode = "continuation"
+        route_decision = RouteDecision("RESPOND", "CHAT", 1.0, 1.0, "DIRECT_REQUEST")
+        pending_for_send = self._set_pending_interaction(
+            message,
+            route_decision=route_decision,
+            target_message_id=self._route_target_message_id(message, route_decision, image_context, replied_message),
+        )
+        server_context = await self._server_context_with_memory(
+            message, base_context=settings.server_context, route_action="CHAT", current_text=user_prompt,
+            replied_message=replied_message,
+        )
+        await message.channel.typing()
+        reply_to_trigger = self._should_reply_to_trigger(message, is_direct_trigger=anchor_type in STRONG_ANCHORS)
+        plan = CapabilityPlan(
+            objective=user_prompt[:300], capabilities=(), primary_action="CHAT",
+            response_delivery={}, external_source={}, football={},
+        )
+        execution_context = CapabilityExecutionContext(
+            CapabilityExecutionPlan(semantic_plan=plan, ordered_capabilities=(), dispatch_action="CHAT")
+        )
+        control: dict[str, object] = {"silent": False, "artifacts": None}
+        completed_changes: dict[str, str] = {}
+
+        async def run_tools(calls: list[dict[str, Any]]) -> list[object]:
+            outputs: dict[str, object] = {}
+            batch: list[CapabilityRequest] = []
+            requirements: list[CapabilityRequirement] = []
+            for call in calls:
+                call_id = str(call.get("call_id") or "")
+                name = str(call.get("name") or "")
+                try:
+                    args = json.loads(call.get("arguments") or "{}")
+                except ValueError:
+                    args = None
+                if not isinstance(args, dict):
+                    outputs[call_id] = {"status": "VALIDATION_FAILED", "reason": "arguments must be a JSON object"}
+                elif name == "stay_silent":
+                    control["silent"] = True
+                    outputs[call_id] = {"status": "SUCCESS"}
+                elif name == "deliver":
+                    outputs[call_id] = self._apply_deliver_call(message, args, control)
+                elif name.upper() not in TOOL_DESCRIPTIONS:
+                    outputs[call_id] = {"status": "UNSUPPORTED", "reason": f"unknown function {name}"}
+                else:
+                    request, requirement, error = self._tool_call_request(name.upper(), call_id, args, execution_context)
+                    if error is None and operation_effect(request) == "mutate":
+                        # A change that already ran (or whose outcome is uncertain) is never repeated in the same turn.
+                        key = hash_text(json.dumps([request.name, dict(request.operands)], sort_keys=True, default=str))
+                        error = f"identical change already requested as task {completed_changes[key]}" if key in completed_changes else None
+                        completed_changes.setdefault(key, call_id)
+                    if error is not None:
+                        outputs[call_id] = {"task_id": call_id, "status": "VALIDATION_FAILED", "reason": error}
+                    else:
+                        batch.append(request)
+                        requirements.append(requirement)
+            if batch:
+                current = execution_context.execution_plan
+                semantic_plan = replace(
+                    current.semantic_plan,
+                    capabilities=current.semantic_plan.capabilities + tuple(batch),
+                    requirements=current.semantic_plan.requirements + tuple(requirements),
+                )
+                execution_context.execution_plan = replace(
+                    current, semantic_plan=semantic_plan, ordered_capabilities=current.ordered_capabilities + tuple(batch),
+                )
+                await self._execute_live_media_composition_result_only(
+                    message, user_prompt, replace(execution_context.execution_plan, ordered_capabilities=tuple(batch)),
+                    settings=settings, replied_message=replied_message, football_lang=lang, memory_lang=lang,
+                    admin_lang=lang, football_anchor_type=anchor_type, football_reply_to_trigger=reply_to_trigger,
+                    image_context=image_context, execution_context=execution_context,
+                    can_continue=lambda: self._pending_can_send(pending_for_send),
+                )
+                # Grok judges fulfillment in its answer; a requirement is supported when its own task satisfied it.
+                execution_context.requirement_assessments = {
+                    task_id: {"status": "supported" if result.satisfies_request else "unsupported"}
+                    for task_id, result in execution_context.results.items()
+                }
+                for request in batch:
+                    result = execution_context.results.get(request.task_id)
+                    outputs[request.task_id] = (
+                        self._capability_bundle_prompt_context(self._single_task_context(execution_context, request, result))
+                        if result is not None
+                        else {"task_id": request.task_id, "status": "NOT_EXECUTED", "reason": "request superseded or cancelled"}
+                    )
+            return [outputs.get(str(call.get("call_id") or ""), {"status": "NOT_EXECUTED"}) for call in calls]
+
+        try:
+            reply = await self.bot.llm_client.chat(
+                server_context=server_context,
+                user_message=llm_prompt,
+                author_name=message.author.display_name,
+                channel_name=getattr(message.channel, "name", "unknown"),
+                request_date=self._football_request_temporal_context(message)[0],
+                channel_reference=self._channel_reference(message.channel),
+                available_channels=self._serialize_text_channels(message.guild),
+                available_emojis=available_emojis,
+                conversation_history=await self._build_branch_conversation_history(
+                    convo_key, message, replied_message,
+                    lease=self._continuation_leases.get(lease_key), is_reply_to_ai=is_reply_to_ai,
+                ),
+                is_owner=self.bot.is_owner_user(message.author),
+                conversation_mode=conversation_mode,
+                image_urls=list(image_context.urls),
+                reply_language=lang,
+                author_permissions=self._author_permissions_text(message),
+                tools=tool_definitions(),
+                run_tools=run_tools,
+            )
+        except Exception as exc:
+            logging.exception("AI tool turn failure in guild=%s channel=%s", message.guild.id, message.channel.id)
+            if self._pending_can_send(pending_for_send):
+                await self._send_ai_failure_reply(
+                    message, exc, lang=lang, image_urls=image_context.urls, reply_to_trigger=reply_to_trigger,
+                )
+            self._store_missed_response_candidate(message, anchor_type, "chat_error")
+            self._clear_pending_interaction(pending_for_send, event="error")
+            return
+        self._log_capability_terminal_checkpoint(message, execution_context)
         if not self._pending_can_send(pending_for_send):
             self._log_pending_event(message, "stale_suppressed", pending_for_send)
             return
-        reply = await self._normalize_discord_references(reply, message.guild)
-        reply = self._sanitize_visible_ai_output(reply)
-        reply = self._dearm_mass_mentions(reply)
+        acted = any(result.satisfies_request for result in execution_context.results.values())
+        if control["silent"] and not acted:
+            self._store_missed_response_candidate(message, anchor_type, "stay_silent")
+            self._invalidate_owner_lease_for_rejection(message, "route_ignore")
+            self._clear_pending_interaction(pending_for_send, event="stay_silent")
+            return
+        if not str(reply).strip():
+            if not acted:
+                await self._send_ai_failure_reply(
+                    message, XAICompletionError("xAI API returned an empty completion."), lang=lang,
+                    image_urls=image_context.urls, reply_to_trigger=reply_to_trigger,
+                )
+            self._clear_pending_interaction(pending_for_send, event="no_text_reply")
+            return
+        produced = [
+            item.task_id for item in execution_context.execution_plan.ordered_capabilities
+            if item.name in {"IMAGE_GENERATE", "IMAGE_EDIT", "MEME"}
+            and getattr(execution_context.results.get(item.task_id), "satisfies_request", False)
+        ]
+        chosen = produced if control["artifacts"] is None else [task_id for task_id in control["artifacts"] if task_id in produced]
+        delivery_plan = replace(
+            execution_context.execution_plan,
+            semantic_plan=replace(
+                execution_context.execution_plan.semantic_plan,
+                response_delivery={"artifacts": [{"upstream_task_id": task_id, "output_field": "artifact"} for task_id in chosen]},
+            ),
+        )
+        execution_context.execution_plan = delivery_plan
+        await self._deliver_turn_reply(
+            message, reply=str(reply), convo_key=convo_key, user_prompt=user_prompt, dispatch_action="CHAT",
+            route_decision=route_decision, result_only_composition=True, execution_plan=delivery_plan,
+            execution_context=execution_context, pending_for_send=pending_for_send, reply_to_trigger=reply_to_trigger,
+            anchor_type=anchor_type, image_context=image_context, available_emojis=available_emojis,
+            conversation_mode=conversation_mode,
+        )
+
+    @staticmethod
+    def _single_task_context(context: CapabilityExecutionContext, request: CapabilityRequest, result) -> CapabilityExecutionContext:
+        """One call's result, judged against that call alone (the turn is still in progress)."""
+        plan = context.execution_plan
+        semantic_plan = replace(plan.semantic_plan, capabilities=(request,), requirements=tuple(
+            item for item in plan.semantic_plan.requirements if item.owner_task_id == request.task_id))
+        return replace(context, results={request.task_id: result},
+                       execution_plan=replace(plan, semantic_plan=semantic_plan, ordered_capabilities=(request,)))
+
+    @staticmethod
+    def _tool_call_request(
+        family: str, call_id: str, args: dict[str, Any], execution_context: CapabilityExecutionContext,
+    ) -> tuple[CapabilityRequest | None, CapabilityRequirement | None, str | None]:
+        descriptors = operand_descriptors(family)
+        unknown = sorted(set(args) - set(descriptors) - {"purpose", "source_refs", "inputs"})
+        if unknown:
+            return None, None, f"unknown arguments {unknown}; allowed: {sorted(descriptors)}"
+        operands = {key: value for key, value in args.items() if key in descriptors and value is not None}
+        for field_name, value in operands.items():
+            error = validate_operands(family, {field_name: value})
+            if error:
+                return None, None, f"{field_name}: {error}; expected {descriptors[field_name].json_schema()}"
+        operation_field = canonical_operation_field(family)
+        if operation_field and operands.get(operation_field) not in canonical_operations(family):
+            return None, None, f"{operation_field} must be one of {sorted(canonical_operations(family))}"
+        bindings: list[InputBinding] = []
+        for item in args.get("inputs") or ():
+            task_id = str((item or {}).get("task_id") or "")
+            output_field = str((item or {}).get("output_field") or "")
+            upstream = execution_context.results.get(task_id)
+            if upstream is None:
+                return None, None, f"inputs: no earlier result has task_id {task_id!r}"
+            if output_field not in known_output_fields(upstream.capability):
+                return None, None, f"inputs: {upstream.capability} outputs are {sorted(known_output_fields(upstream.capability))}"
+            bindings.append(InputBinding(task_id, output_field))
+        purpose = str(args.get("purpose") or "").strip()
+        # A selected link is its own grounding evidence: it is accepted only when it appears in the authorized message.
+        evidence = str(operands.get("url") or operands.get("source_url") or purpose) if family == "EXTERNAL_SOURCE" else purpose
+        scopes = {
+            "WEB": "BROAD_RESEARCH", "EXTERNAL_SOURCE": "EXPLICIT_SOURCE", "IMAGE_ANALYZE": "MEDIA_ANALYSIS",
+            "IMAGE_GENERATE": "IMAGE_GENERATION", "MEME": "IMAGE_GENERATION", "IMAGE_EDIT": "IMAGE_EDIT",
+            "ADMIN": "DISCORD_ACTION", "REACTION": "DISCORD_ACTION",
+        }
+        request = CapabilityRequest(
+            name=family, task_id=call_id, required=True, evidence_span=evidence,
+            depends_on=tuple(binding.upstream_task_id for binding in bindings),
+            scope=scopes.get(family, "STRUCTURED_DATA"), independent_research=family == "WEB",
+            selection_count=int(operands.get("selection_count") or 1), operands=operands,
+            input_bindings=tuple(bindings), source_refs=tuple(str(ref) for ref in args.get("source_refs") or ()),
+            requested_outputs=tuple(sorted(known_output_fields(family))),
+        )
+        if operation_effect(request) is None:
+            return None, None, "unknown or missing operation"
+        requirement = CapabilityRequirement(
+            requirement_id=call_id, objective=purpose or evidence, capability_owner=family, owner_task_id=call_id,
+        )
+        return request, requirement, None
+
+    def _apply_deliver_call(self, message, args: dict[str, Any], control: dict[str, object]) -> dict[str, object]:
+        if isinstance(args.get("artifacts"), list):
+            control["artifacts"] = [str(task_id) for task_id in args["artifacts"]]
+        if args.get("voice"):
+            delivery = {
+                "modality": "VOICE", "explicit": True, "source": "CURRENT_MESSAGE",
+                "evidence_span": str(args.get("voice_request_quote") or ""), "semantic_reason": "voice requested",
+            }
+            decision = self._validated_response_delivery_for_message(message, delivery)
+            if decision.modality != ResponseModality.VOICE:
+                return {"status": "VALIDATION_FAILED", "reason": f"voice_request_quote must be the exact words of the current message asking for audio ({decision.reason})"}
+            self._remember_response_delivery_decision(
+                message, RouteDecision("RESPOND", "CHAT", 1.0, 1.0, "DIRECT_REQUEST", response_delivery=delivery),
+            )
+        return {"status": "SUCCESS"}
+
+    async def _remember_replied_ai_message(self, message, replied_message, convo_key, *, is_reply_to_ai: bool) -> None:
+        if (
+            replied_message is not None
+            and self.bot.user is not None
+            and replied_message.author.id == self.bot.user.id
+            and is_reply_to_ai
+            and replied_message.content.strip()
+        ):
+            cleaned_replied = replied_message.content
+            if len(cleaned_replied) > self._history_entry_max_chars:
+                cleaned_replied = cleaned_replied[: self._history_entry_max_chars - 3].rstrip() + "..."
+            expected_prefixed = f"{self.bot.user.display_name}: {cleaned_replied}"
+            already_in_history = any(
+                item.get("role") == "assistant"
+                and item.get("content") == expected_prefixed
+                for item in self._conversation_history[convo_key]
+            )
+            if not already_in_history:
+                prefixed = self._append_conversation_turn(
+                    convo_key,
+                    role="assistant",
+                    speaker=self.bot.user.display_name,
+                    content=replied_message.content.strip(),
+                )
+                if prefixed is not None:
+                    await self._persist_conversation_turn(
+                        guild_id=message.guild.id,
+                        channel_id=message.channel.id,
+                        role="assistant",
+                        speaker=self.bot.user.display_name,
+                        content=prefixed,
+                        message_id=replied_message.id,
+                    )
+
+    async def _send_ai_failure_reply(self, message, exc: Exception, *, lang: str, image_urls, reply_to_trigger: bool) -> None:
+        if self._is_ai_limit_error(exc):
+            await self._send_long_reply(
+                message,
+                tr(
+                    lang,
+                    "Wow, I think that's a lot of talking from me right now, try later!",
+                    "Wow, creo que he hablado demasiado por ahora, intenta más tarde!",
+                ),
+                reply_to_trigger=reply_to_trigger,
+                mention_author=True,
+            )
+        elif self._is_empty_completion_error(exc):
+            await self._send_long_reply(
+                message,
+                tr(
+                    lang,
+                    "Oops, my brain lagged for a second. Try again!",
+                    "Ups, se me fue la onda por un segundo. Intenta otra vez!",
+                ),
+                reply_to_trigger=reply_to_trigger,
+                mention_author=True,
+            )
+        elif image_urls and self._is_ai_image_access_error(exc):
+            await self._send_long_reply(
+                message,
+                tr(
+                    lang,
+                    "I can see you attached an image, but this xAI model/API access is not enabled for image understanding. Ask an admin to set `XAI_VISION_MODEL` to a vision-capable model and confirm image input access.",
+                    "Veo que adjuntaste una imagen, pero este modelo/acceso de xAI no esta habilitado para entender imagenes. Pide a un admin configurar `XAI_VISION_MODEL` con un modelo con vision y revisar el acceso a imagenes.",
+                ),
+                reply_to_trigger=reply_to_trigger,
+                mention_author=True,
+            )
+        else:
+            await self._send_long_reply(
+                message,
+                tr(
+                    lang,
+                    "I hit an internal AI error. Please try again in a bit.",
+                    "Tuve un error interno de IA. Intenta de nuevo en un momento.",
+                ),
+                reply_to_trigger=reply_to_trigger,
+                mention_author=True,
+            )
+
+    async def _deliver_turn_reply(
+        self, message, *, reply: str, convo_key, user_prompt: str, dispatch_action: str, route_decision: RouteDecision,
+        result_only_composition: bool, execution_plan, execution_context: CapabilityExecutionContext, pending_for_send,
+        reply_to_trigger: bool, anchor_type: str, image_context: ChatImageContext, available_emojis, conversation_mode: str,
+    ) -> None:
+        if not self._pending_can_send(pending_for_send):
+            self._log_pending_event(message, "stale_suppressed", pending_for_send)
+            return
         prefixed_user = self._append_conversation_turn(
             convo_key,
             role="user",
@@ -2295,9 +2582,6 @@ class AIChatCog(commands.Cog):
                 )
             return
 
-        reply = await self._normalize_discord_references(reply, guild)
-        reply = self._sanitize_visible_ai_output(reply)
-        reply = self._dearm_mass_mentions(reply)
         reply = self._format_roast_reply(reply, mention)
         prefixed_user = self._append_conversation_turn(
             convo_key,
@@ -2540,7 +2824,6 @@ class AIChatCog(commands.Cog):
                 )
             return
 
-        translated = await self._normalize_discord_references(translated, ctx.guild)
         await ctx.send(translated[:1900], allowed_mentions=discord.AllowedMentions.none())
 
     def _is_slash_command_response_message(self, message: discord.Message | None) -> bool:
@@ -4918,6 +5201,8 @@ class AIChatCog(commands.Cog):
             reply_text=reply_text,
             reply_embeds=list(getattr(replied_message, "embeds", []) or []) if reply_authorized else [],
         )
+        if intent.selected_urls:
+            sources = [source for source in sources if source.original_url in intent.selected_urls]
 
         if not sources:
             return normalize_terminal_result(
@@ -5565,7 +5850,7 @@ class AIChatCog(commands.Cog):
             text = str(getattr(replied_message, "content", "") or "").strip() if authorized else ""
             if not text:
                 return failure(CapabilityTerminalStatus.VALIDATION_FAILED, "reply_source_unavailable")
-            if len(text) > 1800:  # the provider silently cuts longer input
+            if len(text) > 1800:
                 return failure(CapabilityTerminalStatus.VALIDATION_FAILED, "translate_text_too_long")
         try:
             translated = await self.bot.llm_client.translate(text=text, target_language=target)
@@ -5881,6 +6166,21 @@ class AIChatCog(commands.Cog):
                 )
             return provenance
 
+        if not selected_media:
+            # An image produced earlier in the same request is inspected from its own bytes.
+            selected_media = [
+                ExternalMediaSource(
+                    url="", content_type=str(result.payload.get("content_type") or "image/png"), provenance="generated_artifact",
+                    artifact=ExternalMediaArtifact(result.payload["artifact"], str(result.payload.get("content_type") or "image/png")),
+                )
+                for result in dependency_results
+                if result is not None and result.capability in {"IMAGE_GENERATE", "IMAGE_EDIT", "MEME"}
+                and result.satisfies_request and isinstance(result.payload, dict) and isinstance(result.payload.get("artifact"), bytes)
+            ][:target_selection_count]
+            if selected_media:
+                vision_inputs = build_vision_inputs(selected_media)
+                media_urls = []
+                evidence_source = "generated_artifact"
         if not selected_media and fallback_media_urls:
             selected_media = list(
                 self._external_sources.select_vision_media(
@@ -6020,7 +6320,7 @@ class AIChatCog(commands.Cog):
                 scope={"media_count": len(media_urls)},
                 reason=type(exc).__name__,
             )
-        analysis_text = self._sanitize_visible_ai_output(reply)
+        analysis_text = reply
         logging.info(
             "AI external source vision_execution outcome=SUCCESS input_count=%s source=%s",
             vision_input_count,
@@ -6084,7 +6384,7 @@ class AIChatCog(commands.Cog):
         visual_objective: str | None = None,
         visual_selection_count: int = 1,
     ) -> CapabilityTerminalResult:
-        query = " ".join(str(user_prompt or "").split())[:500]
+        query = str(user_prompt or "")
         request = WebResearchRequest(
             query=query,
             lookup_type="general",
@@ -6100,6 +6400,7 @@ class AIChatCog(commands.Cog):
                 request,
                 guild_id=getattr(message.guild, "id", None),
                 user_id=getattr(message.author, "id", None),
+                turn_id=getattr(message, "id", None),
             )
         except Exception as exc:
             logging.exception("AI result-only web retrieval failed")
@@ -6112,7 +6413,7 @@ class AIChatCog(commands.Cog):
                 reason=type(exc).__name__,
             )
         has_data = bool(result.answer or result.sources or result.citations)
-        outcome = "SUCCESS" if has_data else str(result.failure_reason or "NO_DATA")
+        outcome = str(result.failure_reason) if result.failure_reason else "SUCCESS" if has_data else "NO_DATA"
         return normalize_terminal_result(
             "WEB",
             outcome,
@@ -6127,118 +6428,98 @@ class AIChatCog(commands.Cog):
             reason=result.failure_reason,
         )
 
-    # Read-only information families whose unavailable-source outcomes get one recovery round; clarification-type
-    # outcomes (ambiguous, malformed request) and every action family are excluded.
-    _RECOVERABLE_FAMILIES = frozenset({"FOOTBALL", "EXTERNAL_SOURCE", "NINJAS"})
-    _RECOVERABLE_OUTCOMES = frozenset({
-        "PROVIDER_FAILURE", "TRANSPORT_FAILURE", "NO_DATA", "NO_DATA_FOR_SCOPE",
-        "UNSUPPORTED_BY_COVERAGE", "NOT_FOUND", "RESOLUTION_FAILED",
-        "UNSUPPORTED_SOURCE", "ACCESS_DENIED", "SOURCE_UNAVAILABLE",
-    })
-
-    async def _recover_unavailable_information(
-        self,
-        message: discord.Message,
-        execution_context: CapabilityExecutionContext,
-        *,
-        user_message: str,
-        settings: object,
-    ) -> None:
-        """xAI decides whether to search and writes the question from the typed failure state; code only validates and runs the existing web provider."""
-
-        plan = execution_context.execution_plan
-        failed: dict[str, tuple[Any, CapabilityTerminalResult]] = {}
-        for request in plan.ordered_capabilities:
-            result = execution_context.results.get(request.task_id)
-            if (
-                request.required
-                and request.name in self._RECOVERABLE_FAMILIES
-                and result is not None
-                and result.terminal
-                and not result.satisfies_request
-                and result.native_outcome in self._RECOVERABLE_OUTCOMES
-            ):
-                failed[request.task_id] = (request, result)
-        client = getattr(self.bot, "llm_client", None)
-        planner = getattr(client, "plan_information_recovery", None)
-        assessor = getattr(client, "assess_information_recovery", None)
-        if not failed or not callable(planner) or not callable(assessor):
-            return
-        failures = {
-            task_id: {
-                "task_id": task_id,
-                "capability": request.name,
-                "operation": str(request.operands.get(canonical_operation_field(request.name) or "operation") or ""),
-                "provider": result.provider,
-                "outcome": result.native_outcome,
-                "objective": "\n".join(item.objective for item in plan.semantic_plan.requirements if item.required and item.owner_task_id == task_id),
-                "satisfaction_criterion": "\n".join(item.satisfaction_criterion for item in plan.semantic_plan.requirements if item.required and item.owner_task_id == task_id),
-            }
-            for task_id, (request, result) in failed.items()
-        }
-        request_date = self._football_request_temporal_context(message)[0]
-        guild_id = getattr(message.guild, "id", 0)
-        channel_id = getattr(message.channel, "id", 0)
+    async def _answer_capability_request(
+        self, message, execution_context, *, user_message, conversation_history, response_call, execute_reads, can_continue,
+    ) -> str:
+        plan = execution_context.execution_plan.semantic_plan
+        rounds = added_reads = reviews = 0
+        reason = "review_unavailable"
+        correction = None
         try:
-            searches = await planner(
-                user_message=user_message,
-                conversation_history=self._build_conversation_history(self._conversation_key(guild_id, channel_id))[-8:],
-                failures=list(failures.values()),
-                request_date=request_date,
-            )
-        except Exception:
-            logging.exception("AI information recovery planning failed")
-            return
-        for search in list(searches or [])[:2]:
-            entry = failed.get(search.get("task_id")) if isinstance(search, dict) else None
-            query = search.get("query") if isinstance(search, dict) else None
-            if entry is None or not isinstance(query, str) or not query.strip():
-                continue
-            request, prior = entry
-            web = await self._execute_web_result_only(message, query, settings=settings)
-            payload = web.payload
-            if not (
-                web.satisfies_request
-                and isinstance(payload, WebResearchResult)
-                and payload.answer.strip()
-                and (payload.sources or payload.citations)
-            ):
-                logging.info(
-                    "AI information recovery rejected capability=%s api_outcome=%s reason=no_grounded_answer",
-                    request.name,
-                    prior.native_outcome,
+            for _ in range(3):
+                if not can_continue():
+                    reason = "superseded"
+                    break
+                request = {
+                    "user_message": user_message,
+                    "conversation_history": conversation_history[-8:],
+                    "request_date": self._football_request_temporal_context(message)[0],
+                    "remaining_steps": 3 - reviews,
+                    "remaining_rounds": 2 - rounds, "remaining_reads": 6 - added_reads if rounds < 2 and reviews < 2 else 0,
+                    "requirements": [{"requirement_id": item.requirement_id, "objective": item.objective,
+                        "satisfaction_criterion": item.satisfaction_criterion, "capability_owner": item.capability_owner,
+                        "owner_task_id": item.owner_task_id} for item in plan.requirements if item.required],
+                    "available_tasks": [
+                        {"task_id": task.task_id, "name": task.name, "operands": dict(task.operands),
+                         "requested_outputs": list(task.requested_outputs),
+                         "status": execution_context.results[task.task_id].status.value if task.task_id in execution_context.results else "MISSING",
+                         "has_payload": task.task_id in execution_context.results and execution_context.results[task.task_id].payload is not None,
+                         "authorized": task.task_id not in execution_context.results or execution_context.results[task.task_id].provenance.get("authorized") is not False,
+                         "resolved_scope": dict(execution_context.results[task.task_id].scope) if task.task_id in execution_context.results else {}}
+                        for task in execution_context.execution_plan.ordered_capabilities
+                    ],
+                    "evidence": self._capability_bundle_prompt_context(execution_context),
+                }
+                if correction is not None:
+                    request["correction"] = correction
+                reviews += 1
+                review = None
+                try:
+                    review = await response_call(request)
+                    if not can_continue():
+                        reason = "superseded"
+                        break
+                    assessments, reads, supports = validate_evidence_response(
+                        execution_context, review, remaining_reads=request["remaining_reads"], remaining_rounds=2 - rounds,
+                    )
+                except Exception as exc:
+                    reason = str(exc) if isinstance(exc, ValueError) else "review_failed"
+                    logging.info("AI evidence review rejected step=%s reason=%s", reviews, reason)
+                    recoverable = isinstance(exc, ValueError) or (
+                        isinstance(exc, XAICompletionError) and exc.status is None and not exc.retryable
+                    )
+                    if recoverable and reviews < 3 and can_continue():
+                        correction = {"rejected_response": review, "error": str(exc)[:4000]}
+                        continue
+                    raise ValueError(reason) from exc
+                correction = None
+                execution_context.requirement_assessments = assessments
+                logging.info("AI evidence response step=%s decision=%s requested_reads=%s remaining_rounds=%s remaining_reads=%s",
+                             reviews, review["decision"], len(reads), 2 - rounds, 6 - added_reads)
+                if review["decision"] != "read_more":
+                    reason = "answered" if review["decision"] == "answer" else "insufficient_evidence"
+                    for task in plan.capabilities:
+                        prior = execution_context.results.get(task.task_id)
+                        if task.name == "CHAT" and prior is not None and prior.reason == "awaiting_response":
+                            execution_context.record(normalize_terminal_result(
+                                "CHAT", "SUCCESS", provider="xai_chat", task_id=task.task_id,
+                                payload={"answer": review["answer"]}, provenance={"source": "shared_response", "authorized": True},
+                            ))
+                    return review["answer"]
+                if rounds >= 2 or added_reads + len(reads) > 6:
+                    reason = "investigation_budget_exhausted"
+                    raise ValueError(reason)
+                execution_context.evidence_requirements.update(supports)
+                execution_context.execution_plan = replace(
+                    execution_context.execution_plan,
+                    ordered_capabilities=execution_context.execution_plan.ordered_capabilities + reads,
                 )
-                continue
-            try:
-                satisfied = await assessor(
-                    user_message=user_message,
-                    failure=failures[request.task_id],
-                    answer=payload.answer,
-                    sources=[source.url for source in payload.sources] or list(payload.citations),
-                    request_date=request_date,
-                )
-            except Exception:
-                logging.exception("AI information recovery assessment failed")
-                satisfied = False
-            if satisfied is not True:
-                logging.info(
-                    "AI information recovery rejected capability=%s api_outcome=%s reason=requirement_not_satisfied",
-                    request.name, prior.native_outcome,
-                )
-                continue
-            execution_context.record(
-                replace(
-                    web,
-                    capability=request.name,
-                    task_id=request.task_id,
-                    provider="web-fallback",
-                )
-            )
+                rounds += 1
+                added_reads += len(reads)
+                try:
+                    await execute_reads(reads)
+                except Exception:
+                    logging.exception("AI evidence read execution failed")
+                    reason = "read_execution_failed"
+                    raise ValueError(reason)
+            else:
+                reason = "investigation_budget_exhausted"
+            raise ValueError(reason)
+        finally:
+            execution_context.investigation_stop_reason = reason
             logging.info(
-                "AI information recovery selected capability=%s api_outcome=%s source_count=%s",
-                request.name,
-                prior.native_outcome,
-                len(payload.sources),
+                "AI evidence investigation rounds=%s added_reads=%s reviews=%s satisfied=%s stop_reason=%s",
+                rounds, added_reads, reviews, execution_context.bundle.satisfied, reason,
             )
 
     @staticmethod
@@ -6274,7 +6555,6 @@ class AIChatCog(commands.Cog):
         if names in (("CHAT",), ("NINJAS",), ("CODE",), ("REMINDER",), ("BIRTHDAY",), ("TRANSLATE",), ("MEME",)):
             return bool(
                 getattr(ordered[0], "required", False)
-                and (names != ("CHAT",) or getattr(ordered[0], "independent", False))
                 and getattr(
                     getattr(execution_plan, "semantic_plan", None),
                     "semantic_source",
@@ -6350,10 +6630,15 @@ class AIChatCog(commands.Cog):
             "[TRUSTED_CAPABILITY_RESULTS]",
             f"Request complete: {bundle.complete}",
             f"Request satisfied: {bundle.satisfied}",
-            f"Unsatisfied capabilities: {', '.join(bundle.missing) or 'none'}",
+            f"Unsatisfied {'requirements' if bundle.reviewed_requirement_ids is not None else 'capabilities'}: {', '.join(bundle.missing) or 'none'}",
         ]
         lines = prefix
         visual_result = bundle.by_capability.get("IMAGE_ANALYZE")
+        if any(isinstance(result.payload, WebResearchResult) for result in bundle.results):
+            lines.append(
+                "Evidence class: TEXTUAL_RESEARCH_CONTEXT; WEB claims are source-attributed research, "
+                "never observations from an inspected image. Visual observations require IMAGE_ANALYZE_SUCCESS."
+            )
         if visual_result is not None:
             if visual_result.satisfies_request:
                 lines.append(
@@ -6419,6 +6704,18 @@ class AIChatCog(commands.Cog):
                 short_marker = "[omitted]"
                 return f"{label}: {short_marker}" if available >= len(short_marker) else ""
             return f"{label}: {value[:available - len(marker) - 1]} {marker}"
+
+        plan = getattr(getattr(execution_context, "execution_plan", None), "semantic_plan", None)
+        if plan is not None:
+            contract = {"objective": plan.objective, "requirements": [
+                {"requirement_id": item.requirement_id, "objective": item.objective,
+                 "satisfaction_criterion": item.satisfaction_criterion}
+                for item in plan.requirements if item.required
+            ]}
+            prefix.append("Request contract: " + json.dumps(contract, ensure_ascii=False, separators=(",", ":")))
+            if bundle.reviewed_requirement_ids is not None:
+                prefix.append(f"Investigation stop reason: {execution_context.investigation_stop_reason or 'pending_review'}")
+                prefix.append("Lookup success is distinct from fulfillment. Preserve missing evidence and qualify derived conclusions; omitted evidence is not proof.")
 
         headers: list[list[str]] = []
         renderers = []
@@ -6514,21 +6811,12 @@ class AIChatCog(commands.Cog):
                     request_date=str(result.scope.get("request_date") or "") or None,
                 )
             elif isinstance(result.payload, WebResearchResult):
-                evidence_prefix = [
-                    "Evidence class: TEXTUAL_RESEARCH_CONTEXT; WEB prose and structured source claims are not visual observations."
-                ]
-                if visual_result is None or not visual_result.satisfies_request:
-                    evidence_prefix.append(
-                        "Visual authority: unavailable; report visual properties only as source-attributed research and never as observations from an inspected image."
-                    )
-                web_prefix = "\n".join(evidence_prefix)
-                research_context = format_web_research_context(
+                return format_web_research_context(
                     result.payload,
                     max_sources=3,
                     request_date=str(result.scope.get("request_date") or "") or None,
-                    max_chars=max(0, allowance - len(web_prefix) - 1),
+                    max_chars=allowance,
                 )
-                return f"{web_prefix}\n{research_context}" if research_context else ""
             elif isinstance(result.payload, FootballRetrievalResult):
                 request_plan = result.payload.requested_scope.get("request_plan")
                 declared_fields = (
@@ -6561,15 +6849,19 @@ class AIChatCog(commands.Cog):
                         "notes": result.payload.notes,
                     }
                 )
-                if "standings_table" in football_payload:
-                    football_payload.setdefault("standings", football_payload["standings_table"])
                 if isinstance(football_payload.get("standings_table"), list):
                     table = football_payload["standings_table"]
-                    projected = [_compact_standing(row) for row in table[:12] if isinstance(row, dict)]
+                    projected = [_compact_standing(row) for row in table if isinstance(row, dict)]
                     if len(table) > len(projected):
                         football_payload["standings_table_omitted_rows"] = len(table) - len(projected)
                     football_payload["standings_table"] = projected
-                    football_payload["standings"] = projected
+                football_payload.pop("standings", None)
+                if isinstance(football_payload.get("fixtures"), list):
+                    football_payload["fixtures"] = list(football_payload["fixtures"])
+                if (result.payload.requested_scope.get("operation_type") in {"fixture_next", "fixture_last"}
+                        and isinstance(football_payload.get("fixtures"), list)):
+                    football_payload["fixtures"] = [_compact_fixture(item) for item in football_payload["fixtures"] if isinstance(item, dict)]
+                    football_payload["fixtures_projection"] = "Calendar fields only; other fixture details omitted."
                 def serialize_football() -> str:
                     return json.dumps(football_payload, ensure_ascii=False, default=str, separators=(",", ":"))
 
@@ -6581,7 +6873,7 @@ class AIChatCog(commands.Cog):
                         field_name for field_name in reversed(declared_fields)
                         if isinstance(field_name, str)
                         and field_name in football_payload
-                        and field_name not in {"standing_row", "standings_table", "fallback_evidence"}
+                        and field_name not in {"standing_row", "standings_table", "fixtures", "fallback_evidence"}
                         and len(json.dumps(football_payload[field_name], ensure_ascii=False, default=str)) > 80
                     ]
                     if bulky_fields:
@@ -6592,17 +6884,16 @@ class AIChatCog(commands.Cog):
                             "original_items": len(value) if isinstance(value, (list, dict)) else 1,
                             "original_chars": len(str(value)),
                         }
-                    elif isinstance(football_payload.get("standings_table"), list) and len(football_payload["standings_table"]) > 1:
-                        omitted_rows = football_payload["standings_table"].pop()
-                        football_payload["standings_table_omitted_rows"] = int(
-                            football_payload.get("standings_table_omitted_rows", 0)
-                        ) + 1
+                    elif any(isinstance(football_payload.get(key), list) and len(football_payload[key]) > 1 for key in ("fixtures", "standings_table")):
+                        key = next(key for key in ("fixtures", "standings_table")
+                                   if isinstance(football_payload.get(key), list) and len(football_payload[key]) > 1)
+                        football_payload[key].pop()
+                        football_payload[f"{key}_omitted_rows"] = int(football_payload.get(f"{key}_omitted_rows", 0)) + 1
                     else:
                         omission = json.dumps(
                             {"omitted": True, "original_chars": len(serialized_football)}, separators=(",", ":")
                         )
                         return football_prefix + omission if len(football_prefix) + len(omission) <= allowance else ""
-                    football_payload["standings"] = football_payload.get("standings_table", [])
                     serialized_football = serialize_football()
                 row_count, sample_digest, sample_length, compact_sample = AIChatCog._football_standings_diagnostic(
                     result.payload.standings_table
@@ -6659,14 +6950,26 @@ class AIChatCog(commands.Cog):
             return ""
 
         footer = [
-            "Use only the trusted capability results above. Preserve partial, failed, and missing capability states; "
-            "do not claim the request is fully satisfied when the contract says it is not. "
+            "Use grounded capability results for provider-scoped facts. Stable general knowledge and reasoning from supplied premises are allowed. "
+            "Input request fulfillment awaits your assessment; a CHAT awaiting_response is the reply being composed. "
+            "Preserve partial, failed, and missing capability states; "
+            "mark the request fulfilled only when the assessments support every required outcome. "
             "For ambiguous or failed capability results, mention only named fact fields directly present in the typed provider payload; "
             "never infer league membership, aliases, or other attributes."
         ]
         suffix = [*footer, "[/TRUSTED_CAPABILITY_RESULTS]"]
         base = [*prefix, *(line for group in headers for line in group), *suffix]
+        if len("\n".join(base)) > 11000:
+            headers = [[group[0].split(" | reason=", 1)[0]] for group in headers]
+            prefix.append("Detailed result metadata omitted to preserve the complete request contract.")
+            base = [*prefix, *(line for group in headers for line in group), *suffix]
         remaining = max(0, 11000 - len("\n".join(base)))
+        if bundle.reviewed_requirement_ids is not None:
+            review_context = json_context({"assessments": execution_context.requirement_assessments}, min(3500, remaining // 3))
+            if review_context:
+                prefix.append("Evidence review: " + review_context)
+                remaining = max(0, remaining - len(review_context) - len("Evidence review: ") - 1)
+            base = [*prefix, *(line for group in headers for line in group), *suffix]
         rendered = list(prefix)
         content_index = 0
         for header, render in zip(headers, renderers):
@@ -6691,6 +6994,7 @@ class AIChatCog(commands.Cog):
         self,
         *,
         user_prompt: str,
+        message: discord.Message, execute_reads, can_continue,
         execution_context: CapabilityExecutionContext,
         server_context: str,
         author_name: str,
@@ -6748,23 +7052,30 @@ class AIChatCog(commands.Cog):
             "success" if visual_result is not None and visual_result.satisfies_request else "unavailable",
             hash_text(synthesis_prompt),
         )
-        reply = await self.bot.llm_client.chat(
-            server_context=server_context,
-            user_message=user_prompt,
-            trusted_capability_context=capability_context,
-            author_name=author_name,
-            channel_name=getattr(channel, "name", "unknown"),
-            channel_reference=self._channel_reference(channel),
-            available_channels=self._serialize_text_channels(guild),
-            available_emojis=available_emojis,
-            conversation_history=conversation_history,
-            mention_hints=mention_hints,
-            relay_instruction=relay_instruction,
-            is_owner=is_owner,
-            conversation_mode=conversation_mode,
-            image_urls=[],
-            reply_language=reply_language,
-            author_permissions=author_permissions,
+        async def respond(request):
+            return await self.bot.llm_client.respond_with_evidence(
+                response_request={key: value for key, value in request.items() if key != "evidence"},
+                server_context=server_context,
+                user_message=user_prompt,
+                trusted_capability_context=request["evidence"],
+                author_name=author_name,
+                channel_name=getattr(channel, "name", "unknown"),
+                channel_reference=self._channel_reference(channel),
+                available_channels=self._serialize_text_channels(guild),
+                available_emojis=available_emojis,
+                conversation_history=conversation_history,
+                mention_hints=mention_hints,
+                relay_instruction=relay_instruction,
+                is_owner=is_owner,
+                conversation_mode=conversation_mode,
+                image_urls=[],
+                reply_language=reply_language,
+                author_permissions=author_permissions,
+            )
+
+        reply = await self._answer_capability_request(
+            message, execution_context, user_message=user_prompt, conversation_history=conversation_history,
+            response_call=respond, execute_reads=execute_reads, can_continue=can_continue,
         )
         logging.info(
             "AI capability synthesis output_excerpt synthesis_input_hash=%s output_hash=%s output_length=%s excerpt=%s",
@@ -7019,6 +7330,8 @@ class AIChatCog(commands.Cog):
         current_scope: dict[str, object] | None = None,
         resolution_message: discord.Message | None = None,
         direct_chat: dict[str, object] | None = None,
+        execution_context: CapabilityExecutionContext | None = None,
+        can_continue=None,
     ) -> CapabilityExecutionContext:
         # Every native task must carry its own typed operands.  Compatibility
         # routes may still use the legacy projections supplied by the caller.
@@ -7067,25 +7380,29 @@ class AIChatCog(commands.Cog):
             return resolved
 
         def _native_external_source_input(request: object, operands: dict[str, object]) -> dict[str, object]:
-            # required comes from the task itself; the router only emits this task for an explicit source.
+            # Supplemental source reads support an existing requirement instead of owning another user outcome.
             return {
                 **operands,
-                "required": bool(getattr(request, "required", False)),
+                "required": bool(getattr(request, "required", False)) or (
+                    execution_context is not None and getattr(request, "task_id", "") in execution_context.evidence_requirements
+                ),
                 "explicit": True,
                 "evidence_span": getattr(request, "evidence_span", ""),
             }
 
         def _task_objective(request: object, operands: dict[str, object]) -> str | None:
-            for key in ("objective", "prompt", "query", "request"):
+            for key in ("objective", "prompt", "query", "research_question", "request"):
                 value = operands.get(key)
                 if isinstance(value, str) and value.strip():
-                    return " ".join(value.split())[:900]
+                    return value
             task_id = getattr(request, "task_id", None)
+            if execution_context is not None and task_id in execution_context.evidence_requirements:
+                return str(getattr(request, "evidence_span", "") or "")
             for requirement in tuple(getattr(semantic_plan, "requirements", ()) or ()):
                 if getattr(requirement, "owner_task_id", None) == task_id:
                     value = str(getattr(requirement, "objective", "") or "").strip()
                     if value:
-                        return " ".join(value.split())[:900]
+                        return value
             return None
 
         def _task_failure(capability: str, reason: str) -> CapabilityTerminalResult:
@@ -7098,7 +7415,7 @@ class AIChatCog(commands.Cog):
                 satisfies_request=False,
             )
 
-        capability_requests = tuple(getattr(semantic_plan, "capabilities", ()) or ())
+        capability_requests = tuple(execution_plan.ordered_capabilities)
         capability_by_task_id = {
             getattr(item, "task_id", ""): item
             for item in capability_requests
@@ -7170,6 +7487,8 @@ class AIChatCog(commands.Cog):
         async def chat_handler(_request, _context):
             task_operands = _task_operands(_request, _context)
             objective = _task_objective(_request, task_operands)
+            if direct_chat is not None and len(capability_requests) == 1:
+                return normalize_terminal_result("CHAT", "PENDING", provider="orchestrator", reason="awaiting_response")
             if not objective and direct_chat is None:
                 return _task_failure("CHAT", "missing_chat_task_objective")
             bound_lines: list[str] = []
@@ -7437,6 +7756,7 @@ class AIChatCog(commands.Cog):
                 reply_to_trigger=football_reply_to_trigger,
                 create_lease=False,
                 result_only=True,
+                allow_web_fallback=False,
             )
 
         async def minecraft_handler(_request, _context):
@@ -7472,8 +7792,10 @@ class AIChatCog(commands.Cog):
             if native_task_plan and not task_operands:
                 return _task_failure("MEMORY", "missing_memory_task_operands")
             if isinstance(task_operands, dict) and task_operands:
+                # The task's own memory_action is the operation that preflight validated; it always wins.
                 task_action = str(
-                    getattr(_request, "owner_action", None)
+                    task_operands.get("memory_action")
+                    or getattr(_request, "owner_action", None)
                     or (task_decision.action if task_decision is not None else "")
                 ).upper()
                 if not task_action.startswith("SERVER_MEMORY_") and not native_task_plan:
@@ -8125,7 +8447,7 @@ class AIChatCog(commands.Cog):
         }
         if not requested_capabilities.issubset(set(handlers)):
             raise RuntimeError("stage4_result_only_handler_registry_mismatch")
-        execution_context = CapabilityExecutionContext(execution_plan)
+        execution_context = execution_context or CapabilityExecutionContext(execution_plan)
         if prior_typed_context is not None:
             prior_plan, prior_bundle = prior_typed_context
             reusable = reusable_results_for_continuation(
@@ -8138,11 +8460,34 @@ class AIChatCog(commands.Cog):
             )
             for result in reusable.values():
                 execution_context.record(result)
+        async def guarded_read(request, context):
+            if request.task_id in context.evidence_requirements:
+                operands = _task_operands(request, context)
+                typed = {key: value for key, value in operands.items() if key in operand_descriptors(request.name)}
+                if validate_operands(request.name, typed) or operation_effect(replace(request, operands=typed)) != "read":
+                    return _task_failure(request.name, "invalid_bound_investigation_operation")
+                key = evidence_read_key(replace(request, operands=operands))
+                for prior in context.execution_plan.ordered_capabilities:
+                    if prior.task_id in context.results and evidence_read_key(replace(prior, operands=_task_operands(prior, context))) == key:
+                        return _task_failure(request.name, "duplicate_investigation_read")
+            result = await handlers[request.name](request, context)
+            if request.task_id in context.evidence_requirements and isinstance(result.payload, FootballRetrievalResult):
+                scope = {key: value for key, value in result.scope.items() if key != "request_plan"}
+                for prior in context.results.values():
+                    if (scope and prior.status == result.status == CapabilityTerminalStatus.SUCCESS
+                            and isinstance(prior.payload, FootballRetrievalResult)
+                            and scope == {key: value for key, value in prior.scope.items() if key != "request_plan"}
+                            and result.payload.resolved_entities == prior.payload.resolved_entities):
+                        return replace(result, status=CapabilityTerminalStatus.NOT_EXECUTED, payload=None,
+                                       satisfies_request=False, reason=f"duplicate_resolved_read:{prior.task_id}")
+            return result
+
         return await execute_ordered_capabilities(
             specialized_execution_plan,
-            handlers,
+            {name: guarded_read for name in handlers} if can_continue is not None else handlers,
             context=execution_context,
             preflight=mutation_preflight,
+            can_continue=can_continue,
         )
 
     async def _execute_football_action(
@@ -8158,6 +8503,7 @@ class AIChatCog(commands.Cog):
         create_lease: bool = True,
         execution_context: CapabilityExecutionContext | None = None,
         result_only: bool = False,
+        allow_web_fallback: bool = True,
     ) -> object:
         client = getattr(self.bot, "api_football_client", None)
         if client is None:
@@ -8192,12 +8538,21 @@ class AIChatCog(commands.Cog):
         )
         active_football_turn_context = self._valid_football_turn_context(message)
         prior_context = self._football_prior_lease_context(message)
-        operation = compile_football_operation(
-            action,
-            operation_request,
-            plan,
-            prior_context=prior_context,
-        )
+        try:
+            operation = compile_football_operation(
+                action, operation_request, plan, prior_context=prior_context,
+            )
+        except InvalidFootballApiRequest as exc:
+            if not result_only:
+                raise
+            return normalize_terminal_result(
+                "FOOTBALL", "VALIDATION_FAILED", provider="football_compiler", reason=str(exc),
+                payload=FootballRetrievalResult(outcome=FootballOutcome.RESOLUTION_FAILED, notes=[str(exc)],
+                    missing_inputs=["typed_operands"], requested_scope={
+                        "operation_type": (plan or {}).get("operation_family"),
+                        "supplied_team_candidates": (plan or {}).get("team_candidates", []),
+                    }),
+            )
         logging.info(
             "AI football continuation branch input message=%s continuation_lease_present=%s "
             "continuation_lease_active=%s lease_owner_matches_author=%s football_turn_context_active=%s "
@@ -8294,7 +8649,7 @@ class AIChatCog(commands.Cog):
             web_result: WebResearchResult | None = None
             api_outcome = result.outcome
             fallback_used = False
-            fallback_eligible = football_web_fallback_eligible(result)
+            fallback_eligible = allow_web_fallback and football_web_fallback_eligible(result)
             logging.info(
                 "AI football retrieval web fallback decision operation=%s outcome=%s eligible=%s "
                 "missing_inputs=%s ambiguity_count=%s resolved_entities=%s",
@@ -8320,13 +8675,14 @@ class AIChatCog(commands.Cog):
                             user_id=getattr(message.author, "id", None),
                         )
                         if (
-                            str(getattr(candidate_web_result, "answer", "") or "").strip()
+                            not candidate_web_result.failure_reason
+                            and str(getattr(candidate_web_result, "answer", "") or "").strip()
                             and (getattr(candidate_web_result, "sources", ()) or getattr(candidate_web_result, "citations", ()))
                         ):
                             web_result = candidate_web_result
                             result.fallback_evidence = {
                                 "query": fallback_query,
-                                "answer": str(candidate_web_result.answer).strip()[:1400],
+                                "answer": str(candidate_web_result.answer),
                                 "sources": [
                                     {
                                         "title": source.title,
@@ -8544,12 +8900,11 @@ class AIChatCog(commands.Cog):
             )
             return "PROVIDER_FAILURE"
 
-        reply = self._sanitize_visible_ai_output(reply)
         guard_context = football_entity_context or self._football_guard_context_from_operation(operation)
         reply = self._guard_football_entity_reply(reply, guard_context, self._football_prior_lease_context(message), lang)
         sent_message_id = await self._send_long_reply(
             message,
-            self._dearm_mass_mentions(reply),
+            reply,
             reply_to_trigger=reply_to_trigger,
             mention_author=True,
         )
@@ -9768,9 +10123,10 @@ class AIChatCog(commands.Cog):
         author = getattr(getattr(replied_message, "author", None), "display_name", "unknown")
         lines.append(f"Author: {author}")
 
-        content = " ".join(str(getattr(replied_message, "content", "") or "").split())
+        content = str(getattr(replied_message, "content", "") or "")
         if content:
-            lines.append(f"Text: {content[:900]}")
+            excerpt = content if len(content) <= 900 else content[:885] + " [text omitted]"
+            lines.append(f"Text: {excerpt}")
 
         for index, embed in enumerate(getattr(replied_message, "embeds", [])[:2], start=1):
             title = " ".join(str(getattr(embed, "title", "") or "").split())
@@ -10628,7 +10984,7 @@ class AIChatCog(commands.Cog):
             ExternalExpectedContent.UNKNOWN,
         )
         explicit = bool(external_source.get("explicit", False))
-        evidence = " ".join(str(external_source.get("evidence_span", "") or "").split())[:180]
+        evidence = " ".join(str(external_source.get("evidence_span", "") or "").split())
         semantic_reason = " ".join(str(external_source.get("semantic_reason", "") or "").split())[:240]
         failure_reason = " ".join(str(external_source.get("failure_reason", "") or "").split())[:180]
         ambiguous_reason = " ".join(str(external_source.get("ambiguous_reason", "") or "").split())[:180]
@@ -10717,6 +11073,7 @@ class AIChatCog(commands.Cog):
             evidence_span=evidence,
             expected_content=expected_content,
             semantic_reason=semantic_reason,
+            selected_urls=tuple(url for url in evidence_urls if url in authorized_urls),
         )
 
     @staticmethod
@@ -11251,8 +11608,9 @@ class AIChatCog(commands.Cog):
             or bool(getattr(author, "bot", False))
         ):
             return False, ""
-        content = " ".join(str(getattr(replied_message, "content", "") or "").split())
-        return True, content[: self._history_entry_max_chars]
+        content = str(getattr(replied_message, "content", "") or "")
+        excerpt = content if len(content) <= self._history_entry_max_chars else content[:self._history_entry_max_chars - 15] + " [text omitted]"
+        return True, excerpt
 
     def _route_lease_metadata(self, message: discord.Message) -> dict[str, object]:
         lease = self._valid_lease_for_message(message)
@@ -11673,11 +12031,11 @@ class AIChatCog(commands.Cog):
         speaker: str,
         content: str,
     ) -> str | None:
-        cleaned = " ".join(content.strip().split())
-        if not cleaned:
+        cleaned = content
+        if not cleaned.strip():
             return None
         if len(cleaned) > self._history_entry_max_chars:
-            cleaned = cleaned[: self._history_entry_max_chars - 3].rstrip() + "..."
+            cleaned = cleaned[: self._history_entry_max_chars - 15] + " [text omitted]"
         prefixed = f"{speaker}: {cleaned}"
         history = self._conversation_history[key]
         if history:
@@ -11837,127 +12195,7 @@ class AIChatCog(commands.Cog):
             if key[0] == guild_id:
                 del self._football_turn_contexts[key]
 
-    def _sanitize_visible_ai_output(self, text: str) -> str:
-        cleaned = text.strip()
-        if not cleaned:
-            return cleaned
 
-        cleaned = re.sub(
-            r"\[\s*UNTRUSTED[^\]]*\]\s*",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-        cleaned = re.sub(
-            r"(?im)^\s*UNTRUSTED[_\s-]*(?:USER|ASSISTANT|TRANSLATION|MENTION|RELAY)[^\n]*\n?",
-            "",
-            cleaned,
-        )
-        cleaned = re.sub(
-            r"\bUNTRUSTED_(?:USER|ASSISTANT|TRANSLATION|MENTION|RELAY)[A-Z_]*(?:\s+FROM\s+\S+)?\b\s*",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-        cleaned = re.sub(
-            r"\[\s*/?\s*TRUSTED_FOOTBALL_DATA\s*\]\s*",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-        cleaned = re.sub(r"\bTRUSTED_FOOTBALL_DATA\b\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(
-            r"\[\s*/?\s*TRUSTED_WEB_RESULTS\s*\]\s*",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-        cleaned = re.sub(r"\bTRUSTED_WEB_RESULTS\b\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\b(?:web_search|x_search)_tool\b\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(
-            r"(?i)\bdatos\s+confiables\b(?:\s+de\s+\S+)?",
-            "datos",
-            cleaned,
-        )
-        cleaned = re.sub(
-            r"(?i)\b(?:according to|based on)\s+(?:my\s+)?sources[:,]?\s*",
-            "",
-            cleaned,
-        )
-        cleaned = re.sub(
-            r"(?i)\bseg[uú]n\s+(?:mis\s+)?fuentes[:,]?\s*",
-            "",
-            cleaned,
-        )
-        cleaned = re.sub(
-            r"(?i)\bdatos\s+confiables\s+de\s+f[uú]tbol\b",
-            "datos de futbol",
-            cleaned,
-        )
-        cleaned = re.sub(
-            r"(?i)\btrusted\s+(?:football\s+)?data\b",
-            "football data",
-            cleaned,
-        )
-        cleaned = re.sub(r"(?i)\bunavailable\b", "not showing right now", cleaned)
-        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
-        cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
-        return self._strip_bot_speaker_prefix(cleaned)
-
-    def _strip_bot_speaker_prefix(self, text: str) -> str:
-        cleaned = text.strip().strip("`")
-        names = {
-            "nitori",
-            "nitori-buchona",
-            "nitori kawashiro",
-            "bot",
-        }
-        if self.bot.user is not None:
-            if self.bot.user.name:
-                names.add(self.bot.user.name)
-            if self.bot.user.display_name:
-                names.add(self.bot.user.display_name)
-
-        pattern_names = [name.strip() for name in names if name and name.strip()]
-        if not pattern_names:
-            return cleaned
-        pattern_names.sort(key=len, reverse=True)
-        joined = "|".join(re.escape(name) for name in pattern_names)
-        prefix_re = re.compile(
-            rf"^(?:\*\*)?(?:{joined})(?:\*\*)?\s*[:\-]\s*",
-            flags=re.IGNORECASE,
-        )
-        while True:
-            updated = prefix_re.sub("", cleaned, count=1).lstrip()
-            if updated == cleaned:
-                break
-            cleaned = updated
-
-        inline_label_re = re.compile(
-            rf"(?:(?<=\s)|^)(?:\*\*)?(?:{joined})(?:\*\*)?\s*[:\-]\s*",
-            flags=re.IGNORECASE,
-        )
-        cleaned = inline_label_re.sub(" ", cleaned)
-
-        if self.bot.user is not None:
-            mention_label_re = re.compile(
-                rf"<@!?{self.bot.user.id}>\s*[:\-]\s*",
-                flags=re.IGNORECASE,
-            )
-            cleaned = mention_label_re.sub("", cleaned)
-
-            for bot_name in (self.bot.user.name, self.bot.user.display_name):
-                if not bot_name:
-                    continue
-                plain_at_label_re = re.compile(
-                    rf"@{re.escape(bot_name)}\s*[:\-]\s*",
-                    flags=re.IGNORECASE,
-                )
-                cleaned = plain_at_label_re.sub("", cleaned)
-
-        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-        return cleaned
 
     @staticmethod
     def _bounded_diagnostic_excerpt(
@@ -11981,32 +12219,35 @@ class AIChatCog(commands.Cog):
 
     @staticmethod
     def _split_for_discord(text: str, *, limit: int) -> list[str]:
-        cleaned = text.strip()
-        if not cleaned:
+        if not text:
             return []
         chunks: list[str] = []
-        remaining = cleaned
-        while len(remaining) > limit:
-            cut = remaining.rfind("\n", 0, limit)
-            if cut < int(limit * 0.5):
-                cut = remaining.rfind(" ", 0, limit)
-            if cut < int(limit * 0.5):
-                cut = limit
-            piece = remaining[:cut].rstrip()
-            if piece:
-                chunks.append(piece)
-            remaining = remaining[cut:].lstrip()
-        if remaining:
-            chunks.append(remaining)
+        remaining = text
+        fence = ""
+        marker = ""
+        closing_size = max((len(match.group(1)) for match in re.finditer(r"(?m)^ {0,3}(`{3,}|~{3,})", text)), default=3) + 1
+        while remaining:
+            prefix = fence + "\n" if fence else ""
+            if len(prefix) + len(remaining) <= limit:
+                chunks.append(prefix + remaining)
+                break
+            available = max(1, limit - len(prefix) - closing_size)
+            cut = remaining.rfind("\n", 0, available) + 1
+            if not cut:
+                cut = remaining.rfind(" ", 0, available) + 1 or available
+            if cut < available // 2:
+                cut = available
+            piece, remaining = remaining[:cut], remaining[cut:]
+            for match in re.finditer(r"(?m)^ {0,3}(`{3,}|~{3,})([^\r\n]*)", piece):
+                token, language = match.groups()
+                if not fence and len(token + language) + len(token) + 2 < limit:
+                    fence, marker = token + language, token
+                elif token[0] == marker[0] and len(token) >= len(marker) and not language.strip():
+                    fence = marker = ""
+            suffix = ("" if piece.endswith("\n") else "\n") + marker if fence else ""
+            chunks.append(prefix + piece + suffix)
         return chunks
 
-    @staticmethod
-    def _dearm_mass_mentions(text: str) -> str:
-        if not text:
-            return text
-        updated = re.sub(r"@(?=everyone\b)", "@\u200beveryone", text, flags=re.IGNORECASE)
-        updated = re.sub(r"@(?=here\b)", "@\u200bhere", updated, flags=re.IGNORECASE)
-        return updated
 
     @staticmethod
     async def _get_replied_message(message: discord.Message) -> discord.Message | None:
@@ -12091,304 +12332,7 @@ class AIChatCog(commands.Cog):
         )
         return any(marker in message for marker in markers)
 
-    async def _normalize_discord_references(
-        self, text: str, guild: discord.Guild | None
-    ) -> str:
-        if guild is None:
-            return text
 
-        user_prefixed = re.compile(r"(?<!<)@(\d{15,22})(?!>)")
-        channel_prefixed = re.compile(r"(?<!<)#(\d{15,22})(?!>)")
-        user_name_prefixed = re.compile(r"(?<![<\w])@([^\s@#<>]{1,64})")
-        channel_name_prefixed = re.compile(r"(?<![<\w])#([^\s@#<>]{1,100})")
-        malformed_user_angle = re.compile(r"<@!?([^\s@#<>]{1,64})>")
-        malformed_user_angle_loose = re.compile(r"<@!?([^<>]{1,80})>")
-        malformed_channel_angle = re.compile(r"<#([^\s@#<>]{1,100})>")
-        bare_id = re.compile(r"(?<![@#<])\b(\d{15,22})\b(?!>)")
-
-        text = user_prefixed.sub(lambda m: f"<@{m.group(1)}>", text)
-        text = channel_prefixed.sub(lambda m: f"<#{m.group(1)}>", text)
-
-        member_map: dict[str, int] = {}
-        member_compact_candidates: list[tuple[str, int]] = []
-        seen_compact_pairs: set[tuple[str, int]] = set()
-
-        def register_member_candidate(member_id: int, candidate: str | None) -> None:
-            if not isinstance(candidate, str):
-                return
-            direct_key = self._normalize_lookup_key(candidate)
-            if direct_key and direct_key not in member_map:
-                member_map[direct_key] = member_id
-            compact_key = self._compact_lookup_key(candidate)
-            if compact_key:
-                if compact_key not in member_map:
-                    member_map[compact_key] = member_id
-                pair = (compact_key, member_id)
-                if pair not in seen_compact_pairs:
-                    seen_compact_pairs.add(pair)
-                    member_compact_candidates.append(pair)
-
-        for member in guild.members:
-            candidates = [member.name, member.display_name]
-            global_name = getattr(member, "global_name", None)
-            if isinstance(global_name, str):
-                candidates.append(global_name)
-            for candidate in candidates:
-                register_member_candidate(member.id, candidate)
-
-        channel_map: dict[str, int] = {}
-        for channel in guild.text_channels:
-            direct_key = self._normalize_lookup_key(channel.name)
-            if direct_key and direct_key not in channel_map:
-                channel_map[direct_key] = channel.id
-            compact_key = self._compact_lookup_key(channel.name)
-            if compact_key and compact_key not in channel_map:
-                channel_map[compact_key] = channel.id
-
-        def fuzzy_member_id(compact_query: str) -> int | None:
-            if len(compact_query) < 3:
-                return None
-            by_member_id: dict[int, float] = {}
-            for compact_key, member_id in member_compact_candidates:
-                base = difflib.SequenceMatcher(None, compact_query, compact_key).ratio()
-                bonus = 0.0
-                if compact_query == compact_key:
-                    bonus += 0.45
-                if compact_query in compact_key:
-                    bonus += 0.25
-                elif compact_key in compact_query:
-                    bonus += 0.10
-                if compact_key.startswith(compact_query) or compact_query.startswith(compact_key):
-                    bonus += 0.08
-                score = base + bonus
-                if score > by_member_id.get(member_id, 0.0):
-                    by_member_id[member_id] = score
-
-            if not by_member_id:
-                return None
-            ranked = sorted(by_member_id.items(), key=lambda kv: kv[1], reverse=True)
-            best_id, best_score = ranked[0]
-            second_score = ranked[1][1] if len(ranked) > 1 else 0.0
-            if best_score >= 0.78 and (best_score - second_score >= 0.07 or best_score >= 1.05):
-                return best_id
-            return None
-
-        def resolve_member_id_from_token(token_raw: str) -> int | None:
-            for candidate in self._candidate_user_queries(token_raw):
-                direct_key = self._normalize_lookup_key(candidate)
-                compact_key = self._compact_lookup_key(candidate)
-                resolved = member_map.get(direct_key) or member_map.get(compact_key)
-                if resolved is not None:
-                    return resolved
-                if compact_key:
-                    fuzzy = fuzzy_member_id(compact_key)
-                    if fuzzy is not None:
-                        if direct_key:
-                            member_map[direct_key] = fuzzy
-                        if compact_key:
-                            member_map[compact_key] = fuzzy
-                        return fuzzy
-            return None
-
-        unresolved_user_tokens: set[str] = set()
-        for match in user_name_prefixed.finditer(text):
-            token_core, _ = self._split_token(match.group(1))
-            if not token_core:
-                continue
-            if token_core.lower() in {"everyone", "here"}:
-                continue
-            direct_key = self._normalize_lookup_key(token_core)
-            compact_key = self._compact_lookup_key(token_core)
-            if direct_key and direct_key in member_map:
-                continue
-            if compact_key and compact_key in member_map:
-                continue
-            unresolved_user_tokens.add(token_core)
-        for match in malformed_user_angle.finditer(text):
-            token = match.group(1)
-            if token.isdigit():
-                continue
-            token_core, _ = self._split_token(token)
-            if not token_core:
-                continue
-            if token_core.lower() in {"everyone", "here"}:
-                continue
-            direct_key = self._normalize_lookup_key(token_core)
-            compact_key = self._compact_lookup_key(token_core)
-            if direct_key and direct_key in member_map:
-                continue
-            if compact_key and compact_key in member_map:
-                continue
-            unresolved_user_tokens.add(token_core)
-        for match in malformed_user_angle_loose.finditer(text):
-            token = match.group(1).strip()
-            if not token or token.isdigit():
-                continue
-            unresolved_user_tokens.add(token)
-
-        for token in list(unresolved_user_tokens)[:6]:
-            resolved_id = resolve_member_id_from_token(token)
-            if resolved_id is None:
-                resolved_id = await self._query_member_id(guild, token)
-            if resolved_id is None:
-                continue
-            for candidate in self._candidate_user_queries(token):
-                register_member_candidate(resolved_id, candidate)
-
-        def resolve_user_name(match: re.Match[str]) -> str:
-            token = match.group(1)
-            token_core, suffix = self._split_token(token)
-            if not token_core:
-                return match.group(0)
-            if token_core.lower() in {"everyone", "here"}:
-                return match.group(0)
-            member_id = resolve_member_id_from_token(token_core)
-            if member_id is None:
-                return match.group(0)
-            return f"<@{member_id}>{suffix}"
-
-        def resolve_channel_name(match: re.Match[str]) -> str:
-            token = match.group(1)
-            token_core, suffix = self._split_token(token)
-            if not token_core:
-                return match.group(0)
-            direct_key = self._normalize_lookup_key(token_core)
-            compact_key = self._compact_lookup_key(token_core)
-            channel_id = channel_map.get(direct_key) or channel_map.get(compact_key)
-            if channel_id is None:
-                return match.group(0)
-            return f"<#{channel_id}>{suffix}"
-
-        def resolve_malformed_user(match: re.Match[str]) -> str:
-            token = match.group(1)
-            if token.isdigit():
-                return f"<@{token}>"
-            token_core, suffix = self._split_token(token)
-            if not token_core:
-                return match.group(0)
-            if token_core.lower() in {"everyone", "here"}:
-                return match.group(0)
-            member_id = resolve_member_id_from_token(token_core)
-            if member_id is None:
-                return match.group(0)
-            return f"<@{member_id}>{suffix}"
-
-        def resolve_malformed_user_loose(match: re.Match[str]) -> str:
-            token = match.group(1).strip()
-            if not token:
-                return match.group(0)
-            if token.isdigit():
-                return f"<@{token}>"
-            member_id = resolve_member_id_from_token(token)
-            if member_id is None:
-                return match.group(0)
-            return f"<@{member_id}>"
-
-        def resolve_malformed_channel(match: re.Match[str]) -> str:
-            token = match.group(1)
-            if token.isdigit():
-                return f"<#{token}>"
-            token_core, suffix = self._split_token(token)
-            if not token_core:
-                return match.group(0)
-            direct_key = self._normalize_lookup_key(token_core)
-            compact_key = self._compact_lookup_key(token_core)
-            channel_id = channel_map.get(direct_key) or channel_map.get(compact_key)
-            if channel_id is None:
-                return match.group(0)
-            return f"<#{channel_id}>{suffix}"
-
-        text = user_name_prefixed.sub(resolve_user_name, text)
-        text = channel_name_prefixed.sub(resolve_channel_name, text)
-        text = malformed_user_angle.sub(resolve_malformed_user, text)
-        text = malformed_user_angle_loose.sub(resolve_malformed_user_loose, text)
-        text = malformed_channel_angle.sub(resolve_malformed_channel, text)
-
-        def resolve_bare(match: re.Match[str]) -> str:
-            raw = match.group(1)
-            try:
-                snowflake = int(raw)
-            except ValueError:
-                return raw
-
-            channel = guild.get_channel(snowflake)
-            if channel is None and hasattr(guild, "get_thread"):
-                channel = guild.get_thread(snowflake)
-            if channel is not None:
-                return f"<#{snowflake}>"
-
-            member = guild.get_member(snowflake)
-            if member is not None:
-                return f"<@{snowflake}>"
-            return raw
-
-        text = bare_id.sub(resolve_bare, text)
-        text = self._normalize_custom_emoji_mentions(text, guild)
-        return self._dedupe_repeated_mentions(text)
-
-    @staticmethod
-    def _normalize_custom_emoji_mentions(text: str, guild: discord.Guild) -> str:
-        emojis: list[discord.Emoji] = [
-            emoji for emoji in guild.emojis if emoji.available and emoji.is_usable()
-        ]
-        if not emojis:
-            return text
-
-        emoji_map: dict[str, discord.Emoji] = {}
-        emoji_by_id: dict[int, discord.Emoji] = {}
-        for emoji in emojis:
-            key = AIChatCog._normalize_lookup_key(emoji.name)
-            if key and key not in emoji_map:
-                emoji_map[key] = emoji
-            emoji_by_id[emoji.id] = emoji
-
-        if not emoji_map and not emoji_by_id:
-            return text
-
-        full_emoji = re.compile(r"<a?:([A-Za-z0-9_]{2,32}):(\d{15,22})>")
-        malformed_angle = re.compile(r"<(a?):([A-Za-z0-9_]{2,32})>")
-        shortcode = re.compile(r"(?<!<):([A-Za-z0-9_]{2,32}):(?!\d)")
-
-        def to_emoji_token(emoji: discord.Emoji) -> str:
-            prefix = "a" if emoji.animated else ""
-            return f"<{prefix}:{emoji.name}:{emoji.id}>"
-
-        def resolve_full_emoji(match: re.Match[str]) -> str:
-            name = match.group(1)
-            raw_id = match.group(2)
-            try:
-                emoji_id = int(raw_id)
-            except ValueError:
-                return match.group(0)
-
-            emoji = emoji_by_id.get(emoji_id)
-            if emoji is None:
-                key = AIChatCog._normalize_lookup_key(name)
-                emoji = emoji_map.get(key)
-            if emoji is None:
-                return match.group(0)
-            return to_emoji_token(emoji)
-
-        def resolve_malformed_angle(match: re.Match[str]) -> str:
-            name = match.group(2)
-            key = AIChatCog._normalize_lookup_key(name)
-            emoji = emoji_map.get(key)
-            if emoji is None:
-                return match.group(0)
-            return to_emoji_token(emoji)
-
-        def resolve_shortcode(match: re.Match[str]) -> str:
-            name = match.group(1)
-            key = AIChatCog._normalize_lookup_key(name)
-            emoji = emoji_map.get(key)
-            if emoji is None:
-                return match.group(0)
-            return to_emoji_token(emoji)
-
-        text = full_emoji.sub(resolve_full_emoji, text)
-        text = malformed_angle.sub(resolve_malformed_angle, text)
-        text = shortcode.sub(resolve_shortcode, text)
-        return text
 
     @staticmethod
     async def _query_member_id(guild: discord.Guild, token: str) -> int | None:
@@ -12502,17 +12446,6 @@ class AIChatCog(commands.Cog):
                 push(tok)
         return candidates[:8]
 
-    @staticmethod
-    def _dedupe_repeated_mentions(text: str) -> str:
-        user_dup = re.compile(r"(<@!?(\d{15,22})>)([\s\.,;:!?-]{0,10})<@!?\2>")
-        channel_dup = re.compile(r"(<#(\d{15,22})>)([\s\.,;:!?-]{0,10})<#\2>")
-        while True:
-            updated, user_count = user_dup.subn(r"\1\3", text)
-            updated, channel_count = channel_dup.subn(r"\1\3", updated)
-            text = updated
-            if user_count + channel_count == 0:
-                break
-        return text
 
     @staticmethod
     def _serialize_text_channels(guild: discord.Guild) -> list[str]:

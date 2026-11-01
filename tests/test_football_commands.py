@@ -362,7 +362,7 @@ class FootballQueryCompilerTests(unittest.TestCase):
                 "data_focus": "odds_bets",
                 "fixture_focus": "pre_match",
                 "date_hint": "2026-09-04",
-                "team_candidates": ["Alpha FC", "Beta FC"],
+                "team_candidates": ["Alpha FC"],
             },
         )
 

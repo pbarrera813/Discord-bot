@@ -1132,6 +1132,14 @@ class FootballOperationService:
         if operation.operation_type == "fixture_next" and str(data_focus or "").casefold() in {"next_match", "single_next_match"}:
             result.fixtures = _nearest_fixture(result.fixtures)
         result.endpoints.append("/fixtures")
+        result.requested_scope["fixture_selection"] = {
+            "league_id": league_id, "season": season, "team_id": team_id,
+            "date": calendar_date, "round": operation.fixture_round,
+            "direction": "last" if operation.operation_type == "fixture_last" else "next",
+            "requested_count": fixture_count if calendar_date is None and operation.fixture_round is None else None,
+            "returned_count": len(result.fixtures),
+            "completeness": "calendar_slice" if calendar_date is not None or operation.fixture_round is not None else "bounded_sample",
+        }
         if not result.fixtures and (team_id is not None or league_id is not None):
             result.outcome = FootballOutcome.NO_DATA_FOR_SCOPE
             result.notes.append("fixture_list_missing_for_scope")

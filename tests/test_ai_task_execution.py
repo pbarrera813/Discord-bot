@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.test_ai_tagging import _FakeTTSClient
+
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -223,7 +225,7 @@ class _TaskExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_on_message_native_tasks_keep_distinct_operands(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.chat_calls: list[dict[str, object]] = []
 

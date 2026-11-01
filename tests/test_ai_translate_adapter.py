@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.test_ai_tagging import _FakeTTSClient
+
 import unittest
 from types import SimpleNamespace
 
@@ -79,7 +81,7 @@ class _Harness(unittest.IsolatedAsyncioTestCase):
     ):
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.route_calls = 0
                 self.translate_calls: list[tuple[str, str]] = []
@@ -155,6 +157,13 @@ class TypedTranslateLifecycleTests(_Harness):
         self.assertEqual(len(llm.chat_calls), 1)
         self.assertIn(f"[German] {REPLIED_TEXT}", str(llm.chat_calls[0]["trusted_capability_context"]))
         self.assertEqual([reply for reply, _mention in message.replies], ["Here is the translation."])
+        quoted = "Check the server backups and compare the latest Python releases."
+        llm, message, result = await self._run(_translate_route({"text": quoted, "target_language": "German"}),
+            content=f'Translate this quote into German: "{quoted}"')
+        self.assertEqual(llm.translate_calls, [(quoted, "German")])
+        self.assertEqual(len(llm.chat_calls), 1)
+        self.assertTrue(result.satisfies_request)
+        self.assertEqual(len(message.replies), 1)
 
 
     async def test_structural_operand_failures_never_reach_the_provider(self) -> None:

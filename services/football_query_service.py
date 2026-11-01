@@ -261,6 +261,17 @@ def build_operation(route_action: str, request: str, plan: dict[str, Any] | None
     return compile_football_operation(route_action, request, plan)
 
 
+# Families whose own name is not a data_focus the compiler understands (see _operation_type).
+_FAMILY_FOCUS = {
+    "fixture_next": "next_fixtures", "fixture_last": "last_fixtures", "fixture_result": "summary",
+    "fixture_events": "events", "fixture_lineups": "lineups", "fixture_statistics": "statistics",
+    "fixture_prediction": "prediction", "fixture_odds_pre_match": "pre_match_odds", "fixture_odds_live": "live_odds",
+    "fixture_shootout": "shootout", "fixture_shootout_attempts": "shootout_attempts",
+    "fixture_statistics_half": "half_statistics", "fixture_statistics_half_comparison": "half_statistics",
+    "team_profile": "team", "top_scorers": "scorers", "team_injuries": "injuries", "team_transfers": "transfers",
+}
+
+
 def compile_football_operation(
     route_action: str,
     request: str,
@@ -268,7 +279,12 @@ def compile_football_operation(
     prior_context: str | None = None,
 ) -> FootballQueryOperation:
     typed_plan = isinstance(plan, dict) and str(plan.get("semantic_source", "")).strip().lower() == "router"
-    date_correction_only = not typed_plan and bool(prior_context) and _request_is_date_correction_only(request)
+    family = _text(plan, "operation_family") if typed_plan else None
+    family = family if family in OPERATION_TYPES - {"unknown"} else None
+    if family and _operation_type("", _text(plan, "data_focus"), "") != family:
+        # The typed family is the validated selector; data_focus only refines it when it compiles to that family.
+        plan = {**plan, "data_focus": _FAMILY_FOCUS.get(family, family)}
+    date_correction_only =not typed_plan and bool(prior_context) and _request_is_date_correction_only(request)
     parsed_player = football_resolver.parse_player_query(request) if not typed_plan else football_resolver.parse_player_query("")
     structured_player = (
         _StructuredPlayerExtraction()
@@ -320,6 +336,8 @@ def compile_football_operation(
         data_focus = "summary"
     route = _route_action_for_focus(route_action, data_focus)
     operation_type = _operation_type(route, data_focus, request if not typed_plan else "", bool(player_candidates))
+    if operation_type == "unknown" and family in OPERATION_TYPES:
+        operation_type = family
     planned_fixture_focus = _text(plan, "fixture_focus")
     fixture_focus = planned_fixture_focus
     if typed_plan and str(data_focus or "").casefold() in {"venue", "stadium", "team_venue"}:
@@ -557,6 +575,8 @@ def compile_football_operation(
         player_slots=player_slots,
         capability_intent=capability_intent,
         semantic_source="router" if typed_plan else "compatibility",
+        fixture_count=_int(plan, "fixture_count"),
+        fixture_round=_text(plan, "fixture_round"),
     )
 
 
@@ -575,8 +595,12 @@ _TWO_TEAM_OPERATIONS = {
 }
 
 
+def football_team_candidate_limit(operation_type: str) -> int:
+    return 2 if operation_type in _TWO_TEAM_OPERATIONS else 1
+
+
 def _validate_typed_team_arity(operation_type: str, candidates: list[str]) -> list[str]:
-    maximum = 2 if operation_type in _TWO_TEAM_OPERATIONS else 1
+    maximum = football_team_candidate_limit(operation_type)
     if len(candidates) <= maximum:
         return candidates
     logging.info(
@@ -585,7 +609,9 @@ def _validate_typed_team_arity(operation_type: str, candidates: list[str]) -> li
         len(candidates),
         maximum,
     )
-    return []
+    raise InvalidFootballApiRequest(
+        f"invalid_team_arity: operation={operation_type} maximum={maximum} candidates={candidates!r}"
+    )
 
 
 def _slot_metadata(

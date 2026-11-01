@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.test_ai_tagging import _FakeTTSClient
+
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -313,7 +315,7 @@ class MemoryLifecycleEndToEndTests(unittest.IsolatedAsyncioTestCase):
     async def _run(self, route: dict[str, object], db: _MemoryDb, *, admin: bool):
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori", bot=True)
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.route_calls = 0
                 self.chat_calls: list[dict[str, object]] = []

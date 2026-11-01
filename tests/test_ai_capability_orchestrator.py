@@ -254,7 +254,7 @@ class CapabilityPlanTests(unittest.TestCase):
         context.record(normalize_terminal_result("WEB", "SUCCESS", provider="web", task_id="web_a", satisfies_request=True))
         self.assertEqual(set(context.bundle.by_task), {"web_a"})
         self.assertFalse(context.bundle.complete)
-        self.assertEqual(context.bundle.missing, ("web_b",))
+        self.assertEqual(context.bundle.missing, ("web_a_req", "web_b_req"))
 
     def test_missing_mutation_preflight_does_not_block_independent_reads(self) -> None:
         payload = {
@@ -804,7 +804,7 @@ class CapabilityPlanTests(unittest.TestCase):
             "time_scope": "specific_date",
             "stat_focus": "goals",
             "player_candidates": ["Player A"],
-            "team_candidates": ["Team A", "Team B"],
+            "team_candidates": ["Team A"],
             "coach_candidates": ["Coach A"],
             "venue_candidates": ["Venue A"],
             "league_candidates": ["League A"],
@@ -952,10 +952,12 @@ class CapabilityPlanTests(unittest.TestCase):
 
         self.assertFalse(context.bundle.complete)
         self.assertFalse(context.bundle.satisfied)
-        self.assertEqual(context.bundle.missing, ("FOOTBALL",))
+        self.assertEqual(context.bundle.missing, ("req_EXTERNAL_SOURCE", "req_FOOTBALL"))
 
         context.record(normalize_terminal_result("FOOTBALL", "SELECTED", provider="api-football", task_id="FOOTBALL"))
         self.assertTrue(context.bundle.complete)
+        self.assertFalse(context.bundle.satisfied)
+        context.requirement_assessments = {item.requirement_id: {"status": "supported"} for item in plan.requirements}
         self.assertTrue(context.bundle.satisfied)
 
     def test_result_collector_rejects_undeclared_capability(self) -> None:
@@ -1011,7 +1013,7 @@ class CapabilityPlanTests(unittest.TestCase):
 
         self.assertEqual(calls, ["EXTERNAL_SOURCE", "IMAGE_ANALYZE"])
         self.assertTrue(context.bundle.complete)
-        self.assertTrue(context.bundle.satisfied)
+        self.assertFalse(context.bundle.satisfied)
         self.assertEqual(context.bundle.by_capability["EXTERNAL_SOURCE"].provenance["url_hash"], "source_a")
         self.assertEqual(context.bundle.by_capability["IMAGE_ANALYZE"].provenance["from_capability"], "EXTERNAL_SOURCE")
 
@@ -1046,7 +1048,7 @@ class CapabilityPlanTests(unittest.TestCase):
         self.assertEqual(calls, ["EXTERNAL_SOURCE"])
         self.assertFalse(context.bundle.satisfied)
         self.assertEqual(context.bundle.by_capability["IMAGE_ANALYZE"].status, CapabilityTerminalStatus.NOT_EXECUTED)
-        self.assertEqual(context.bundle.missing, ("EXTERNAL_SOURCE", "IMAGE_ANALYZE"))
+        self.assertEqual(context.bundle.missing, ("req_EXTERNAL_SOURCE", "req_IMAGE_ANALYZE"))
 
 
     def test_semantic_failure_cannot_become_satisfied_from_compatibility_chat(self) -> None:
@@ -1117,7 +1119,7 @@ class CapabilityPlanTests(unittest.TestCase):
             context.record(reused)
         asyncio.run(execute_ordered_capabilities(current, {"IMAGE_ANALYZE": handler}, context=context))
         self.assertEqual(calls, [])
-        self.assertTrue(context.bundle.satisfied)
+        self.assertFalse(context.bundle.satisfied)
 
     def test_typed_result_reuse_requires_matching_scope_freshness_and_authorization(self) -> None:
         def make_plan(objective: str):

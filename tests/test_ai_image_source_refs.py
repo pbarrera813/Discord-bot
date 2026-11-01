@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.test_ai_tagging import _FakeTTSClient
+
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -27,7 +29,7 @@ class ImageSourceRefsTests(unittest.IsolatedAsyncioTestCase):
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
         route_metadata: dict[str, object] = {}
 
-        class LLM:
+        class LLM(_FakeTTSClient):
             async def route_ai_interaction(self, **kwargs):
                 route_metadata.update(kwargs["image_metadata"])
                 ref = route_metadata["image_sources"][0]["ref"]

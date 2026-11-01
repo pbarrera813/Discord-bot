@@ -43,6 +43,8 @@ class NativeTaskSchemaTests(unittest.TestCase):
             {"requirement_id": "rb", "objective": "b", "required": True, "satisfaction_criterion": "b", "capability_owner": "CHAT", "owner_task_id": "b", "depends_on": []},
         ]}
         self.assertIsNone(validate_native_capability_contract({"capability_plan": raw}))
+        normalized = normalize_capability_plan(raw, action="CHAT")
+        self.assertNotIn("requires_evidence_review", normalized.to_payload())
         execution = build_capability_execution_plan(normalize_capability_plan(raw, action="CHAT"), fallback_action="CHAT")
         async def handler(request, _context):
             return normalize_terminal_result("CHAT", "SUCCESS", provider="test", task_id=request.task_id, satisfies_request=True)
@@ -67,6 +69,14 @@ class NativeTaskSchemaTests(unittest.TestCase):
 
         task["operands"] = {"address": "one.example", "selection_count": 1}
         self.assertEqual(validate_native_capability_contract({"capability_plan": raw}), "inconsistent_capability_plan")
+        raw["objective"] = "Read the requested fixtures"
+        raw["requirements"][0]["capability_owner"] = "FOOTBALL"
+        task.update(name="FOOTBALL", requested_outputs=["result"], operands={
+            "operation_family": "fixture_next", "fixture_count": 50, "fixture_round": "Opening - 17"})
+        self.assertIsNone(validate_native_capability_contract({"capability_plan": raw}))
+        for count in (0, 51, True, "50"):
+            task["operands"]["fixture_count"] = count
+            self.assertEqual(validate_native_capability_contract({"capability_plan": raw}), "inconsistent_capability_plan")
 
 
     def test_delivery_artifacts_require_explicit_declared_producer_binding(self):

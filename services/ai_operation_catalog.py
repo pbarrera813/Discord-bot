@@ -9,7 +9,7 @@ from typing import Any, Mapping
 from services.database import BIRTHDAY_EVENT_TYPES
 from services.football_query_service import OPERATION_TYPES
 from services.glot import RUN_FILENAMES
-from services.server_memory import MEMORY_STATUSES
+from services.server_memory import MEMORY_STATUSES, MEMORY_TYPES
 
 
 ADMIN_READ_OPERATIONS = frozenset({"join_stats", "leave_stats", "list_warnings", "user_info", "ai_channel_list", "server_context_view", "color_list", "help"})
@@ -264,6 +264,7 @@ OPERAND_DESCRIPTORS: dict[str, dict[str, OperandDescriptor]] = {
         "bookmaker_candidates": _strings(), "bet_candidates": _strings(),
         "reference_query": _string(120), "country_filter": _string(20, enum=frozenset({"name", "code", "search"})),
         "reference_page": _integer(minimum=1),
+        "fixture_count": _integer(minimum=1, maximum=50), "fixture_round": _string(100),
     },
     "MINECRAFT": {"address": _string(255)},
     "NINJAS": {
@@ -456,3 +457,126 @@ def operation_effect(request: Any) -> str | None:
     if family in {"CHAT", "MINECRAFT", "TRANSLATE", "WEB", "EXTERNAL_SOURCE", "IMAGE_ANALYZE", "CLARIFICATION"}:
         return "read"
     return None
+
+
+# One native function per capability family: the function name is the family and its parameters are that family's
+# own operands, so Grok never fills another family's fields and its arguments reach the adapter unchanged.
+TOOL_DESCRIPTIONS = {
+    "FOOTBALL": (
+        "API-Football data: fixtures, live matches, events, lineups, statistics, standings, teams, squads, players, "
+        "coaches, venues, rounds, predictions, odds, injuries, transfers, trophies, top scorers, and starting or "
+        "stopping live match updates in this channel (live_watch_start/live_watch_stop, only when explicitly asked). "
+        "operation_family and data_focus are executable selectors. Candidates are names as the user wrote them, "
+        "resolved by the provider: team_candidates holds exactly one name per actual participant, in user order. "
+        "Use fixture_count for a bounded next/last sample and fixture_round only for an exact provider round name. "
+        "On AMBIGUOUS or NOT_FOUND, retry with a better name or show the candidates to the user."
+    ),
+    "WEB": "Current or broad web research with citations; put the complete question in research_question.",
+    "EXTERNAL_SOURCE": (
+        "Read a link the user posted in the current message or in the message they replied to. url is that exact "
+        "link; make one call per link you need. source_scope is CURRENT_MESSAGE, REPLY_TARGET or BOTH; "
+        "expected_content is TEXT, MEDIA or MULTIMODAL; operation is SUMMARIZE, EXPLAIN, COMPARE, EXTRACT, "
+        "ANALYZE, VERIFY or OTHER."
+    ),
+    "IMAGE_GENERATE": "Create a new image from prompt.",
+    "IMAGE_EDIT": (
+        "Change an existing image itself. Pick it with source_refs (exactly one ref from the available images) or "
+        "with inputs (the artifact of an earlier image call or the media of an EXTERNAL_SOURCE call); prompt "
+        "describes the change. A caption on a picture is MEME custom, not an edit."
+    ),
+    "IMAGE_ANALYZE": (
+        "Look at images and report what is actually in them. Pick them with source_refs (refs from the available "
+        "images) or inputs (an earlier image call's artifact, or the media of an EXTERNAL_SOURCE or WEB call); "
+        "purpose says what to look for; selection_count is how many images (1-4)."
+    ),
+    "MEME": (
+        "Make a captioned meme image. meme_action template (meme_template exactly as the user named it), random, "
+        "or custom (the user's picture chosen with one ref in source_refs). Write meme_top/meme_bottom yourself in "
+        "the request's language, or the user's exact words when they dictated the text."
+    ),
+    "CODE": (
+        "Run a program on the remote sandbox and get its stdout, stderr and error: code_action run with "
+        "code_language and code (the user's code, or code you wrote for the request), or code_action languages."
+    ),
+    "REMINDER": (
+        "The author's own reminders: create (reminder_duration like 10m, 2h, 3d, 1w, 2mo or 1y, and "
+        "reminder_message), list, or remove (reminder_id shown by a listed reminder). Never invent a duration or id."
+    ),
+    "BIRTHDAY": (
+        "Birthday profiles and settings. show (the author's own), view (another member: target_user_id or "
+        "target_user_candidates), next (optional birthday_count 1-25), set (birth_month, birth_day, optional "
+        "birth_year) and remove act only on the author. Administrator-only settings: setup, set_channel, set_role, "
+        "set_timezone (IANA name), set_mode (user or server), set_ages, event, preview, template_add, template_list, "
+        "template_remove, blacklist_user, blacklist_role, trusted. Never invent a date, channel, role or id."
+    ),
+    "NINJAS": (
+        "API Ninjas lookups: joke, dadjoke, advice, whois (domain), unit_conversion (amount, from_unit and to_unit "
+        "as singular lowercase unit names)."
+    ),
+    "MINECRAFT": "Current status of a Minecraft server; address exactly as the user gave it.",
+    "MEMORY": (
+        "Structured server memory. SERVER_MEMORY_LOOKUP retrieves saved facts (memory_type null unless the user "
+        "named a category). SERVER_MEMORY_WRITE/UPDATE only when the user clearly wants something remembered, never "
+        "for jokes or banter; when a memory is about one member, subject is that member's name, mention or id and "
+        "value is a complete standalone statement. SERVER_MEMORY_DELETE names memory_id when known, otherwise "
+        "memory_type and subject. SERVER_MEMORY_LIST, APPROVE and REJECT use memory_id from a listed result. "
+        "Behavior rules (memory_type BOT_BEHAVIOR_RULE) need authority to manage bot behavior. memory_type is one "
+        f"of: {', '.join(sorted(MEMORY_TYPES))}."
+    ),
+    "ADMIN": (
+        "Discord moderation and server settings; the runtime checks the author's real permissions. Name members in "
+        "target_user_candidates (or target_user_id), roles in target_role_candidates, existing channels in "
+        "target_channel (id or name; the current channel's id for 'this channel'), a new channel in channel_name. "
+        "create_role takes role_name and role_color_hex (#rrggbb); a channel or role created earlier in this turn is "
+        "passed with inputs (its resource_handle). purge_user_messages takes message_count 1-500; say posts say_text "
+        "in the current channel. Settings: set_modlog, ai_channel_add/remove (target_channel), set_prefix "
+        "(guild_prefix), set_language (en/es), set_antispam/set_antilink (filter_enabled), server_context_reset "
+        "(context_scope), server_context_learn (target_channel); help takes an optional help_section."
+    ),
+    "REACTION": "Add a reaction to the user's message: emoji is one unicode emoji or a custom token from the list.",
+}
+_SELECTABLE_INPUTS = {"IMAGE_EDIT", "IMAGE_ANALYZE", "MEME", "ADMIN"}
+_TOOL_HIDDEN_OPERATIONS = {"MEMORY": {"SERVER_MEMORY_CLARIFY"}}
+
+
+def tool_definitions() -> list[dict[str, Any]]:
+    tools: list[dict[str, Any]] = []
+    for family, description in TOOL_DESCRIPTIONS.items():
+        properties = {field: descriptor.json_schema() for field, descriptor in operand_descriptors(family).items()}
+        operation_field = canonical_operation_field(family)
+        if family in _TOOL_HIDDEN_OPERATIONS:
+            properties[operation_field]["enum"] = sorted(canonical_operations(family) - _TOOL_HIDDEN_OPERATIONS[family])
+        properties["purpose"] = {"type": "string", "maxLength": 480, "description": "What this call must find out or do."}
+        if family in _SELECTABLE_INPUTS:
+            properties["source_refs"] = {"type": "array", "maxItems": 4, "items": {"type": "string", "maxLength": 120}}
+            properties["inputs"] = {"type": "array", "maxItems": 4, "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {"task_id": {"type": "string", "maxLength": 120}, "output_field": {"type": "string", "maxLength": 40}},
+                "required": ["task_id", "output_field"],
+            }}
+        tools.append({
+            "type": "function", "name": family.lower(), "description": description,
+            "parameters": {
+                "type": "object", "additionalProperties": False, "properties": properties,
+                "required": [operation_field, "purpose"] if operation_field in properties else ["purpose"],
+            },
+        })
+    tools.append({
+        "type": "function", "name": "deliver",
+        "description": (
+            "Optional. artifacts lists the task_ids of the images to attach (default: every image produced this turn). "
+            "voice true speaks the reply as a voice message, only when the current message explicitly asks for audio; "
+            "voice_request_quote holds those exact words of the current message."
+        ),
+        "parameters": {"type": "object", "additionalProperties": False, "properties": {
+            "artifacts": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 120}},
+            "voice": {"type": "boolean"},
+            "voice_request_quote": {"type": "string", "maxLength": 180},
+        }, "required": []},
+    })
+    tools.append({
+        "type": "function", "name": "stay_silent",
+        "description": "The message is not meant for you (people talking about you or to each other): send nothing.",
+        "parameters": {"type": "object", "additionalProperties": False, "properties": {}, "required": []},
+    })
+    return tools

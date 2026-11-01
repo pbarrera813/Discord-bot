@@ -18,7 +18,9 @@ def format_web_research_context(
     ]
     attribution_indexes: set[int] = set()
     summary_index: int | None = None
-    summary = f"Summary: {_clip_with_omission(result.answer, 1400)}" if result.answer else None
+    excerpts: list[str] = []
+    if result.answer:
+        excerpts.append(f"Summary: {result.answer}")
     if request_date:
         lines.append(
             "Temporal anchor: "
@@ -36,7 +38,7 @@ def format_web_research_context(
         if source.published_at:
             parts.append(f"date={source.published_at}")
         if source.snippet:
-            parts.append(_clip_with_omission(source.snippet, 220))
+            excerpts.append(f"Source {index} excerpt: {source.snippet}")
         lines.append(" | ".join(part for part in parts if part))
         if str(source.url or "").strip().startswith(("http://", "https://")):
             attribution_indexes.add(len(lines) - 1)
@@ -45,9 +47,21 @@ def format_web_research_context(
             lines.append(f"Citation {index} | {str(citation or '').strip()}")
             if str(citation or "").strip().startswith(("http://", "https://")):
                 attribution_indexes.add(len(lines) - 1)
-    if summary:
-        summary_index = len(lines)
-        lines.append(summary)
+    remaining = max(0, max_chars - len("\n".join((*lines, "Evidence omitted.", "[/TRUSTED_WEB_RESULTS]"))))
+    all_fit = sum(len(excerpt) + 1 for excerpt in excerpts) <= remaining
+    omitted = False
+    for index, excerpt in enumerate(excerpts):
+        allowance = len(excerpt) if all_fit else max(0, remaining // (len(excerpts) - index) - 1)
+        rendered = _clip_with_omission(excerpt, allowance)
+        if rendered:
+            if index == 0 and result.answer:
+                summary_index = len(lines)
+            lines.append(rendered)
+            remaining = max(0, remaining - len(rendered) - 1)
+        else:
+            omitted = True
+    if omitted:
+        lines.append("Evidence omitted.")
     lines.append("[/TRUSTED_WEB_RESULTS]")
     return _bounded_trusted_block(
         lines,
@@ -123,8 +137,10 @@ def _bounded_trusted_block(
 
 
 def _clip_with_omission(value: str, limit: int) -> str:
-    cleaned = " ".join(str(value or "").split())
+    cleaned = str(value or "")
     if len(cleaned) <= limit:
         return cleaned
     marker = " [text omitted]"
+    if limit < len(marker):
+        return ""
     return cleaned[:max(0, limit - len(marker))] + marker

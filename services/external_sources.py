@@ -125,6 +125,8 @@ class ExternalSourceIntent:
     semantic_reason: str = ""
     failure_reason: str = ""
     ambiguous_reason: str = ""
+    # Authorized links the request selected; empty means every grounded link.
+    selected_urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

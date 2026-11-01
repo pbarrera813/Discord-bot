@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.test_ai_tagging import _FakeTTSClient
+
 import unittest
 from types import SimpleNamespace
 
@@ -161,7 +163,7 @@ class CodeLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def _run(self, route: dict[str, object], *, glot: object | None):
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.route_calls = 0
                 self.chat_calls: list[dict[str, object]] = []

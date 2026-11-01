@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.test_ai_tagging import _FakeTTSClient
+
 import unittest
 from types import SimpleNamespace
 
@@ -220,7 +222,7 @@ def _artifact_lifecycle_cog(
         async def add_ai_conversation_turn(self, **_kwargs):
             return None
 
-    class _LLM:
+    class _LLM(_FakeTTSClient):
         def __init__(self) -> None:
             self.generated: list[str] = []
             self.chat_calls = 0

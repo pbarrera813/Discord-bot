@@ -175,6 +175,28 @@ class _FakeTTSClient:
         self.chat_calls.append(kwargs)
         return self.reply
 
+    async def respond_with_evidence(self, *, response_request, **kwargs):
+        answer = await self.chat(**kwargs)
+        tasks = {task["task_id"]: task for task in response_request["available_tasks"]}
+        assessments = []
+        for requirement in response_request["requirements"]:
+            task = tasks[requirement["owner_task_id"]]
+            conversational = requirement["capability_owner"] in {"CHAT", "TRANSLATE"}
+            usable = task["status"] in {"SUCCESS", "PARTIAL_SUCCESS", "NO_DATA"} and task["has_payload"] and task["authorized"]
+            supported = usable or (conversational and task["status"] in {"SUCCESS", "PENDING"})
+            assessments.append({"requirement_id": requirement["requirement_id"],
+                "status": "supported" if supported else "unknown", "basis": "context" if conversational else "retrieved",
+                "evidence_task_ids": [task["task_id"]] if usable else [],
+                "findings": ["The requested result is available."] if supported else [],
+                "missing_evidence": [] if supported else ["The requested result was unavailable."],
+            })
+        blocked = [row["owner_task_id"] for row in response_request["requirements"]
+                   if tasks[row["owner_task_id"]]["status"] in {"PROVIDER_FAILURE", "PERMISSION_DENIED", "UNSUPPORTED", "NO_DATA"}]
+        supported = all(row["status"] == "supported" for row in assessments)
+        return {"decision": "answer" if supported else "limited", "stop": None if supported else {
+                    "reason": "source_blocked" if blocked else "clarification_required", "task_ids": blocked},
+                "answer": answer, "assessments": assessments, "reads": []}
+
 
 class _FakeVoiceProcessor:
     def __init__(self) -> None:
@@ -989,8 +1011,9 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_standalone_router_chat_uses_one_shared_synthesis_and_delivery(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
         objective = "Explain in one sentence why the sky looks blue."
+        accepted = '```python\nfor item in range(5):\n    if item == 0:\n        print("unavailable")\n```'
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.route_calls = 0
                 self.chat_calls: list[dict[str, object]] = []
@@ -1036,7 +1059,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
 
             async def chat(self, **kwargs):
                 self.chat_calls.append(kwargs)
-                return "The sky looks blue because air scatters blue light more strongly."
+                return accepted
 
         db = SimpleNamespace(
             get_or_create_guild_settings=_async_return(
@@ -1072,16 +1095,23 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(llm.chat_calls), 1)
         self.assertIn(objective, llm.chat_calls[0]["user_message"])
         self.assertEqual(llm.chat_calls[0]["conversation_mode"], "mention")
-        self.assertIsNone(llm.chat_calls[0]["trusted_capability_context"])
+        self.assertIn("awaiting_response", llm.chat_calls[0]["trusted_capability_context"])
         self.assertGreaterEqual(len(checkpoints), 1)
         chat_result = checkpoints[-1].bundle.by_task["chat_1"]
         self.assertEqual(chat_result.task_id, "chat_1")
         self.assertEqual(chat_result.status, CapabilityTerminalStatus.SUCCESS)
         self.assertTrue(chat_result.satisfies_request)
-        self.assertEqual(chat_result.payload["answer"], "The sky looks blue because air scatters blue light more strongly.")
+        self.assertEqual(chat_result.payload["answer"], accepted)
         self.assertEqual(len(message.replies), 1)
         self.assertEqual(message.channel.sent, [])
-        self.assertEqual(message.replies[0][0], "The sky looks blue because air scatters blue light more strongly.")
+        self.assertEqual(message.replies[0][0], accepted)
+        long_code = '```python\n' + '    if True:\n        print("unavailable")\n' * 100 + '```'
+        chunks = cog._split_for_discord(long_code, limit=1900)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(part) <= 1900 and part.startswith('```python\n') and part.endswith('```') for part in chunks))
+        self.assertEqual(sum(part.count('        print("unavailable")') for part in chunks), 100)
+        plain = '    preserve these spaces\n' * 100
+        self.assertEqual(''.join(cog._split_for_discord(plain, limit=1900)), plain)
 
 
     async def test_mixed_chat_synthesis_failure_is_typed_without_continuation(self) -> None:
@@ -1200,7 +1230,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
         media_url = "https://cdn.example.test/continuation-image.png"
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.image_calls: list[dict[str, object]] = []
                 self.synthesis_calls: list[dict[str, object]] = []
@@ -1349,7 +1379,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
 
 
     async def test_passive_reply_to_slash_command_output_is_ignored(self) -> None:
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.chat_calls = 0
 
@@ -1398,7 +1428,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.replies, [])
 
     async def test_direct_mention_replying_to_slash_command_output_routes(self) -> None:
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.chat_calls = 0
 
@@ -1455,7 +1485,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_name_reference_vocative_reaches_router_and_chats(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori-Buchona", display_name="Nitori-Buchona")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.route_kwargs = None
                 self.chat_calls = 0
@@ -1515,7 +1545,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
         bot_user = SimpleNamespace(id=42, name="Nitori-Buchona", display_name="Nitori-Buchona")
         other_user = SimpleNamespace(id=77, bot=False, display_name="Galen", name="Galen")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.chat_calls = 0
                 self.route_anchors: list[str] = []
@@ -1626,7 +1656,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
                         "failure": False,
                     })
 
-                    class _LLM:
+                    class _LLM(_FakeTTSClient):
                         def __init__(self) -> None:
                             self.route_kwargs: list[dict[str, object]] = []
                             self.chat_calls = 0
@@ -1706,7 +1736,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_lease_replaced_only_after_successful_other_user_response(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             async def route_ai_interaction(self, **_kwargs):
                 return {
                     "participation": "RESPOND",
@@ -1762,7 +1792,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_explicit_anchor_router_failure_fails_closed_without_chat_execution(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             async def route_ai_interaction(self, **_kwargs):
                 return {"valid": False, "failure": True}
 
@@ -1799,7 +1829,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
         token = "<:nitori:123456789012345678>"
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.route_calls = 0
 
@@ -1856,7 +1886,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_ambiguous_router_failure_ignores(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.chat_calls = 0
                 self.chat_kwargs: list[dict[str, object]] = []
@@ -1905,7 +1935,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_same_user_continuation_bypasses_throttle_and_keeps_branch_history(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori-Buchona", display_name="Nitori-Buchona")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.route_anchors: list[str] = []
                 self.chat_kwargs: list[dict[str, object]] = []
@@ -1984,7 +2014,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_reply_to_ai_without_fresh_mention_routes_as_reply_to_ai(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori-Buchona", display_name="Nitori-Buchona")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.route_anchor = ""
                 self.chat_kwargs: dict[str, object] = {}
@@ -2060,7 +2090,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_missed_continuation_repair_routes_with_prior_context(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori-Buchona", display_name="Nitori-Buchona")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.route_anchors: list[str] = []
                 self.route_kwargs: list[dict[str, object]] = []
@@ -2237,6 +2267,13 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
                             route_response._text = json.dumps(envelope)
                 return super().post(url, json=kwargs["json"], headers=headers)
 
+        def image_answer(capability, answer):
+            task_id = "generated_image_task" if capability == "IMAGE_GENERATE" else "edited_image_task"
+            return json.dumps({"decision": "answer", "answer": answer, "reads": [], "stop": None, "assessments": [{
+                "requirement_id": capability.casefold(), "status": "supported", "basis": "retrieved",
+                "evidence_task_ids": [task_id], "findings": [answer], "missing_evidence": [],
+            }]})
+
         session = _RouteImageSession(
             [
                 _FakeResponse(
@@ -2253,7 +2290,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 _FakeResponse(
                     status=200,
-                    text=json.dumps({"status": "completed", "output_text": "Generated the requested artifact."}),
+                    text=json.dumps({"status": "completed", "output_text": image_answer("IMAGE_GENERATE", "Generated the requested artifact.")}),
                 ),
                 _FakeResponse(
                     status=200,
@@ -2269,7 +2306,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 _FakeResponse(
                     status=200,
-                    text=json.dumps({"status": "completed", "output_text": "Edited the requested artifact."}),
+                    text=json.dumps({"status": "completed", "output_text": image_answer("IMAGE_EDIT", "Edited the requested artifact.")}),
                 ),
             ]
         )
@@ -2438,7 +2475,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
                 self.calls += 1
                 return WebResearchResult(query="", answer="", failure_reason="should_not_call")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.chat_prompt = ""
                 self.user_prompt = ""
@@ -3636,7 +3673,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
             async def create_pending_memory(self, data):
                 raise AssertionError("trusted behavior rules should not require approval")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.route_kwargs: dict[str, object] = {}
                 self.chat_calls: list[dict[str, object]] = []
@@ -3715,7 +3752,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
                 self.pending_writes.append(data)
                 return {"id": 27}
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.chat_calls: list[dict[str, object]] = []
 
@@ -3804,7 +3841,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
             async def delete_memory(self, guild_id, record_id):
                 self.delete_calls.append((guild_id, record_id))
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.chat_calls: list[dict[str, object]] = []
 
@@ -3874,7 +3911,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_router_owned_server_memory_operand_is_rejected_before_handler_or_db(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.route_calls = 0
                 self.chat_calls = 0
@@ -3963,7 +4000,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori", bot=True)
         exact_key = "maintenance.window"
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.chat_calls = 0
                 self.chat_kwargs: list[dict[str, object]] = []
@@ -4060,7 +4097,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori", bot=True)
         exact_key = "shared.key"
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.chat_calls = 0
                 self.chat_kwargs: list[dict[str, object]] = []
@@ -4187,7 +4224,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_router_typed_admin_payload_owns_execution_over_local_text_parser(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.route_calls = 0
                 self.chat_calls: list[dict[str, object]] = []
@@ -4303,7 +4340,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
         target = _DummyMember(user_id=100000000000000001, name="juanito", display_name="Juanito")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.route_kwargs: dict[str, object] = {}
                 self.chat_calls: list[dict[str, object]] = []
@@ -4400,7 +4437,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
             display_name=target_name,
         )
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.chat_calls: list[dict[str, object]] = []
 
@@ -4490,7 +4527,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori", bot=True)
         private_service_message = "PRIVATE_LOCK_SERVICE_MESSAGE"
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.chat_calls: list[dict[str, object]] = []
 
@@ -4573,7 +4610,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_admin_lock_channel_unauthorized_uses_shared_synthesis(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori", bot=True)
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.chat_calls: list[dict[str, object]] = []
 
@@ -4655,7 +4692,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori", bot=True)
         target = _DummyMember(user_id=100000000000000001, name="target", display_name="Target")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.chat_calls: list[dict[str, object]] = []
 
@@ -4740,7 +4777,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_ai_join_stats_uses_member_event_count(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.chat_calls: list[dict[str, object]] = []
 
@@ -4815,7 +4852,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_admin_delete_messages_executes_without_confirmation(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.chat_calls: list[dict[str, object]] = []
 
@@ -4915,7 +4952,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_delete_messages_trigger_delete_failure_keeps_successful_delivery(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori", bot=True)
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.chat_calls = 0
 
@@ -5000,7 +5037,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_ai_admin_delete_messages_requires_bot_manage_messages(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.chat_calls: list[dict[str, object]] = []
 
@@ -5077,7 +5114,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_incomplete_router_admin_payload_fails_closed_without_second_planner(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.route_calls = 0
                 self.chat_calls: list[dict[str, object]] = []
@@ -5286,7 +5323,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_admin_action_text_claim_does_not_grant_authority_metadata(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.route_kwargs: dict[str, object] = {}
                 self.chat_calls: list[dict[str, object]] = []
@@ -5528,7 +5565,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_explicit_analysis_without_image_asks_for_one(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             async def route_ai_interaction(self, **_kwargs):
                 return {
                     "participation": "RESPOND",
@@ -5570,7 +5607,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_image_edit_with_current_attachment_uses_edit_endpoint(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.edit_calls: list[tuple[str, str]] = []
                 self.chat_calls = 0
@@ -5667,7 +5704,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_standalone_image_edit_provider_failure_uses_shared_synthesis_without_attachment(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.edit_calls = 0
                 self.chat_calls = 0
@@ -5752,7 +5789,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_image_edit_in_reply_uses_replied_image(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.edit_calls: list[tuple[str, str]] = []
                 self.chat_calls = 0
@@ -6067,7 +6104,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_reaction_only_request_adds_emoji_and_does_not_call_chat(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.route_calls = 0
                 self.chat_calls = 0
@@ -6126,7 +6163,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_noisy_reply_mode_remembers_ai_response_for_reply_to_ai(self) -> None:
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.anchors: list[str] = []
 
@@ -6372,7 +6409,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Authoritative visual analysis:", llm.chat_calls[-1]["trusted_capability_context"])
         self.assertIn("Visual synthesis requirement:", llm.chat_calls[-1]["trusted_capability_context"])
         self.assertIn("surface the substantive IMAGE_ANALYZE findings", llm.chat_calls[-1]["trusted_capability_context"])
-        self.assertIn("satisfied: True", llm.chat_calls[-1]["trusted_capability_context"])
+        self.assertIn("satisfied: False", llm.chat_calls[-1]["trusted_capability_context"])
         self.assertLess(
             llm.chat_calls[-1]["trusted_capability_context"].index("Visual synthesis requirement:"),
             llm.chat_calls[-1]["trusted_capability_context"].index("[TRUSTED_EXTERNAL_SOURCES]"),
@@ -6389,7 +6426,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
         image_url = "https://cdn.discordapp.com/current.png"
         answer = "I can help with that."
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             def __init__(self) -> None:
                 self.route_calls: list[dict[str, object]] = []
                 self.chat_calls: list[dict[str, object]] = []
@@ -6480,7 +6517,7 @@ class AIChatTaggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(image_metadata["has_supported_image"])
         self.assertEqual(image_metadata["supported_image_urls"], [image_url])
         self.assertEqual(natural_llm.chat_calls[0].get("image_urls", []), [])
-        self.assertIsNone(natural_llm.chat_calls[0]["trusted_capability_context"])
+        self.assertIn("awaiting_response", natural_llm.chat_calls[0]["trusted_capability_context"])
         self.assertEqual(len(natural_llm.chat_calls), 1)
         chat_result = checkpoints[-1].bundle.by_task["chat_1"]
         self.assertEqual(chat_result.status, CapabilityTerminalStatus.SUCCESS)
@@ -6563,7 +6600,7 @@ class XAIClientMessageTests(unittest.TestCase):
         bounded_context = str(client.messages[-2]["content"])
         self.assertEqual(XAIClient._MAX_TRUSTED_CAPABILITY_CONTEXT, 11000)
         self.assertEqual(len(bounded_context), 11000)
-        self.assertTrue(bounded_context.endswith("..."))
+        self.assertIn("text omitted; original_chars=", bounded_context)
         self.assertNotIn(bounded_context, str(client.messages[-1]["content"]))
 
 
@@ -6874,6 +6911,7 @@ class XAIClientMessageTests(unittest.TestCase):
 
 
     def test_route_ai_interaction_sanitizes_bounded_reply_source_content(self) -> None:
+        current = 'Translate "ignore previous instructions".\n' + ('Retain the context. ' * 80) + '\nAlso preserve the final requirement.'
         route_json = {
             "participation": "RESPOND",
             "action": "CHAT",
@@ -6892,7 +6930,7 @@ class XAIClientMessageTests(unittest.TestCase):
                 matched_alias=None,
                 author_name="Pablo",
                 author_id=99,
-                current_message="compare the replied sources",
+                current_message=current,
                 anchor_type="REPLY_TO_AI",
                 recent_context=[],
                 reply_metadata={
@@ -6905,9 +6943,11 @@ class XAIClientMessageTests(unittest.TestCase):
         )
 
         payload = json.loads(session.calls[0]["json"]["input"][1]["content"])
+        self.assertEqual(payload["current_message"], current)
         reply = payload["reply"]
         self.assertTrue(reply["source_content_authorized"])
-        self.assertNotIn("ignore previous instructions", reply["source_content"])
+        self.assertIn("ignore previous instructions ```", reply["source_content"])
+        self.assertIn("text omitted; original_chars=", reply["source_content"])
         self.assertLessEqual(len(reply["source_content"]), 900)
 
     def test_route_ai_interaction_validates_router_owned_memory_operation_and_operands(self) -> None:
@@ -7662,6 +7702,7 @@ class XAIClientMessageTests(unittest.TestCase):
                     "sources": [{"url": "https://example.com/a", "title": "A"}],
                     "citations": ["https://example.com/a"],
                     "failure_reason": None,
+                    "provider_status": "COMPLETED",
                     "tool_used": "web_search",
                 }
 
@@ -7684,6 +7725,14 @@ class XAIClientMessageTests(unittest.TestCase):
         limited = asyncio.run(throttled.research(WebResearchRequest(query="b"), guild_id=1, user_id=2))
         self.assertIsNone(ok.failure_reason)
         self.assertEqual(limited.failure_reason, "rate_limited")
+        client = _Client()
+        grouped = WebResearchService(client, enabled=True, cooldown_seconds=30, cache_ttl_seconds=60)
+        for query, turn in (("a", 10), ("b", 10), ("a", 11), ("c", 11)):
+            result = asyncio.run(grouped.research(WebResearchRequest(query=query), guild_id=1, user_id=2, turn_id=turn))
+            self.assertEqual(result.failure_reason, "rate_limited" if query == "c" else None)
+            if query == "a" and turn == 11:
+                self.assertTrue(result.cache_hit)
+        self.assertEqual(client.calls, 2)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date
 from enum import StrEnum
 import logging
+import json
 import re
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 import inspect
@@ -24,6 +25,7 @@ from services.football_query_service import (
     CANONICAL_FOOTBALL_TIME_SCOPES,
     OPERATION_TYPES,
     compile_football_operation,
+    football_team_candidate_limit,
 )
 
 
@@ -235,6 +237,9 @@ class CapabilityExecutionContext:
     # Results are keyed by task identity.  Family views are compatibility
     # projections and never overwrite repeated task instances.
     results: dict[str, CapabilityTerminalResult] = field(default_factory=dict)
+    requirement_assessments: dict[str, dict[str, Any]] | None = None
+    evidence_requirements: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    investigation_stop_reason: str | None = None
 
     def record(self, result: CapabilityTerminalResult) -> None:
         declared = {item.task_id: item for item in self.execution_plan.ordered_capabilities}
@@ -271,12 +276,23 @@ class CapabilityExecutionContext:
 
     @property
     def bundle(self) -> "CapabilityResultBundle":
+        protected = tuple(
+            item.task_id for item in self.execution_plan.ordered_capabilities if item.required
+            and (operation_effect(item) in {"mutate", "artifact"}
+                 or (item.name == "CODE" and item.operands.get("code_action") == "run"))
+        )
         return CapabilityResultBundle(
             required_capabilities=self.execution_plan.required_capabilities,
             results=tuple(self.results.values()),
             semantic_status=self.execution_plan.semantic_plan.semantic_status,
             semantic_failure_reason=self.execution_plan.semantic_plan.semantic_failure_reason,
             required_task_ids=self.execution_plan.required_task_ids,
+            requirement_assessments=self.requirement_assessments,
+            reviewed_requirement_ids=tuple(
+                item.requirement_id for item in self.execution_plan.semantic_plan.requirements
+                if item.required and item.owner_task_id not in protected
+            ) if self.execution_plan.semantic_plan.requirements else None,
+            protected_task_ids=protected,
         )
 
     def diagnostics(self) -> dict[str, Any]:
@@ -293,6 +309,8 @@ class CapabilityExecutionContext:
             "semantic_failure_reason": bundle.semantic_failure_reason,
             "missing": list(bundle.missing),
             "results": [result.to_payload() for result in bundle.results],
+            "requirement_statuses": {key: value["status"] for key, value in (self.requirement_assessments or {}).items()},
+            "investigation_stop_reason": self.investigation_stop_reason,
         }
 
 
@@ -303,6 +321,9 @@ class CapabilityResultBundle:
     semantic_status: str = "SUCCESS"
     semantic_failure_reason: str | None = None
     required_task_ids: tuple[str, ...] = ()
+    requirement_assessments: Mapping[str, Mapping[str, Any]] | None = None
+    reviewed_requirement_ids: tuple[str, ...] | None = None
+    protected_task_ids: tuple[str, ...] = ()
 
     @property
     def by_task(self) -> dict[str, CapabilityTerminalResult]:
@@ -333,6 +354,12 @@ class CapabilityResultBundle:
 
     @property
     def missing(self) -> tuple[str, ...]:
+        if self.reviewed_requirement_ids is not None:
+            assessments = self.requirement_assessments or {}
+            missing = [key for key in self.reviewed_requirement_ids if assessments.get(key, {}).get("status") != "supported"]
+            missing.extend(key for key in self.protected_task_ids
+                           if key not in self.by_task or not self.by_task[key].satisfies_request)
+            return tuple(missing)
         missing: list[str] = []
         if self.required_task_ids:
             results = self.by_task
@@ -372,6 +399,7 @@ class CapabilityResultBundle:
             "semantic_failure_reason": self.semantic_failure_reason,
             "missing": list(self.missing),
             "results": [result.to_payload() for result in self.results],
+            "requirement_assessments": self.requirement_assessments,
         }
 
 
@@ -387,6 +415,7 @@ async def execute_ordered_capabilities(
     *,
     context: CapabilityExecutionContext | None = None,
     preflight: MutationPreflight | None = None,
+    can_continue: Callable[[], bool] | None = None,
 ) -> CapabilityExecutionContext:
     """A failed dependency prevents downstream provider work, so incomplete and satisfied work stay distinct."""
 
@@ -447,6 +476,8 @@ async def execute_ordered_capabilities(
     for item in execution_plan.ordered_capabilities:
         if item.task_id in execution_context.results:
             continue
+        if can_continue is not None and not can_continue():
+            break
         dependency_failures = [
             dependency
             for dependency in item.depends_on
@@ -1087,6 +1118,7 @@ def validate_native_capability_contract(
     payload: Mapping[str, Any],
     *,
     diagnostic_sink: list[dict[str, Any]] | None = None,
+    prior_tasks: Sequence[CapabilityRequest] = (),
 ) -> str | None:
     """Deliberately does not infer missing capabilities; normalization is a structural projection only."""
 
@@ -1158,9 +1190,13 @@ def validate_native_capability_contract(
             },
         }
 
-    def reject(predicate: str) -> str:
+    task_id = None
+
+    def reject(predicate: str, *, path: str | None = None, expected: object = None, actual: object = None) -> str:
         if diagnostic_sink is not None and not diagnostic_sink:
-            diagnostic_sink.append({"predicate": predicate, "typed_state": typed_snapshot()})
+            diagnostic_sink.append({"predicate": predicate, "typed_state": typed_snapshot(),
+                "task_id": task_id,
+                "path": path, "expected": expected, "actual": actual})
         return "inconsistent_capability_plan"
 
     if (
@@ -1172,13 +1208,16 @@ def validate_native_capability_contract(
     if len(raw_capabilities) == 0 or len(raw_capabilities) > 8:
         return reject("capabilities_not_bounded_list")
     task_ids: list[str] = []
-    task_by_id: dict[str, Mapping[str, Any]] = {}
+    task_by_id: dict[str, Mapping[str, Any]] = {
+        item.task_id: {"name": item.name, "depends_on": list(item.depends_on),
+                       "requested_outputs": list(item.requested_outputs)} for item in prior_tasks
+    }
     allowed_task_fields = {
         "name", "task_id", "required", "evidence_span", "depends_on", "scope",
         "independent", "independent_research", "selection_count", "owner_action",
         "operands", "input_bindings", "source_refs", "requested_outputs",
     }
-    for item in raw_capabilities:
+    for index, item in enumerate(raw_capabilities):
         if not isinstance(item, Mapping):
             return reject("capability_not_mapping")
         if set(item) - allowed_task_fields:
@@ -1195,8 +1234,11 @@ def validate_native_capability_contract(
             return reject("task_fields_missing")
         if task_id in task_by_id:
             return reject("missing_or_duplicate_task_id")
-        if not isinstance(item.get("required"), bool) or not isinstance(item.get("evidence_span"), str) or len(item["evidence_span"]) > 180:
-            return reject("task_field_type_invalid")
+        if not isinstance(item.get("required"), bool):
+            return reject("task_field_type_invalid", path=f"capabilities[{index}].required", expected="boolean", actual=type(item.get("required")).__name__)
+        if not isinstance(item.get("evidence_span"), str) or len(item["evidence_span"]) > 180:
+            return reject("task_field_type_invalid", path=f"capabilities[{index}].evidence_span",
+                expected="string with at most 180 characters", actual=f"length {len(item['evidence_span'])} exceeds 180" if isinstance(item.get("evidence_span"), str) else type(item.get("evidence_span")).__name__)
         if not isinstance(item.get("scope"), str) or len(item["scope"]) > 40 or item["scope"] not in {
             "GENERAL_REASONING", "STRUCTURED_DATA", "BROAD_RESEARCH", "EXPLICIT_SOURCE",
             "MEDIA_ANALYSIS", "IMAGE_GENERATION", "IMAGE_EDIT", "DISCORD_ACTION", "UNSPECIFIED",
@@ -1210,7 +1252,7 @@ def validate_native_capability_contract(
             return reject("task_selection_count_invalid")
         task_ids.append(task_id)
         task_by_id[task_id] = item
-    for item in raw_capabilities:
+    for index, item in enumerate(raw_capabilities):
         task_id = _clean_text(item.get("task_id"), 80)
         name = _clean_text(item.get("name"), 40).upper()
         dependencies = item.get("depends_on", [])
@@ -1259,7 +1301,8 @@ def validate_native_capability_contract(
             return reject("task_operands_not_mapping")
         operand_failure = validate_operands(name, operands)
         if operand_failure is not None:
-            return reject(operand_failure)
+            return reject(operand_failure, path=f"capabilities[{index}].operands",
+                expected="only this capability's typed operands within catalog bounds", actual={"fields": list(own_operands(name, operands))[:40]})
         operands = own_operands(name, operands)
         if not isinstance(item.get("required"), bool) or not isinstance(item.get("independent"), bool) or not isinstance(item.get("independent_research"), bool):
             return reject("task_field_type_invalid")
@@ -1274,6 +1317,13 @@ def validate_native_capability_contract(
                 return reject("unknown_or_missing_operation")
             if any(key in operands for key in OPERATION_FIELD_NAMES - {operation_field}):
                 return reject("conflicting_operation_fields")
+            if name == "FOOTBALL":
+                candidates = operands.get("team_candidates") or []
+                maximum = football_team_candidate_limit(operation)
+                if len(candidates) > maximum:
+                    return reject("invalid_team_arity", path=f"capabilities[{index}].operands.team_candidates",
+                        expected=f"at most {maximum} participants for {operation}; use separate scoped reads or one league-wide table",
+                        actual=candidates)
         for field in ("source_refs", "requested_outputs"):
             values = item.get(field)
             if not isinstance(values, list) or len(values) > 8 or any(
@@ -1948,7 +1998,9 @@ def normalize_capability_plan(
             "country_filter",
         }:
             football_payload[key] = None if value is None else _clean_text(value, 180)
-        elif key == "reference_page" and (value is None or (isinstance(value, int) and not isinstance(value, bool))):
+        elif key == "fixture_round":
+            football_payload[key] = value
+        elif key in {"reference_page", "fixture_count"} and (value is None or (isinstance(value, int) and not isinstance(value, bool))):
             football_payload[key] = value
     minecraft = raw.get("minecraft") if isinstance(raw.get("minecraft"), Mapping) else {}
     minecraft_payload = {
@@ -2021,6 +2073,155 @@ def normalize_capability_plan(
         failure_reason=plan_failure_reason,
         requirements=requirements,
     )
+
+
+EVIDENCE_READ_CAPABILITIES = frozenset({
+    "FOOTBALL", "WEB", "EXTERNAL_SOURCE", "IMAGE_ANALYZE", "MINECRAFT", "NINJAS",
+    "ADMIN", "MEMORY", "REMINDER", "BIRTHDAY",
+})
+
+
+def evidence_read_key(request: CapabilityRequest) -> str:
+    def normalize(value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, Mapping):
+            return {key: normalize(item) for key, item in value.items() if item is not None and item != []}
+        if isinstance(value, (list, tuple)):
+            return [normalize(item) for item in value]
+        return value
+
+    return json.dumps([request.name, normalize(request.operands)], sort_keys=True, default=str, separators=(",", ":"))
+
+
+def validate_evidence_response(
+    context: CapabilityExecutionContext, review: object, *, remaining_reads: int, remaining_rounds: int = 2,
+) -> tuple[dict[str, dict[str, Any]], tuple[CapabilityRequest, ...], dict[str, tuple[str, ...]]]:
+    """Validate model-owned conclusions and supplemental reads without rewriting user requirements."""
+    if not isinstance(review, dict) or set(review) != {"decision", "answer", "assessments", "reads", "stop"}:
+        raise ValueError("invalid_review_shape")
+    decision = review["decision"]
+    if decision not in ("answer", "read_more", "limited"):
+        raise ValueError("invalid_review_decision")
+    answer = review["answer"]
+    if not isinstance(answer, str) or len(answer) > 24000 or (bool(answer.strip()) != (decision != "read_more")):
+        raise ValueError("invalid_response_answer")
+    requirements = {item.requirement_id for item in context.execution_plan.semantic_plan.requirements if item.required}
+    rows = review["assessments"]
+    if not isinstance(rows, list) or len(rows) != len(requirements):
+        raise ValueError("missing_requirement_assessment")
+    assessments: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"requirement_id", "status", "basis", "evidence_task_ids", "findings", "missing_evidence"}:
+            raise ValueError("invalid_requirement_assessment")
+        key = row["requirement_id"]
+        if not isinstance(key, str) or key not in requirements or key in assessments or row["status"] not in ("supported", "partial", "unknown"):
+            raise ValueError("invalid_requirement_assessment")
+        if row["basis"] not in ("retrieved", "context", "general_knowledge"):
+            raise ValueError("invalid_assessment_basis")
+        owner = next(item for item in context.execution_plan.semantic_plan.requirements if item.requirement_id == key)
+        if (row["status"] == "supported" and owner.owner_task_id in context.bundle.protected_task_ids
+                and (owner.owner_task_id not in context.results or not context.results[owner.owner_task_id].satisfies_request)):
+            raise ValueError("action_result_cannot_be_overridden")
+        refs = row["evidence_task_ids"]
+        if not isinstance(refs, list) or len(refs) > 14 or any(not isinstance(ref, str) for ref in refs) or len(set(refs)) != len(refs):
+            raise ValueError("invalid_evidence_reference")
+        for ref in refs:
+            result = context.results.get(ref)
+            if (result is None or result.status not in {CapabilityTerminalStatus.SUCCESS, CapabilityTerminalStatus.PARTIAL_SUCCESS, CapabilityTerminalStatus.NO_DATA}
+                    or result.payload is None or result.provenance.get("authorized") is False):
+                errors.append(f"unavailable_evidence_reference: assessments[{key}].evidence_task_ids contains {ref!r} "
+                              f"with status={result.status.value if result is not None else 'MISSING'}; "
+                              "cite only available factual results; failed tasks are diagnostic context, not evidence")
+        for field in ("findings", "missing_evidence"):
+            values = row[field]
+            if (not isinstance(values, list) or len(values) > 4
+                    or any(not isinstance(value, str) or not 1 <= len(value.strip()) <= 600 for value in values)):
+                raise ValueError("unbounded_requirement_assessment")
+        if row["basis"] == "retrieved" and row["findings"] and not refs:
+            raise ValueError("ungrounded_findings")
+        if row["status"] == "supported" and ((row["basis"] == "retrieved" and not refs) or not row["findings"] or row["missing_evidence"]):
+            raise ValueError("unsupported_fulfillment_claim")
+        if row["status"] != "supported" and not row["missing_evidence"]:
+            raise ValueError("missing_evidence_not_identified")
+        assessments[key] = dict(row)
+    unsatisfied = {key for key, row in assessments.items() if row["status"] != "supported"}
+    raw_reads = review["reads"]
+    if not isinstance(raw_reads, list) or len(raw_reads) > min(6, remaining_reads):
+        raise ValueError("read_budget_exceeded")
+    if ((decision == "answer" and unsatisfied) or (decision == "limited" and requirements and not unsatisfied)
+            or (decision == "read_more" and (not raw_reads or not unsatisfied))
+            or (decision != "read_more" and raw_reads)):
+        raise ValueError("inconsistent_review_decision")
+    stop = review["stop"]
+    if decision != "limited":
+        if stop is not None:
+            raise ValueError("stop_requires_limited_decision")
+    else:
+        if (not isinstance(stop, dict) or set(stop) != {"reason", "task_ids"} or not isinstance(stop["reason"], str)
+                or stop["reason"] not in {"budget_exhausted", "source_blocked", "clarification_required", "analysis_limit"}):
+            raise ValueError("limited_requires_justified_stop: choose read_more when missing evidence can still be retrieved")
+        ids = stop["task_ids"]
+        if (not isinstance(ids, list) or len(ids) > 14 or any(not isinstance(key, str) for key in ids)
+                or len(set(ids)) != len(ids) or any(key not in context.results for key in ids)):
+            raise ValueError("invalid_stop_task_reference")
+        if stop["reason"] == "budget_exhausted" and remaining_reads > 0 and remaining_rounds > 0:
+            raise ValueError("read_budget_still_available: request missing evidence before answering with limitations")
+        if stop["reason"] == "source_blocked":
+            relevant = {item.owner_task_id for item in context.execution_plan.semantic_plan.requirements if item.requirement_id in unsatisfied}
+            relevant.update(key for key, requirements in context.evidence_requirements.items() if unsatisfied.intersection(requirements))
+            blocked = {CapabilityTerminalStatus.PROVIDER_FAILURE, CapabilityTerminalStatus.PERMISSION_DENIED,
+                       CapabilityTerminalStatus.UNSUPPORTED, CapabilityTerminalStatus.NO_DATA}
+            if not ids or any(key not in relevant or context.results[key].status not in blocked for key in ids):
+                raise ValueError("source_not_blocked: reference actual unavailable supporting tasks; argument errors require correction")
+        if stop["reason"] == "analysis_limit":
+            if remaining_rounds == 2 or not ids or any(
+                context.results[key].status not in {CapabilityTerminalStatus.SUCCESS, CapabilityTerminalStatus.PARTIAL_SUCCESS, CapabilityTerminalStatus.NO_DATA}
+                or context.results[key].payload is None or context.results[key].provenance.get("authorized") is False for key in ids
+            ):
+                raise ValueError("analysis_limit_requires_investigation: gather missing evidence in an additional read round")
+    if not raw_reads:
+        if errors:
+            raise ValueError("; ".join(errors))
+        return assessments, (), {}
+    tasks = []
+    supports: dict[str, tuple[str, ...]] = {}
+    for read in raw_reads:
+        if not isinstance(read, dict) or set(read) != {"requirement_ids", "task"}:
+            raise ValueError("invalid_supplemental_read")
+        ids = read["requirement_ids"]
+        task = read["task"]
+        if (not isinstance(ids, list) or not ids or len(ids) > 8
+                or any(not isinstance(key, str) or key not in unsatisfied for key in ids)
+                or len(set(ids)) != len(ids) or not isinstance(task, dict) or task.get("required") is not False):
+            raise ValueError("invalid_read_requirement_reference")
+        tasks.append(task)
+        task_id = task.get("task_id")
+        if not isinstance(task_id, str):
+            raise ValueError("invalid_read_task_id")
+        supports[task_id.strip()] = tuple(ids)
+    raw_plan = {"objective": "", "requirements": [], "capabilities": tasks}
+    diagnostics: list[dict[str, Any]] = []
+    failure = validate_native_capability_contract({"capability_plan": raw_plan}, prior_tasks=context.execution_plan.ordered_capabilities, diagnostic_sink=diagnostics)
+    if failure:
+        raise ValueError("; ".join(errors + ["invalid_read_contract: " + json.dumps(diagnostics, ensure_ascii=False)]))
+    reads = _normalize_capabilities(tasks, action="CHAT", external={}, native_task_contract=True)
+    if len(reads) != len(tasks):
+        raise ValueError("invalid_read_contract")
+    seen = {evidence_read_key(item): item.task_id for item in context.execution_plan.ordered_capabilities}
+    for read in reads:
+        if read.name not in EVIDENCE_READ_CAPABILITIES or operation_effect(read) != "read" or read.owner_action is not None:
+            raise ValueError("forbidden_investigation_operation")
+        fingerprint = evidence_read_key(read)
+        if fingerprint in seen:
+            errors.append(f"duplicate_investigation_read: tasks {seen[fingerprint]!r} and {read.task_id!r} have identical executable operands; "
+                          "reuse available evidence or supply distinct typed scope/participants; task IDs and purpose text do not change operands")
+        else:
+            seen[fingerprint] = read.task_id
+    if errors:
+        raise ValueError("; ".join(errors))
+    return assessments, reads, supports
 
 
 def build_capability_execution_plan(plan: CapabilityPlan, *, fallback_action: str) -> CapabilityExecutionPlan:

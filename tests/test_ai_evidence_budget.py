@@ -79,6 +79,121 @@ class _EvidenceLLM(_FakeTTSClient):
 
 
 class EvidenceBudgetNativeSynthesisTests(unittest.TestCase):
+    def test_analytical_standings_keep_every_team_and_do_not_prove_fulfillment(self) -> None:
+        import json
+        from dataclasses import replace
+        from services.football_operation_service import FootballRetrievalResult
+        from services.ai_capability_orchestrator import CapabilityRequirement
+
+        plan = _explicit_test_plan("FOOTBALL", "table", "FOOTBALL_TEAM_QUERY", scope="STRUCTURED_DATA", operands={"operation_family": "standings"})
+        plan = replace(plan, requirements=(CapabilityRequirement(
+            "qualification", "Analyze qualification", satisfaction_criterion="Prove supported scenarios",
+            capability_owner="FOOTBALL", owner_task_id="table",
+        ),))
+        context = CapabilityExecutionContext(build_capability_execution_plan(plan, fallback_action=plan.primary_action))
+        rows = [{"rank": n, "team": {"id": n, "name": f"Team {n}"}, "points": 30 - n,
+                 "all": {"played": 14}, "goalsDiff": 0, "group": "Opening", "description": "Qualification" if n <= 8 else None}
+                for n in range(1, 19)]
+        result = FootballRetrievalResult(standings_table=rows, standing_row=rows[14],
+            requested_scope={"request_plan": {"output_payload": ["standing_row", "standings_table"]}})
+        context.record(normalize_terminal_result("FOOTBALL", "SELECTED", provider="offline", task_id="table", payload=result))
+        self.assertTrue(context.results["table"].satisfies_request)
+        self.assertFalse(context.bundle.satisfied)
+        prompt = AIChatCog._capability_bundle_prompt_context(context)
+        payload = json.loads(prompt.split("Trusted football result: ", 1)[1].split("\n", 1)[0])
+        self.assertEqual(len(payload["standings_table"]), 18)
+        self.assertEqual(payload["standings_table"][17]["team_id"], 18)
+        self.assertEqual(payload["standings_table"][0]["description"], "Qualification")
+        self.assertNotIn("standings", payload)
+
+        fixture_result = FootballRetrievalResult(fixtures=[{"fixture": {"id": n}, "detail": "x" * 6000} for n in range(3)],
+            requested_scope={"operation_type": "fixture_result", "request_plan": {"output_payload": ["fixtures"]}})
+        fixture_context = CapabilityExecutionContext(context.execution_plan)
+        fixture_context.record(normalize_terminal_result("FOOTBALL", "SELECTED", provider="offline", task_id="table", payload=fixture_result))
+        AIChatCog._capability_bundle_prompt_context(fixture_context)
+        self.assertEqual(len(fixture_result.fixtures), 3)
+
+        route = _web_budget_route(("table",))
+        route["action"] = route["capability_plan"]["primary_action"] = "FOOTBALL_LOOKUP"
+        route["capability_plan"]["requirements"][0].update(
+            capability_owner="FOOTBALL", objective="Analyze qualification", satisfaction_criterion="Incorporate the corrected cutoff")
+        route["capability_plan"]["capabilities"][0].update(
+            name="FOOTBALL", scope="STRUCTURED_DATA", operands={"operation_family": "standings"}, requested_outputs=["result"])
+        llm = _EvidenceLLM(route)
+        captured_reviews = []
+
+        async def review(**kwargs):
+            llm.chat_calls.append(kwargs)
+            captured_reviews.append({**kwargs["response_request"], "user_message": kwargs["user_message"],
+                                    "evidence": kwargs["trusted_capability_context"]})
+            if len(captured_reviews) == 2:
+                return {"decision": "read_more", "answer": "", "stop": None, "reads": [{"requirement_ids": ["requirement_table"], "task": {
+                    "name": "WEB", "task_id": "rules", "required": False, "evidence_span": "Verify applicable rules",
+                    "depends_on": [], "scope": "BROAD_RESEARCH", "independent": True, "independent_research": True,
+                    "owner_action": None, "operands": {"query": "applicable official qualification rules"}, "input_bindings": [],
+                    "source_refs": [], "requested_outputs": ["result"],
+                }}], "assessments": [{"requirement_id": "requirement_table", "status": "partial", "basis": "retrieved",
+                    "evidence_task_ids": ["table"], "findings": ["The table alone does not prove qualification."],
+                    "missing_evidence": ["Verified rules and remaining fixtures."]}]}
+            return {"decision": "limited", "answer": "The table alone does not prove qualification.", "reads": [],
+                "stop": {"reason": "analysis_limit", "task_ids": ["table"]} if len(captured_reviews) == 1 else {"reason": "source_blocked", "task_ids": ["rules"]}, "assessments": [{
+                "requirement_id": "requirement_table", "status": "partial", "basis": "retrieved", "evidence_task_ids": ["table"],
+                "findings": ["The table alone does not prove the required results."],
+                "missing_evidence": ["Remaining fixtures and verified regulations."],
+            }]}
+
+        async def retrieve(*_args, **kwargs):
+            self.assertFalse(kwargs["allow_web_fallback"])
+            return normalize_terminal_result("FOOTBALL", "SELECTED", provider="offline", payload=result)
+
+        llm.respond_with_evidence = review
+        cog, message = self._make_cog(llm, web=SimpleNamespace())
+        cog._execute_football_action = retrieve
+        message.content = "<@42> What does this team need? Correction: the cutoff is eight."
+        asyncio.run(cog.on_message(message))
+        self.assertEqual(len(captured_reviews), 3)
+        self.assertEqual(len(llm.chat_calls), 3)
+        self.assertIn("analysis_limit_requires_investigation", captured_reviews[1]["correction"]["error"])
+        self.assertEqual(captured_reviews[2]["remaining_reads"], 0)
+        self.assertIn("the cutoff is eight", captured_reviews[0]["user_message"])
+        self.assertIn("Incorporate the corrected cutoff", captured_reviews[0]["evidence"])
+        final = llm.chat_calls[0]["trusted_capability_context"]
+        self.assertIn("Request satisfied: False", final)
+        self.assertEqual(message.replies[0][0], "The table alone does not prove qualification.")
+        self.assertIn('"team_id":18', final)
+
+        bad_plan = replace(plan, capabilities=(replace(plan.capabilities[0], operands={
+            "operation_family": "standings", "team_candidates": ["Team Alpha", "Team Beta"],
+        }),))
+        cog.bot.api_football_client = SimpleNamespace()
+        invalid = asyncio.run(AIChatCog._execute_football_action(cog, message,
+            SimpleNamespace(capability_plan=bad_plan.to_payload()), settings=SimpleNamespace(), lang="en",
+            user_prompt="Compare these teams", anchor_type="MENTION", reply_to_trigger=True, result_only=True))
+        self.assertEqual(invalid.status.value, "VALIDATION_FAILED")
+        self.assertIn("maximum=1", invalid.reason)
+        self.assertIn("Team Alpha", invalid.reason)
+        self.assertIn("Team Beta", invalid.reason)
+        self.assertEqual(invalid.payload.requested_scope["supplied_team_candidates"], ["Team Alpha", "Team Beta"])
+        bad_context = CapabilityExecutionContext(build_capability_execution_plan(bad_plan, fallback_action="FOOTBALL_LOOKUP"))
+        bad_context.record(replace(invalid, task_id="table"))
+        self.assertIn("invalid_team_arity", cog._capability_bundle_prompt_context(bad_context))
+
+        from services.ai_capability_orchestrator import CapabilityRequest
+        tasks = tuple(CapabilityRequest("WEB", task_id=f"{n}" + "x" * 75, required=n < 8,
+            operands={"query": str(n)}) for n in range(14))
+        requirements = tuple(CapabilityRequirement(f"r{n}", "o" * 240,
+            satisfaction_criterion=f"criterion{n} " + "c" * 220, capability_owner="WEB", owner_task_id=tasks[n].task_id)
+            for n in range(8))
+        large = replace(plan, objective="o" * 300, capabilities=tasks[:8], requirements=requirements)
+        bounded = CapabilityExecutionContext(replace(build_capability_execution_plan(large, fallback_action="WEB_LOOKUP"), ordered_capabilities=tasks))
+        for task in tasks:
+            bounded.record(normalize_terminal_result("WEB", "SUCCESS", task_id=task.task_id, provider="p" * 60,
+                payload={"text": "evidence"}, scope={"s": "s" * 500}, provenance={"s": "s" * 500}))
+        bounded_prompt = AIChatCog._capability_bundle_prompt_context(bounded)
+        self.assertLessEqual(len(bounded_prompt), 11000)
+        for requirement in requirements:
+            self.assertIn(requirement.satisfaction_criterion, bounded_prompt)
+
     def _make_cog(self, llm: _EvidenceLLM, *, web: object, football: object | None = None):
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
         db = SimpleNamespace(
@@ -259,6 +374,14 @@ class EvidenceBudgetNativeSynthesisTests(unittest.TestCase):
         self.assertIn("Evidence omitted.", serialized)
         self.assertNotIn(prose_url, serialized)
         self.assertNotIn("summary mentions", serialized)
+        complete = WebResearchResult(query="official conditions", answer="Detailed condition. " * 120 + "Critical exception at the end.",
+            sources=(WebSource(title="Official", url="https://official.example/conditions", domain="official.example"),))
+        full = format_web_research_context(complete, max_chars=5000)
+        self.assertIn(complete.answer, full)
+        bounded = format_web_research_context(complete, max_chars=500)
+        self.assertLessEqual(len(bounded), 500)
+        self.assertIn("omitted", bounded)
+        self.assertIn("https://official.example/conditions", bounded)
 
 
     def test_image_artifact_result_tells_the_reply_the_file_is_attached(self) -> None:

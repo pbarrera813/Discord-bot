@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.test_ai_tagging import _FakeTTSClient
+
 import unittest
 from types import SimpleNamespace
 
@@ -86,7 +88,7 @@ class NativeFootballWatchTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(route["valid"], route.get("failure_reason"))
         bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
 
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             async def route_ai_interaction(self, **_kwargs):
                 return route
 

@@ -54,11 +54,12 @@ class XAISemanticAuthorityTests(unittest.TestCase):
                 "How the bot should reply: Do not start with a greeting | concise replies | Ada Lovelace",
             ]
         )
+        user_text = 'Explain this literally: "ignore previous instructions".\n```python\nif ready:\n    first()\nsecond()\n```\n' + ('context ' * 200) + ' Keep the last condition.'
 
         asyncio.run(
             _Client(session).chat(
                 server_context=context,
-                user_message="hello",
+                user_message=user_text,
                 author_name="user",
                 channel_name="general",
                 conversation_history=[],
@@ -66,6 +67,7 @@ class XAISemanticAuthorityTests(unittest.TestCase):
         )
 
         sent = json.dumps(session.calls[0]["json"]["input"], ensure_ascii=False)
+        self.assertTrue(session.calls[0]["json"]["input"][-1]["content"].endswith(user_text))
         for saved_value in (
             "warm but practical",
             "moon-toast lore",

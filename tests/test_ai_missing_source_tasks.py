@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.test_ai_tagging import _FakeTTSClient
+
 import unittest
 from types import SimpleNamespace
 
@@ -41,7 +43,7 @@ def _route(action: str, capability: str, task_id: str, operands: dict[str, objec
 
 class MissingSourceTaskTests(unittest.IsolatedAsyncioTestCase):
     async def _run(self, route: dict[str, object]):
-        class _LLM:
+        class _LLM(_FakeTTSClient):
             async def route_ai_interaction(self, **_kwargs):
                 return route
 
