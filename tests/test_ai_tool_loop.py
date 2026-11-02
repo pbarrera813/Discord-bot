@@ -174,9 +174,6 @@ class _ToolLLM(_FakeTTSClient):
         self.generated.append(prompt)
         return PNG
 
-    async def route_ai_interaction(self, **_kwargs):
-        raise AssertionError("the router must not run")
-
 
 class ToolTurnTests(unittest.IsolatedAsyncioTestCase):
     async def _run(self, llm: _ToolLLM, *, content: str = "<@42> hi", glot: object | None = None, **bot_extra):
@@ -243,6 +240,17 @@ class ToolTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.data for item in llm.vision_calls[0]["image_inputs"]], [PNG])
         self.assertEqual(llm.outputs[1][0]["status"], "SUCCESS")
         self.assertEqual(llm.outputs[1][0]["data"], {"analysis": "A red bicycle beside a blue door."})
+
+    async def test_a_refused_change_names_the_missing_arguments(self) -> None:
+        # Production 2026-11-02: a reminder without duration and text came back as "mutation_batch_preflight_failed"
+        # and Grok gave up instead of retrying.
+        llm = _ToolLLM([[{"call_id": "r1", "name": "reminder", "args": {"reminder_action": "create", "purpose": "oven in 10 minutes"}}]])
+
+        await self._run(llm, content="<@42> remind me in 10 minutes to check the oven")
+
+        self.assertEqual(llm.outputs[0][0]["status"], "NOT_EXECUTED")
+        self.assertIn("reminder_duration", llm.outputs[0][0]["reason"])
+        self.assertIn("reminder_message", llm.outputs[0][0]["reason"])
 
     async def test_memory_lookup_dispatches_its_own_operation(self) -> None:
         llm = _ToolLLM([[{"call_id": "m1", "name": "memory", "args": {

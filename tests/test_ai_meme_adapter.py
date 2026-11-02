@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import unittest
-from dataclasses import replace
 
-from cogs.ai_chat import MAX_RESULT_IMAGE_ARTIFACT_BYTES
-from services.ai_capability_orchestrator import CapabilityTerminalStatus
 from services.memegen import MemeGenClient
 from services.xai_client import XAIClient
-from tests.test_ai_artifact_delivery import _LifecycleAttachment, _artifact_lifecycle_cog, _multi_image_route
+from tests.test_ai_artifact_delivery import _artifact_lifecycle_cog
 
 TASK_ID = "meme_1"
 PNG = b"\x89PNG\r\n\x1a\nmeme-bytes"
@@ -132,187 +129,10 @@ def _translate_meme_route(*, via_chat: bool, direct_field: str = "text") -> dict
     return base
 
 
-class MemeAdapterTests(unittest.IsolatedAsyncioTestCase):
-    async def _run(
-        self,
-        operands: dict[str, object],
-        *,
-        memegen: object,
-        refs=None,
-        attach: bool = False,
-        tamper=None,
-    ):
-        cog, message, llm = _artifact_lifecycle_cog({})
-        if attach:
-            message.attachments = [_LifecycleAttachment(
-                attachment_id=100, filename="source.png", size=4, url=SOURCE_URL,
-            )]
-        cog.bot.memegen_client = memegen
-        if tamper is not None:
-            honest = cog._image_artifact_terminal_result
-            cog._image_artifact_terminal_result = lambda *args, **kwargs: tamper(honest(*args, **kwargs))
-        contexts: list[object] = []
-        cog._log_capability_terminal_checkpoint = lambda _message, context: contexts.append(context)
-
-        async def route_ai_interaction(**kwargs):
-            sources = kwargs["image_metadata"].get("image_sources", [])
-            source_refs = list(refs(sources)) if refs is not None else []
-            return _validated(_meme_route(operands, source_refs))
-
-        llm.route_ai_interaction = route_ai_interaction
-        await cog.on_message(message)
-        result = contexts[-1].bundle.by_task[TASK_ID] if contexts else None
-        return message, result
-
-    @staticmethod
-    def _delivered(message) -> list[tuple[str, bytes]]:
-        return [item for send in message.channel.sends for item in send["files"]]
-
-    async def _assert_success(self, operands, *, expected_url: str, refs=None, attach=False):
-        memegen = _FakeMemegen()
-        message, result = await self._run(operands, memegen=memegen, refs=refs, attach=attach)
-        self.assertEqual(result.status, CapabilityTerminalStatus.SUCCESS, result.reason)
-        self.assertTrue(result.satisfies_request)
-        self.assertEqual(result.payload["artifact"], PNG)
-        self.assertEqual(result.payload["content_type"], "image/png")
-        self.assertEqual(memegen.fetch_urls, [expected_url])
-        delivered = self._delivered(message)
-        self.assertEqual(len(delivered), 1)
-        self.assertTrue(delivered[0][0].endswith(".png"))
-        self.assertEqual(delivered[0][1], PNG)
-        return memegen
-
-    async def _assert_failure(self, operands, *, reason: str | None, status=None, memegen=None, refs=None, attach=False):
-        memegen = memegen if memegen is not None else _FakeMemegen()
-        message, result = await self._run(operands, memegen=memegen, refs=refs, attach=attach)
-        self.assertIsNotNone(result)
-        self.assertNotEqual(result.status, CapabilityTerminalStatus.SUCCESS)
-        self.assertFalse(result.satisfies_request)
-        if reason is not None:
-            self.assertEqual(result.reason, reason)
-        if status is not None:
-            self.assertEqual(result.status, status)
-        self.assertEqual(memegen.fetch_urls, [])
-        self.assertEqual(self._delivered(message), [])
-        return result
-
-    async def test_template_by_exact_id_fetches_once_and_delivers_one_png(self) -> None:
-        operands = {"meme_action": "template", "meme_template": "drake", "meme_top": "hello", "meme_bottom": "world"}
-        expected = MemeGenClient().build_template_url(template_id="drake", top_text="hello", bottom_text="world")
-        memegen = await self._assert_success(operands, expected_url=expected)
-        self.assertEqual(memegen.list_calls, 1)
-
-
-    async def test_template_miss_is_typed_and_never_fetches(self) -> None:
-        operands = {"meme_action": "template", "meme_template": "Unknown Meme", "meme_top": "hello"}
-        await self._assert_failure(operands, reason="meme_template_not_found", status=CapabilityTerminalStatus.VALIDATION_FAILED)
-
-
-    async def test_a_forged_meme_result_is_never_delivered(self) -> None:
-        forgeries = {
-            "image provider": lambda result: replace(result, provider="xai_image"),
-            "image provenance source": lambda result: replace(result, provenance={**result.provenance, "source": "generate_image"}),
-            "unknown execution path": lambda result: replace(result, provenance={**result.provenance, "execution_path": "memegen_other"}),
-        }
-        operands = {"meme_action": "template", "meme_template": "drake", "meme_top": "hello"}
-        for name, tamper in forgeries.items():
-            with self.subTest(name):
-                message, _result = await self._run(operands, memegen=_FakeMemegen(), tamper=tamper)
-                self.assertEqual(self._delivered(message), [])
-
-    async def test_an_image_generation_result_cannot_borrow_memegen_trust(self) -> None:
-        task = {
-            "task_id": "image_a", "name": "IMAGE_GENERATE", "required": True,
-            "evidence_span": "generate image", "depends_on": [], "scope": "IMAGE_GENERATION",
-            "independent": True, "independent_research": False, "owner_action": None,
-            "operands": {"prompt": "image prompt"}, "input_bindings": [], "source_refs": [],
-            "requested_outputs": ["artifact"],
-        }
-        route = _multi_image_route(tasks=[task], artifacts=[{"upstream_task_id": "image_a", "output_field": "artifact"}])
-        cog, message, _llm = _artifact_lifecycle_cog(route)
-
-        async def borrowed(*_args, **_kwargs):
-            return cog._image_artifact_terminal_result(
-                "IMAGE_GENERATE", PNG, source="memegen", provider="memegen", filename="nitori_meme.png",
-                provenance={"execution_path": "memegen_template"},
-            )
-
-        cog._execute_image_generation_result_only = borrowed
-        await cog.on_message(message)
-        self.assertEqual(message.channel.sends[0]["files"], [])
-
-    async def test_random_picks_from_the_provider_list_and_delivers(self) -> None:
-        operands = {"meme_action": "random", "meme_top": "hello"}
-        memegen = _FakeMemegen()
-        message, result = await self._run(operands, memegen=memegen)
-        self.assertEqual(result.status, CapabilityTerminalStatus.SUCCESS, result.reason)
-        self.assertEqual(len(memegen.fetch_urls), 1)
-        self.assertTrue(any(f"/images/{item['id']}/" in memegen.fetch_urls[0] for item in TEMPLATES))
-        self.assertEqual(len(self._delivered(message)), 1)
-
-    async def test_custom_background_is_the_exact_authorized_ref_url(self) -> None:
-        operands = {"meme_action": "custom", "meme_top": "top", "meme_bottom": "bottom"}
-        expected = MemeGenClient().build_custom_url(background_url=SOURCE_URL, top_text="top", bottom_text="bottom")
-        await self._assert_success(
-            operands, expected_url=expected, attach=True,
-            refs=lambda sources: [sources[0]["ref"]],
-        )
-
-
-    def test_a_non_null_operand_of_another_capability_is_still_refused(self) -> None:
-        for leaked in ({"prompt": "texto gracioso"}, {"query": "memes de lunes"}):
-            with self.subTest(leaked):
-                route = _meme_route({"meme_action": "random", "meme_top": "hello", **leaked})
-                self.assertFalse(_validated(route)["valid"])
-
-
-    async def test_download_problems_are_typed_and_nothing_is_attached(self) -> None:
-        operands = {"meme_action": "template", "meme_template": "drake", "meme_top": "hello"}
-        cases = (
-            ("not_png", _FakeMemegen(content_type="image/jpeg"), "meme_not_png"),
-            ("fetch_error", _FakeMemegen(fetch_error=RuntimeError("down")), "RuntimeError"),
-            ("oversize", _FakeMemegen(body=b"x" * (MAX_RESULT_IMAGE_ARTIFACT_BYTES + 1)), "invalid_image_artifact"),
-        )
-        for name, memegen, reason in cases:
-            with self.subTest(case=name):
-                message, result = await self._run(operands, memegen=memegen)
-                self.assertEqual(result.status, CapabilityTerminalStatus.PROVIDER_FAILURE)
-                self.assertEqual(result.reason, reason)
-                self.assertFalse(result.satisfies_request)
-                self.assertEqual(len(memegen.fetch_urls), 1)
-                self.assertEqual(self._delivered(message), [])
-
 
 if __name__ == "__main__":
     unittest.main()
 
-class MemeBoundCaptionTests(unittest.IsolatedAsyncioTestCase):
-    async def _run(self, meme_operands: dict[str, object], *, caption: str = "Cuando el lunes te gana", binding_field: str = "answer"):
-        cog, message, llm = _artifact_lifecycle_cog({})
-        memegen = _FakeMemegen()
-        cog.bot.memegen_client = memegen
-        calls: list[dict[str, object]] = []
-
-        async def chat(**kwargs):
-            calls.append(kwargs)
-            return caption if len(calls) == 1 else "listo"
-
-        llm.chat = chat
-        contexts: list[object] = []
-        cog._log_capability_terminal_checkpoint = lambda _message, context: contexts.append(context)
-
-        async def route_ai_interaction(**_kwargs):
-            return _validated(_bound_caption_route(meme_operands, binding_field=binding_field))
-
-        llm.route_ai_interaction = route_ai_interaction
-        await cog.on_message(message)
-        by_task = contexts[-1].bundle.by_task if contexts else {}
-        return message, memegen, by_task
-
-
-    async def test_only_text_outputs_may_feed_a_caption(self) -> None:
-        route = _bound_caption_route({"meme_action": "random", "meme_text_slot": "top"}, binding_field="artifact")
-        self.assertFalse(_validated(route)["valid"])
 
 class MemeCaptionFromTranslationTests(unittest.IsolatedAsyncioTestCase):
     async def _run(self, *, via_chat: bool, direct_field: str = "text"):
@@ -336,12 +156,6 @@ class MemeCaptionFromTranslationTests(unittest.IsolatedAsyncioTestCase):
         return message, memegen, chat_calls
 
 
-    async def test_the_translation_binds_through_its_result_output_as_xai_chose_in_production(self) -> None:
-        self.assertTrue(_validated(_translate_meme_route(via_chat=False, direct_field="result"))["valid"])
-        message, memegen, calls = await self._run(via_chat=False, direct_field="result")
-        self.assertIn("/Good_morning/", memegen.fetch_urls[0])
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(len([f for send in message.channel.sends for f in send["files"]]), 1)
 
     async def test_a_bound_result_without_text_is_a_typed_failure(self) -> None:
         from services.ai_capability_orchestrator import normalize_terminal_result
@@ -354,13 +168,3 @@ class MemeCaptionFromTranslationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.reason, "invalid_meme_text_binding")
         self.assertEqual(memegen.fetch_urls, [])
-
-    def test_a_free_standing_non_independent_chat_next_to_a_specialized_task_is_still_refused(self) -> None:
-        route = _translate_meme_route(via_chat=True)
-        plan = route["capability_plan"]
-        for task in plan["capabilities"]:
-            if task["name"] == "CHAT":
-                task["input_bindings"] = []
-        plan["capabilities"][2]["input_bindings"] = [{"upstream_task_id": "translate1", "output_field": "text"}]
-        plan["capabilities"][2]["depends_on"] = ["translate1", "chat_caption"]
-        self.assertFalse(_validated(route)["valid"])

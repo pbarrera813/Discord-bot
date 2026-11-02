@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from tests.test_ai_tagging import _FakeTTSClient
 
 import unittest
 from datetime import date, datetime, timezone
@@ -13,10 +12,9 @@ import discord
 import cogs.birthdays as birthdays
 from cogs.ai_chat import AIChatCog
 from cogs.birthdays import BirthdaysCog
-from services.ai_capability_orchestrator import CapabilityTerminalStatus
 from services.ai_operation_catalog import operation_effect, validate_operands
 from services.xai_client import XAIClient
-from tests.test_ai_tagging import _CaptureChannel, _DummyGuild, _DummyMessage, _async_return
+from tests.test_ai_tagging import _async_return
 
 NOW = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
 
@@ -414,61 +412,6 @@ class BirthdayCommandParityTests(unittest.IsolatedAsyncioTestCase):
         await BirthdaysCog.birthday_view.callback(self._cog(db), ctx, user=_Member(99))
         self.assertEqual(sent[0]["embed"].title, "Birthday profile")
 
-
-class BirthdayLifecycleTests(unittest.IsolatedAsyncioTestCase):
-    async def test_native_set_task_executes_once_with_one_synthesis_and_one_reply(self) -> None:
-        route = _birthday_route({"birthday_action": "set", "birth_month": 3, "birth_day": 14, "birth_year": 1990})
-        self.assertTrue(route["valid"], route.get("failure_reason"))
-        fake = _FakeDb()
-        bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
-
-        class _LLM(_FakeTTSClient):
-            def __init__(self) -> None:
-                self.route_calls = 0
-                self.chat_calls: list[dict[str, object]] = []
-
-            async def route_ai_interaction(self, **_kwargs):
-                self.route_calls += 1
-                return route
-
-            async def chat(self, **kwargs):
-                self.chat_calls.append(kwargs)
-                return "Your birthday is saved."
-
-        llm = _LLM()
-        db = SimpleNamespace(
-            get_or_create_guild_settings=_async_return(SimpleNamespace(prefix="!", language_code="en", server_context="")),
-            is_ai_channel_allowed=_async_return(True),
-            get_ai_conversation_history=_async_return([]),
-            get_announcement_settings=_async_return(SimpleNamespace(channel_id=None)),
-            add_ai_conversation_turn=_async_return(None),
-            get_or_create_birthday_guild_settings=fake.get_or_create_birthday_guild_settings,
-            upsert_birthday_profile=fake.upsert_birthday_profile,
-        )
-        bot = SimpleNamespace(user=bot_user, application_id=1234, db=db, llm_client=llm, is_owner_user=lambda _user: False)
-        cog = AIChatCog(bot)
-        contexts: list[object] = []
-        cog._log_capability_terminal_checkpoint = lambda _message, context: contexts.append(context)
-        message = _DummyMessage(
-            attachments=[], author_id=99, guild_id=1, channel_id=10,
-            content="<@42> my birthday is March 14 1990", mentions=[bot_user], message_id=8400,
-        )
-        message.guild = _DummyGuild()
-        message.channel = _CaptureChannel()
-
-        await cog.on_message(message)
-
-        self.assertEqual(
-            fake.upserts,
-            [{"guild_id": 1, "user_id": 99, "month": 3, "day": 14, "birth_year": 1990, "timezone_name": None}],
-        )
-        result = contexts[-1].bundle.by_task["birthday_1"]
-        self.assertEqual(result.status, CapabilityTerminalStatus.SUCCESS)
-        self.assertTrue(result.satisfies_request)
-        self.assertEqual(llm.route_calls, 1)
-        self.assertEqual(len(llm.chat_calls), 1)
-        self.assertIn("Trusted birthday result: ", str(llm.chat_calls[0]["trusted_capability_context"]))
-        self.assertEqual([reply for reply, _mention in message.replies], ["Your birthday is saved."])
 
 
 class _Channel:

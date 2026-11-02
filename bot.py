@@ -52,11 +52,9 @@ class DiscordModBot(commands.Bot):
         self.llm_client = XAIClient(
             settings.xai_api_key,
             settings.xai_model,
-            vision_model=settings.xai_vision_model,
             image_model=settings.xai_image_model,
             tts_voice=settings.xai_tts_voice,
             tts_language=settings.xai_tts_language,
-            router_output_token_ceiling=getattr(settings, "xai_router_output_token_ceiling", None),
         )
         self.mc_client = McSrvStatClient()
         self.ninjas_client = (

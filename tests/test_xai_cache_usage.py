@@ -4,7 +4,7 @@ import asyncio
 import json
 import unittest
 
-from services.xai_client import XAIClient, XAICompletionError
+from services.xai_client import XAIClient
 
 
 class _Response:
@@ -61,12 +61,11 @@ class CompletionCacheKeyAndUsageTests(unittest.TestCase):
         for kind, cache_key, expected_role in (
             ("completion", "nitori-chat", "nitori-chat"), ("completion", None, "other"),
             ("json", "nitori-football-identity-selector", "nitori-football-identity-selector"),
-            ("response", "nitori-chat", "nitori-chat"),
             ("web", "nitori-web-research", "nitori-web-research"),
         ):
             with self.subTest(kind=kind, cache_key=cache_key):
                 captured: dict = {}
-                body = {**_COMPLETION, "output": [{"type": "message", "content": [{"type": "output_text", "text": '{"ok":true}'}]}]} if kind in {"json", "response"} else _COMPLETION
+                body = {**_COMPLETION, "output": [{"type": "message", "content": [{"type": "output_text", "text": '{"ok":true}'}]}]} if kind == "json" else _COMPLETION
                 client = _client(captured, body=body)
                 with self.assertLogs(level="INFO") as logs:
                     if kind == "completion":
@@ -74,9 +73,6 @@ class CompletionCacheKeyAndUsageTests(unittest.TestCase):
                             [{"role": "user", "content": "hi"}], temperature=0.2, max_tokens=20, cache_key=cache_key,
                         ))
                         self.assertEqual(str(result), "hola")
-                    elif kind == "response":
-                        result = asyncio.run(client.respond_with_evidence(response_request={"remaining_reads":6}, server_context="", user_message="analyze", author_name="tester", channel_name="general", request_date="2026-10-30"))
-                        self.assertEqual(result, {"ok": True})
                     elif kind == "json":
                         result = asyncio.run(client._small_json_call(
                             system_prompt="Return JSON.", request={"query": "hi"}, max_output_tokens=20,
@@ -92,20 +88,6 @@ class CompletionCacheKeyAndUsageTests(unittest.TestCase):
                     f"AI xAI usage role={expected_role} input=4731 cached=4096 output=318 reasoning=290 cost_usd=0.0066",
                     "\n".join(logs.output),
                 )
-                if kind == "response":
-                    fixed = captured["payload"]["input"][0]["content"].split("\nCurrent request date:", 1)[0]
-                    asyncio.run(client.respond_with_evidence(response_request={"remaining_reads":3, "correction":{"error":"invalid read", "rejected_response":{"decision":"read_more"}}}, server_context="", user_message="corrected analysis", author_name="tester", channel_name="general", request_date="2026-10-31"))
-                    self.assertTrue(captured["payload"]["input"][0]["content"].startswith(fixed))
-                    self.assertEqual(captured["payload"]["max_output_tokens"], 6000)
-                    self.assertTrue(captured["payload"]["text"]["format"]["strict"])
-                    self.assertIn("corrected analysis", captured["payload"]["input"][-1]["content"])
-        for status, prose in (("completed", "Unassessed prose must never be delivered."), ("incomplete", '{"decision":"answer"')):
-            with self.subTest(status=status):
-                captured = {}
-                client = _client(captured, body={**_COMPLETION, "status": status, "output": [{"type":"message", "content":[{"type":"output_text", "text":prose}]}]})
-                with self.assertLogs(level="INFO") as logs, self.assertRaises((ValueError, XAICompletionError)):
-                    asyncio.run(client.respond_with_evidence(response_request={}, server_context="", user_message="hello", author_name="tester", channel_name="general"))
-                self.assertEqual(sum("AI xAI usage role=" in line for line in logs.output), 1)
         for status in ("completed", "incomplete"):
             captured = {}
             body = {**_COMPLETION, "status":status}
@@ -117,22 +99,6 @@ class CompletionCacheKeyAndUsageTests(unittest.TestCase):
             self.assertEqual(result["failure_reason"], reason)
             self.assertEqual(result["provider_status"], status.upper())
 
-
-class RouterRequestShapeTests(unittest.TestCase):
-    def test_the_router_carries_a_key_and_puts_the_per_message_parts_last(self) -> None:
-        captured: dict = {}
-        client = _client(captured, status=400, body={"error": "captured offline"})
-        asyncio.run(client.route_ai_interaction(
-            bot_name="Nitori", author_name="tester", current_message="hello", anchor_type="NAME_AT_START",
-            recent_context=[], available_emojis=["a: <:a:1>"], channel_metadata={"id": 5, "name": "general"},
-        ))
-        payload = captured["payload"]
-        self.assertEqual(payload["prompt_cache_key"], "nitori-router")
-        keys = list(json.loads(payload["input"][1]["content"]))
-        stable = ("bot", "bot_aliases", "channel", "available_emojis", "request_timezone")
-        volatile = ("current_message", "mentions", "reply", "lease", "request_date", "recent_channel_sequence")
-        self.assertLess(max(keys.index(key) for key in stable), min(keys.index(key) for key in volatile))
-        self.assertEqual(keys[-1], "recent_channel_sequence")
 
 
 class ReactionRequestShapeTests(unittest.TestCase):

@@ -325,12 +325,6 @@ def operand_descriptors(family: str) -> dict[str, OperandDescriptor]:
     return dict(OPERAND_DESCRIPTORS.get(str(family or "").strip().upper(), {}))
 
 
-def native_operand_schema() -> dict[str, dict[str, Any]]:
-    merged: dict[str, OperandDescriptor] = {}
-    for descriptors in OPERAND_DESCRIPTORS.values():
-        merged.update(descriptors)
-    return {field: descriptor.json_schema() for field, descriptor in merged.items()}
-
 
 # Strict mode forces a value on every non-nullable operand, so the router fills the other families' selectors and arrays too.
 _SCHEMA_FORCED = frozenset(

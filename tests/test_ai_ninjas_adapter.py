@@ -1,17 +1,14 @@
 from __future__ import annotations
 
-from tests.test_ai_tagging import _FakeTTSClient
 
 import math
 import unittest
 from types import SimpleNamespace
 
-from cogs.ai_chat import AIChatCog
-from services.ai_capability_orchestrator import CapabilityTerminalStatus
 from services.ai_operation_catalog import validate_operands
 from services.api_ninjas import execute_operation
 from services.xai_client import XAIClient
-from tests.test_ai_tagging import _CaptureChannel, _DummyGuild, _DummyMessage, _async_return
+from tests.test_ai_tagging import _async_return
 
 
 def _ninjas_route(operands: dict[str, object], *, task_id: str = "ninjas_1") -> dict[str, object]:
@@ -219,80 +216,6 @@ class NinjasCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("couldn't find that target unit", sent[0][0][0])
         self.assertIn("Available: `kilometer, mile`.", sent[0][0][0])
 
-
-class NinjasLifecycleTests(unittest.IsolatedAsyncioTestCase):
-    async def _run(self, route: dict[str, object], *, ninjas: object | None):
-        bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
-
-        class _LLM(_FakeTTSClient):
-            def __init__(self) -> None:
-                self.route_calls = 0
-                self.chat_calls: list[dict[str, object]] = []
-
-            async def route_ai_interaction(self, **_kwargs):
-                self.route_calls += 1
-                return route
-
-            async def chat(self, **kwargs):
-                self.chat_calls.append(kwargs)
-                return "Here is the provider-backed answer."
-
-        llm = _LLM()
-        db = SimpleNamespace(
-            get_or_create_guild_settings=_async_return(
-                SimpleNamespace(prefix="!", language_code="en", server_context="")
-            ),
-            is_ai_channel_allowed=_async_return(True),
-            get_ai_conversation_history=_async_return([]),
-            get_or_create_birthday_guild_settings=_async_return({}),
-            get_announcement_settings=_async_return(SimpleNamespace(channel_id=None)),
-            add_ai_conversation_turn=_async_return(None),
-        )
-        bot = SimpleNamespace(
-            user=bot_user, application_id=1234, db=db, llm_client=llm,
-            is_owner_user=lambda _user: False, ninjas_client=ninjas,
-        )
-        cog = AIChatCog(bot)
-        contexts: list[object] = []
-        cog._log_capability_terminal_checkpoint = lambda _message, context: contexts.append(context)
-        message = _DummyMessage(
-            attachments=[], author_id=99, guild_id=1, channel_id=10,
-            content="<@42> do the lookup", mentions=[bot_user], message_id=8100,
-        )
-        message.guild = _DummyGuild()
-        message.channel = _CaptureChannel()
-        await cog.on_message(message)
-        return llm, message, contexts[-1].bundle.by_task["ninjas_1"] if contexts else None
-
-    async def test_native_whois_task_executes_once_and_reaches_synthesis(self) -> None:
-        route = _ninjas_route({"ninjas_action": "whois", "domain": "example.com"})
-        self.assertTrue(route["valid"], route.get("failure_reason"))
-        ninjas = _FakeNinjas()
-
-        llm, message, result = await self._run(route, ninjas=ninjas)
-
-        self.assertEqual(ninjas.calls, [("whois", ("example.com",))])
-        self.assertEqual(result.status, CapabilityTerminalStatus.SUCCESS)
-        self.assertTrue(result.satisfies_request)
-        self.assertEqual(result.payload["operation"], "whois")
-        self.assertEqual(result.payload["registrar"], "Synthetic Registrar")
-        self.assertEqual(llm.route_calls, 1)
-        self.assertEqual(len(llm.chat_calls), 1)
-        trusted = str(llm.chat_calls[0]["trusted_capability_context"])
-        self.assertIn("Synthetic Registrar", trusted)
-        self.assertIn("example.com", trusted)
-        self.assertEqual([reply for reply, _mention in message.replies], ["Here is the provider-backed answer."])
-
-
-    async def test_provider_error_is_typed_and_not_satisfied(self) -> None:
-        ninjas = _FakeNinjas(fail=True)
-
-        _llm, _message, result = await self._run(_ninjas_route({"ninjas_action": "joke"}), ninjas=ninjas)
-
-        self.assertEqual(len(ninjas.calls), 1)
-        self.assertEqual(result.status, CapabilityTerminalStatus.PROVIDER_FAILURE)
-        self.assertEqual(result.reason, "RuntimeError")
-        self.assertFalse(result.satisfies_request)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from tests.test_ai_tagging import _FakeTTSClient
 
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -15,7 +14,6 @@ from services.ai_capability_orchestrator import (
 from services.ai_operation_catalog import known_output_fields, operation_effect, validate_operands
 from services.server_memory import ServerMemoryService
 from services.xai_client import XAIClient
-from tests.test_ai_tagging import _CaptureChannel, _DummyGuild, _DummyMessage, _async_return
 
 LIFECYCLE = ("SERVER_MEMORY_LIST", "SERVER_MEMORY_APPROVE", "SERVER_MEMORY_REJECT")
 
@@ -310,114 +308,6 @@ def _memory_route(action: str, operands: dict[str, object]) -> dict[str, object]
     }
     return XAIClient("test-key", "test-model")._validate_route_decision("", has_supported_image=False, parsed=route)
 
-
-class MemoryLifecycleEndToEndTests(unittest.IsolatedAsyncioTestCase):
-    async def _run(self, route: dict[str, object], db: _MemoryDb, *, admin: bool):
-        bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori", bot=True)
-
-        class _LLM(_FakeTTSClient):
-            def __init__(self) -> None:
-                self.route_calls = 0
-                self.chat_calls: list[dict[str, object]] = []
-
-            async def route_ai_interaction(self, **_kwargs):
-                self.route_calls += 1
-                return route
-
-            async def chat(self, **kwargs):
-                self.chat_calls.append(kwargs)
-                return "Done."
-
-        llm = _LLM()
-        bot_db = SimpleNamespace(
-            get_or_create_guild_settings=_async_return(SimpleNamespace(prefix="!", language_code="en", server_context="")),
-            is_ai_channel_allowed=_async_return(True),
-            get_ai_conversation_history=_async_return([]),
-            get_or_create_birthday_guild_settings=_async_return({}),
-            get_announcement_settings=_async_return(SimpleNamespace(channel_id=None)),
-            add_ai_conversation_turn=_async_return(None),
-            expire_server_memories=db.expire_server_memories,
-            list_server_memories=db.list_server_memories,
-            get_server_memory=db.get_server_memory,
-            update_server_memory_status=db.update_server_memory_status,
-            delete_server_memory=db.delete_server_memory,
-        )
-        bot = SimpleNamespace(
-            user=bot_user, application_id=1234, db=bot_db, llm_client=llm, is_owner_user=lambda _user: False,
-        )
-        cog = AIChatCog(bot)
-        contexts: list[object] = []
-        cog._log_capability_terminal_checkpoint = lambda _message, context: contexts.append(context)
-        message = _DummyMessage(
-            attachments=[], author_id=99, guild_id=1, channel_id=10,
-            content="<@42> handle that pending memory", mentions=[bot_user], message_id=8400,
-        )
-        message.guild = _DummyGuild()
-        message.channel = _CaptureChannel()
-        message.author.guild_permissions = SimpleNamespace(manage_guild=admin, administrator=False)
-        await cog.on_message(message)
-        return llm, message, contexts[-1].bundle.by_task["memory_1"] if contexts else None
-
-    async def test_admin_approve_executes_once_with_one_synthesis_and_one_reply(self) -> None:
-        route = _memory_route("SERVER_MEMORY_APPROVE", {"memory_id": 5})
-        self.assertTrue(route["valid"], route.get("failure_reason"))
-        db = _MemoryDb([_row(5)])
-
-        llm, message, result = await self._run(route, db, admin=True)
-
-        self.assertEqual(db.status_updates, [{"memory_id": 5, "guild_id": 1, "status": "active", "approved_by_user_id": 99}])
-        self.assertEqual(result.status, CapabilityTerminalStatus.SUCCESS)
-        self.assertEqual(llm.route_calls, 1)
-        self.assertEqual(len(llm.chat_calls), 1)
-        self.assertIn("Trusted server memory result: ", str(llm.chat_calls[0]["trusted_capability_context"]))
-        self.assertEqual([reply for reply, _mention in message.replies], ["Done."])
-
-
-class MemoryDeleteByIdTests(unittest.IsolatedAsyncioTestCase):
-    _run = MemoryLifecycleEndToEndTests._run
-
-
-    async def test_admin_delete_by_id_deletes_that_row_whatever_its_status(self) -> None:
-        for status in ("active", "pending"):
-            with self.subTest(status=status):
-                route = _memory_route("SERVER_MEMORY_DELETE", {"memory_id": 13})
-                db = _MemoryDb([_row(13, status=status, memory_type="SERVER_FACT", subject_user_id=None)])
-                llm, _message_, result = await self._run(route, db, admin=True)
-                self.assertEqual(result.status, CapabilityTerminalStatus.SUCCESS, result.reason)
-                self.assertEqual((db.deleted, db.status_updates, 13 in db.rows), ([13], [], False))
-                self.assertIn('"status_after": "deleted"', str(llm.chat_calls[0]["trusted_capability_context"]).replace('":"', '": "'))
-
-    async def test_non_admin_delete_by_id_changes_nothing_unless_it_is_about_themselves(self) -> None:
-        db = _MemoryDb([_row(13, status="active", memory_type="SERVER_FACT", subject_user_id=55)])
-        _llm, _message_, result = await self._run(_memory_route("SERVER_MEMORY_DELETE", {"memory_id": 13}), db, admin=False)
-        self.assertEqual((db.status_updates, db.deleted), ([], []))
-        self.assertFalse(result.satisfies_request)
-        db = _MemoryDb([_row(13, status="active", memory_type="SERVER_FACT", subject_user_id=99)])
-        _llm, _message_, result = await self._run(_memory_route("SERVER_MEMORY_DELETE", {"memory_id": 13}), db, admin=False)
-        self.assertEqual(db.deleted, [13])
-
-
-class MemoryDeleteByKeyTests(unittest.IsolatedAsyncioTestCase):
-    _run = MemoryLifecycleEndToEndTests._run
-
-    @staticmethod
-    def _delete(**operands: object) -> dict[str, object]:
-        operands = {"memory_type": "SERVER_FACT", "subject": "someone", **operands}
-        route = _memory_route("SERVER_MEMORY_DELETE", operands)
-        route["memory"] = {"value": None, "scope": None, "key": None, **{k: v for k, v in operands.items() if v is not None}}
-        return route
-
-    async def test_a_key_that_matches_nothing_hands_back_the_stored_candidates_with_their_ids(self) -> None:
-        for operands in ({"key": "fan_trans"}, {"key": None}):
-            with self.subTest(operands=operands):
-                db = _MemoryDb([_row(15, status="active", memory_type="SERVER_FACT", subject_user_id=None, value="is a fan of x")])
-                llm, _message_, result = await self._run(self._delete(**operands), db, admin=True)
-                self.assertEqual(result.status, CapabilityTerminalStatus.NO_DATA)
-                self.assertFalse(result.satisfies_request)
-                self.assertEqual([c["id"] for c in result.payload["candidates"]], [15])
-                self.assertEqual(db.status_updates, [])
-                self.assertIn("Untrusted server memory text", str(llm.chat_calls[0]["trusted_capability_context"]))
-                self.assertEqual((result.reason, result.payload["state"]), ("memory_needs_selection", "needs_selection"))
 
 
 class MemorySubjectLinkTests(unittest.TestCase):

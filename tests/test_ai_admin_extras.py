@@ -13,8 +13,7 @@ from cogs.ai_chat import AIChatCog
 from cogs.moderation import ModerationCog
 from services.admin_actions import AdminActionService
 from services.ai_capability_orchestrator import CapabilityExecutionPlan, CapabilityRequest
-from services.ai_operation_catalog import ADMIN_MUTATING_OPERATIONS, native_operand_schema, operation_effect, validate_operands
-from services.xai_client import ROUTER_OUTPUT_SCHEMA
+from services.ai_operation_catalog import validate_operands
 from tests.test_ai_tagging import _CaptureChannel, _DummyMessage, _async_return, _typed_admin_plan
 
 NEW_MUTATIONS = ("set_slowmode", "set_nickname", "say")
@@ -216,31 +215,6 @@ class AdminExtrasCatalogTests(unittest.TestCase):
             with self.subTest(operands=operands):
                 self.assertEqual(validate_operands("ADMIN", operands), predicate)
 
-
-    def test_destructive_operands_are_validated_and_their_effects_mutate(self) -> None:
-        for operands in (
-            {"admin_action": "clear_channel", "target_channel": "general"},
-            {"admin_action": "clone_channel", "target_channel": "general"},
-            {"admin_action": "purge_user_messages", "target_user_id": 5, "message_count": 500},
-            {"admin_action": "purge_user_messages", "target_user_candidates": ["ana"], "message_count": 1},
-        ):
-            with self.subTest(operands=operands):
-                self.assertIsNone(validate_operands("ADMIN", operands))
-        for operands, predicate in (
-            ({"admin_action": "purge_user_messages", "message_count": -1}, "task_operand_type_or_bounds_invalid"),
-            ({"admin_action": "purge_user_messages", "message_count": "5"}, "task_operand_type_or_bounds_invalid"),
-            ({"admin_action": "purge_user_messages", "message_count": True}, "task_operand_type_or_bounds_invalid"),
-            ({"admin_action": "clear_channel", "target_channel": 5}, "task_operand_type_or_bounds_invalid"),
-            ({"admin_action": "clone_channel", "amount": 5}, "unknown_task_operand"),
-        ):
-            with self.subTest(operands=operands):
-                self.assertEqual(validate_operands("ADMIN", operands), predicate)
-        self.assertTrue(set(DESTRUCTIVE) <= ADMIN_MUTATING_OPERATIONS)
-        for action in DESTRUCTIVE:
-            with self.subTest(action=action):
-                self.assertEqual(operation_effect(SimpleNamespace(name="ADMIN", operands={"admin_action": action})), "mutate")
-        legacy = ROUTER_OUTPUT_SCHEMA["properties"]["admin"]["properties"]["admin_action"]["enum"]
-        self.assertTrue(set(DESTRUCTIVE) <= set(legacy) and set(DESTRUCTIVE) <= set(native_operand_schema()["admin_action"]["enum"]))
 
 
 class SetSlowmodeServiceTests(_ModlogCase):

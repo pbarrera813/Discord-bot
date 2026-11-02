@@ -16,11 +16,9 @@ class Settings:
     api_football_base_url: str
     api_football_timezone: str
     xai_model: str
-    xai_vision_model: str
     xai_image_model: str
     xai_tts_voice: str
     xai_tts_language: str
-    xai_router_output_token_ceiling: int | None
     xai_web_search_enabled: bool
     xai_x_search_enabled: bool
     xai_web_search_max_sources: int
@@ -47,13 +45,11 @@ def load_settings() -> Settings:
     ).strip() or "https://v3.football.api-sports.io"
     api_football_timezone = os.getenv("API_FOOTBALL_TIMEZONE", "America/Mexico_City").strip() or "America/Mexico_City"
     xai_model = os.getenv("XAI_MODEL", "grok-4.3").strip()
-    xai_vision_model = os.getenv("XAI_VISION_MODEL", xai_model).strip() or xai_model
     xai_image_model = os.getenv("XAI_IMAGE_MODEL", "grok-imagine-image-quality").strip()
     xai_image_model = xai_image_model or "grok-imagine-image-quality"
     xai_tts_voice = os.getenv("XAI_TTS_VOICE", "iris").strip() or "iris"
     xai_tts_language = os.getenv("XAI_TTS_LANGUAGE", "es-MX").strip() or "es-MX"
     nitori_log_level = _env_log_level("NITORI_LOG_LEVEL", default=logging.INFO)
-    router_ceiling = _env_int("XAI_ROUTER_OUTPUT_TOKEN_CEILING", default=0, minimum=0, maximum=32000)
     xai_web_search_enabled = _env_bool("XAI_WEB_SEARCH_ENABLED", default=False)
     xai_x_search_enabled = _env_bool("XAI_X_SEARCH_ENABLED", default=False)
     xai_web_search_max_sources = _env_int("XAI_WEB_SEARCH_MAX_SOURCES", default=3, minimum=1, maximum=5)
@@ -88,11 +84,9 @@ def load_settings() -> Settings:
         api_football_base_url=api_football_base_url,
         api_football_timezone=api_football_timezone,
         xai_model=xai_model,
-        xai_vision_model=xai_vision_model,
         xai_image_model=xai_image_model,
         xai_tts_voice=xai_tts_voice,
         xai_tts_language=xai_tts_language,
-        xai_router_output_token_ceiling=router_ceiling or None,
         xai_web_search_enabled=xai_web_search_enabled,
         xai_x_search_enabled=xai_x_search_enabled,
         xai_web_search_max_sources=xai_web_search_max_sources,

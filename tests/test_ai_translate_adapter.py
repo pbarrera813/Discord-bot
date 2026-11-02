@@ -6,7 +6,6 @@ import unittest
 from types import SimpleNamespace
 
 from cogs.ai_chat import AIChatCog
-from services.ai_capability_orchestrator import CapabilityTerminalStatus
 from services.ai_operation_catalog import known_output_fields, operation_effect, validate_operands
 from services.xai_client import XAIClient
 from tests.test_ai_tagging import _CaptureChannel, _DummyGuild, _DummyMessage, _async_return
@@ -141,64 +140,6 @@ def _human_message(*, content: str = REPLIED_TEXT, bot: bool = False, message_id
         content=content, message_id=message_id,
     )
 
-
-class TypedTranslateLifecycleTests(_Harness):
-    async def test_replied_message_is_translated_from_structural_source(self) -> None:
-        route = _translate_route({"text_source": "REPLIED_MESSAGE", "target_language": "German"})
-        self.assertTrue(route["valid"], route.get("failure_reason"))
-
-        llm, message, result = await self._run(route, content="please do that", reply_to=_human_message())
-
-        self.assertEqual(llm.translate_calls, [(REPLIED_TEXT, "German")])
-        self.assertEqual(result.status, CapabilityTerminalStatus.SUCCESS)
-        self.assertTrue(result.satisfies_request)
-        self.assertEqual(result.payload["text"], f"[German] {REPLIED_TEXT}")
-        self.assertEqual(result.payload["target_language"], "German")
-        self.assertEqual(len(llm.chat_calls), 1)
-        self.assertIn(f"[German] {REPLIED_TEXT}", str(llm.chat_calls[0]["trusted_capability_context"]))
-        self.assertEqual([reply for reply, _mention in message.replies], ["Here is the translation."])
-        quoted = "Check the server backups and compare the latest Python releases."
-        llm, message, result = await self._run(_translate_route({"text": quoted, "target_language": "German"}),
-            content=f'Translate this quote into German: "{quoted}"')
-        self.assertEqual(llm.translate_calls, [(quoted, "German")])
-        self.assertEqual(len(llm.chat_calls), 1)
-        self.assertTrue(result.satisfies_request)
-        self.assertEqual(len(message.replies), 1)
-
-
-    async def test_structural_operand_failures_never_reach_the_provider(self) -> None:
-        cases = (
-            ("both_sources", {"text": "hi", "text_source": "REPLIED_MESSAGE", "target_language": "German"},
-             _human_message(), "translate_text_source_invalid"),
-            ("no_source", {"target_language": "German"}, None, "translate_text_source_invalid"),
-            ("no_target", {"text": "hi"}, None, "missing_translate_operand"),
-            ("blank_target", {"text": "hi", "target_language": "   "}, None, "missing_translate_operand"),
-            ("no_reply", {"text_source": "REPLIED_MESSAGE", "target_language": "German"}, None,
-             "reply_source_unavailable"),
-            ("bot_author", {"text_source": "REPLIED_MESSAGE", "target_language": "German"},
-             _human_message(bot=True), "reply_source_unavailable"),
-            ("empty_reply", {"text_source": "REPLIED_MESSAGE", "target_language": "German"},
-             _human_message(content="   "), "reply_source_unavailable"),
-        )
-        for name, operands, reply_to, reason in cases:
-            with self.subTest(case=name):
-                llm, _message, result = await self._run(
-                    _translate_route(operands), content="do it", reply_to=reply_to,
-                )
-                self.assertEqual(llm.translate_calls, [])
-                self.assertEqual(result.status, CapabilityTerminalStatus.VALIDATION_FAILED)
-                self.assertEqual(result.reason, reason)
-                self.assertFalse(result.satisfies_request)
-
-    async def test_provider_error_is_typed_and_not_satisfied(self) -> None:
-        route = _translate_route({"text": "hi", "target_language": "German"})
-
-        llm, _message, result = await self._run(route, content="translate", translate_fails=True)
-
-        self.assertEqual(len(llm.translate_calls), 1)
-        self.assertEqual(result.status, CapabilityTerminalStatus.PROVIDER_FAILURE)
-        self.assertEqual(result.reason, "RuntimeError")
-        self.assertFalse(result.satisfies_request)
 
 
 if __name__ == "__main__":

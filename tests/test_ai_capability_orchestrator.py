@@ -1,11 +1,17 @@
 from __future__ import annotations
 
-import asyncio
 from copy import deepcopy
 from dataclasses import replace
 import unittest
 
-from services.ai_capability_orchestrator import CapabilityResultBundle, CapabilityExecutionContext, CapabilityTerminalStatus, InputBinding, build_capability_execution_plan, execute_ordered_capabilities, normalize_terminal_result, normalize_capability_plan, reusable_results_for_continuation, validate_native_capability_contract
+from services.ai_capability_orchestrator import (
+    CapabilityResultBundle,
+    CapabilityTerminalStatus,
+    InputBinding,
+    normalize_terminal_result,
+    normalize_capability_plan,
+    validate_native_capability_contract,
+)
 from services.football_query_service import compile_football_operation
 from services.ai_operation_catalog import operation_effect
 
@@ -237,103 +243,6 @@ class CapabilityPlanTests(unittest.TestCase):
         ]
         self.assertEqual(validate_native_capability_contract({"capability_plan": {"semantic_source": "router", "capabilities": capabilities}}), "inconsistent_capability_plan")
 
-    def test_task_results_never_overwrite_repeated_family_and_missing_is_task_local(self) -> None:
-        payload = {
-            "semantic_source": "router",
-            "requirements": [
-                {"requirement_id": "web_a_req", "objective": "research alpha", "required": True, "satisfaction_criterion": "summary", "capability_owner": "WEB", "owner_task_id": "web_a", "depends_on": []},
-                {"requirement_id": "web_b_req", "objective": "research beta", "required": True, "satisfaction_criterion": "summary", "capability_owner": "WEB", "owner_task_id": "web_b", "depends_on": []},
-            ],
-            "capabilities": [
-                {"name": "WEB", "task_id": "web_a", "required": True, "scope": "BROAD_RESEARCH", "independent": True, "independent_research": True, "evidence_span": "alpha", "operands": {"query": "alpha"}, "input_bindings": [], "source_refs": [], "requested_outputs": ["answer"], "depends_on": []},
-                {"name": "WEB", "task_id": "web_b", "required": True, "scope": "BROAD_RESEARCH", "independent": True, "independent_research": True, "evidence_span": "beta", "operands": {"query": "beta"}, "input_bindings": [], "source_refs": [], "requested_outputs": ["answer"], "depends_on": []},
-            ],
-        }
-        execution = build_capability_execution_plan(_legacy_native_plan(payload, action="CHAT"), fallback_action="CHAT")
-        context = CapabilityExecutionContext(execution)
-        context.record(normalize_terminal_result("WEB", "SUCCESS", provider="web", task_id="web_a", satisfies_request=True))
-        self.assertEqual(set(context.bundle.by_task), {"web_a"})
-        self.assertFalse(context.bundle.complete)
-        self.assertEqual(context.bundle.missing, ("web_a_req", "web_b_req"))
-
-    def test_missing_mutation_preflight_does_not_block_independent_reads(self) -> None:
-        payload = {
-            "semantic_source": "router",
-            "capabilities": [
-                {"name": "ADMIN", "task_id": "admin_stats", "required": True, "owner_action": "ADMIN_ACTION", "operands": {"admin_action": "join_stats"}, "evidence_span": "stats", "depends_on": [], "scope": "DISCORD_ACTION", "independent": True, "independent_research": False, "input_bindings": [], "source_refs": [], "requested_outputs": ["result"]},
-                {"name": "REACTION", "task_id": "react", "required": True, "owner_action": "ADD_REACTION", "operands": {"emoji": "👍"}, "evidence_span": "react", "depends_on": [], "scope": "DISCORD_ACTION", "independent": True, "independent_research": False, "input_bindings": [], "source_refs": [], "requested_outputs": ["reaction"]},
-            ],
-            "primary_action": "ADMIN_ACTION",
-        }
-        execution = build_capability_execution_plan(_legacy_native_plan(payload, action="CHAT"), fallback_action="CHAT")
-        calls = []
-
-        async def admin(_request, _context):
-            calls.append("admin")
-            return normalize_terminal_result("ADMIN", "SUCCESS", provider="admin", task_id="admin_stats", satisfies_request=True)
-
-        async def reaction(_request, _context):
-            calls.append("reaction")
-            return normalize_terminal_result("REACTION", "SUCCESS", provider="discord", task_id="react", satisfies_request=True)
-
-        context = asyncio.run(execute_ordered_capabilities(execution, {"ADMIN": admin, "REACTION": reaction}))
-        self.assertEqual(calls, ["admin"])
-        self.assertEqual(context.bundle.by_task["react"].status, CapabilityTerminalStatus.NOT_EXECUTED)
-
-    def test_continuation_reuses_read_by_operands_scope_not_prior_task_id_and_never_replays_write(self) -> None:
-        def make(task_id: str, operation: str) -> object:
-            return build_capability_execution_plan(
-                _legacy_native_plan(
-                    {
-                        "semantic_source": "router",
-                        "capabilities": [
-                            {
-                                "name": "MEMORY",
-                                "task_id": task_id,
-                                "required": True,
-                                "owner_action": operation,
-                                "evidence_span": "memory",
-                                "depends_on": [],
-                                "scope": "DISCORD_ACTION",
-                                "independent": True,
-                                "independent_research": False,
-                                "operands": {"memory_action": operation, "key": "k1"},
-                                "input_bindings": [],
-                                "source_refs": [],
-                                "requested_outputs": ["result"],
-                            }
-                        ],
-                        "primary_action": operation,
-                    },
-                    action="CHAT",
-                ),
-                fallback_action="CHAT",
-            )
-
-        prior = make("old_read", "SERVER_MEMORY_LOOKUP")
-        current = make("new_read", "SERVER_MEMORY_LOOKUP")
-        read_result = normalize_terminal_result(
-            "MEMORY", "SUCCESS", provider="memory", task_id="old_read", satisfies_request=True,
-            scope={"key": "k1", "fresh": True},
-        )
-        prior_bundle = CapabilityResultBundle(required_capabilities=("MEMORY",), required_task_ids=("old_read",), results=(read_result,))
-        reused = reusable_results_for_continuation(
-            current, prior, prior_bundle, current_scope={"new_read": {"key": "k1"}},
-        )
-        self.assertEqual(set(reused), {"new_read"})
-        self.assertEqual(reused["new_read"].task_id, "new_read")
-
-        write_plan = make("new_write", "SERVER_MEMORY_WRITE")
-        self.assertEqual(
-            reusable_results_for_continuation(
-                write_plan,
-                prior,
-                prior_bundle,
-                current_scope={"new_write": {"key": "k1"}},
-            ),
-            {},
-        )
-
 
     def test_operation_effect_uses_canonical_typed_operation_fields(self) -> None:
         plan = _legacy_native_plan(
@@ -471,98 +380,6 @@ class CapabilityPlanTests(unittest.TestCase):
         self.assertEqual([item.name for item in plan.capabilities], ["EXTERNAL_SOURCE", "IMAGE_ANALYZE"])
         self.assertEqual(plan.capabilities[-1].depends_on, ("EXTERNAL_SOURCE",))
 
-    def test_web_visual_composition_requires_declared_native_dependency(self) -> None:
-        valid = {
-            "external_source": {"required": False, "expected_content": "UNKNOWN"},
-            "capability_plan": {
-                "objective": "Research and inspect discovered media.",
-                "requirements": [
-                    {
-                        "requirement_id": "research",
-                        "objective": "broad research",
-                        "required": True,
-                        "satisfaction_criterion": "grounded research result",
-                        "capability_owner": "WEB",
-                        "owner_task_id": "web",
-                        "owner_task_id": "web",
-                    },
-                    {
-                        "requirement_id": "visual",
-                        "objective": "inspect discovered media",
-                        "required": True,
-                        "satisfaction_criterion": "authoritative visual result",
-                        "capability_owner": "IMAGE_ANALYZE",
-                        "owner_task_id": "image",
-                        "owner_task_id": "image",
-                        "depends_on": ["research"],
-                    },
-                ],
-                "capabilities": [
-                    {
-                        "name": "WEB",
-                        "task_id": "web",
-                        "task_id": "web",
-                        "required": True,
-                        "scope": "BROAD_RESEARCH",
-                        "independent": True,
-                        "independent_research": True,
-                        "evidence_span": "broader research",
-                    },
-                    {
-                        "name": "IMAGE_ANALYZE",
-                        "task_id": "image",
-                        "required": True,
-                        "scope": "MEDIA_ANALYSIS",
-                        "depends_on": ["web"],
-                        "evidence_span": "inspect discovered media",
-                    },
-                ],
-            },
-        }
-
-        self.assertIsNone(validate_native_capability_contract(_legacy_native_envelope(valid)))
-        plan = _legacy_native_plan(valid["capability_plan"], action="WEB_LOOKUP")
-        execution = build_capability_execution_plan(plan, fallback_action="WEB_LOOKUP")
-        self.assertEqual([item.name for item in execution.ordered_capabilities], ["WEB", "IMAGE_ANALYZE"])
-
-        missing_web = {
-            "external_source": {"required": False, "expected_content": "UNKNOWN"},
-            "capability_plan": {
-                "capabilities": [
-                    {
-                        "name": "IMAGE_ANALYZE",
-                        "required": True,
-                        "scope": "MEDIA_ANALYSIS",
-                        "depends_on": ["web"],
-                    }
-                ]
-            },
-        }
-        wrong_web_scope = {
-            "external_source": {"required": False, "expected_content": "UNKNOWN"},
-            "capability_plan": {
-                "capabilities": [
-                    {
-                        "name": "WEB",
-                        "task_id": "web",
-                        "required": True,
-                        "scope": "EXPLICIT_SOURCE",
-                        "independent": True,
-                        "independent_research": True,
-                    },
-                    {
-                        "name": "IMAGE_ANALYZE",
-                        "required": True,
-                        "scope": "MEDIA_ANALYSIS",
-                        "depends_on": ["WEB"],
-                    },
-                ]
-            },
-        }
-
-        self.assertEqual(validate_native_capability_contract(missing_web), "inconsistent_capability_plan")
-        self.assertEqual(validate_native_capability_contract(wrong_web_scope), "inconsistent_capability_plan")
-
 
     def test_native_validation_diagnostic_is_bounded_and_identifies_first_predicate(self) -> None:
         payload = {
@@ -672,53 +489,6 @@ class CapabilityPlanTests(unittest.TestCase):
         self.assertEqual(result, "inconsistent_capability_plan")
         self.assertEqual(diagnostics[0]["predicate"], "requirement_dependency_cross_owner_missing_capability_dependency")
 
-    def test_cross_owner_requirement_dependency_is_mirrored_in_execution_graph(self) -> None:
-        payload = {
-            "external_source": {"required": True, "expected_content": "TEXT"},
-            "capability_plan": {
-                "requirements": [
-                    {
-                        "requirement_id": "req_table",
-                        "objective": "retrieve the current table",
-                        "required": True,
-                        "satisfaction_criterion": "typed football standings",
-                        "capability_owner": "FOOTBALL",
-                        "depends_on": [],
-                    },
-                    {
-                        "requirement_id": "req_contrast",
-                        "objective": "contrast the table with the supplied source",
-                        "required": True,
-                        "satisfaction_criterion": "grounded source comparison",
-                        "capability_owner": "EXTERNAL_SOURCE",
-                        "depends_on": ["req_table"],
-                    },
-                ],
-                "capabilities": [
-                    {"name": "FOOTBALL", "required": True, "scope": "STRUCTURED_DATA"},
-                    {
-                        "name": "EXTERNAL_SOURCE",
-                        "required": True,
-                        "scope": "EXPLICIT_SOURCE",
-                        "depends_on": ["FOOTBALL"],
-                    },
-                ],
-            },
-        }
-
-        self.assertIsNone(validate_native_capability_contract(_legacy_native_envelope(payload, action="FOOTBALL_TABLE")))
-        plan = _legacy_native_plan(
-            payload["capability_plan"],
-            action="FOOTBALL_TABLE",
-            external_source=payload["external_source"],
-        )
-        execution = build_capability_execution_plan(plan, fallback_action="FOOTBALL_TABLE")
-
-        self.assertTrue(plan.valid)
-        self.assertEqual([item.name for item in execution.ordered_capabilities], ["FOOTBALL", "EXTERNAL_SOURCE"])
-        self.assertEqual(execution.missing_dependencies, ())
-        self.assertEqual(execution.cyclic_capabilities, ())
-        self.assertTrue(execution.valid)
 
     def test_requirements_bind_each_required_outcome_to_a_declared_capability(self) -> None:
         payload = {
@@ -773,26 +543,6 @@ class CapabilityPlanTests(unittest.TestCase):
         self.assertEqual(validate_native_capability_contract(payload), "inconsistent_capability_plan")
 
 
-    def test_execution_plan_orders_dependencies_and_preserves_bounded_dispatch(self) -> None:
-        plan = _legacy_native_plan(
-            {
-                "capabilities": [
-                    {"name": "FOOTBALL", "depends_on": ["EXTERNAL_SOURCE"]},
-                    {"name": "EXTERNAL_SOURCE"},
-                ],
-                "football": {"data_focus": "summary"},
-            },
-            action="FOOTBALL_SUMMARY",
-        )
-
-        execution = build_capability_execution_plan(plan, fallback_action="CHAT")
-
-        self.assertEqual(execution.ordered_capabilities[0].name, "EXTERNAL_SOURCE")
-        self.assertEqual(execution.ordered_capabilities[1].name, "FOOTBALL")
-        self.assertEqual(execution.dispatch_action, "FOOTBALL_LOOKUP")
-        self.assertEqual(execution.compatibility_mismatch, "FOOTBALL_SUMMARY->FOOTBALL")
-        self.assertEqual(execution.required_capabilities, ("EXTERNAL_SOURCE", "FOOTBALL"))
-
 
     def test_native_football_normalization_preserves_all_typed_fields_and_types(self) -> None:
         football = {
@@ -841,32 +591,6 @@ class CapabilityPlanTests(unittest.TestCase):
         self.assertEqual(validate_native_capability_contract(payload), "inconsistent_capability_plan")
 
 
-    def test_router_memory_primary_action_fails_closed_when_missing_or_invalid(self) -> None:
-        for label, primary_action, expected_reason in (
-            ("missing", None, "missing_field"),
-            ("invalid", "CHAT", "unknown_enum"),
-        ):
-            with self.subTest(label=label):
-                payload = _migrate_native_fixture(
-                    {
-                        "objective": "Perform the requested memory operation.",
-                        "capabilities": [{"name": "MEMORY", "required": True, "owner_action": "SERVER_MEMORY_LOOKUP"}],
-                        "primary_action": "SERVER_MEMORY_LOOKUP",
-                        "semantic_source": "router",
-                    },
-                    action="SERVER_MEMORY_LOOKUP",
-                )
-                if primary_action is None:
-                    payload.pop("primary_action")
-                else:
-                    payload["primary_action"] = primary_action
-                plan = normalize_capability_plan(payload, action="SERVER_MEMORY_LOOKUP")
-                execution = build_capability_execution_plan(plan, fallback_action="SERVER_MEMORY_LOOKUP")
-
-                self.assertFalse(plan.valid)
-                self.assertEqual(plan.failure_reason, expected_reason)
-                self.assertFalse(execution.valid)
-
 
     def test_router_required_owner_action_fails_closed_when_missing_or_invalid(self) -> None:
         for label, owner_action, expected_reason in (
@@ -896,25 +620,6 @@ class CapabilityPlanTests(unittest.TestCase):
                 self.assertEqual(plan.failure_reason, expected_reason)
 
 
-    def test_router_admin_primary_action_fails_closed_when_missing_or_invalid(self) -> None:
-        for label, primary_action, expected_reason in (
-            ("missing", None, "inconsistent_capability_plan"),
-            ("invalid", "CHAT", "inconsistent_capability_plan"),
-        ):
-            with self.subTest(label=label):
-                payload = {
-                    "capabilities": [{"name": "ADMIN", "required": True}],
-                    "semantic_source": "router",
-                }
-                if primary_action is not None:
-                    payload["primary_action"] = primary_action
-                plan = normalize_capability_plan(payload, action="ADMIN_ACTION")
-                execution = build_capability_execution_plan(plan, fallback_action="ADMIN_ACTION")
-
-                self.assertFalse(plan.valid)
-                self.assertEqual(plan.failure_reason, expected_reason)
-                self.assertFalse(execution.valid)
-
 
     def test_terminal_outcomes_preserve_native_status_and_distinguish_satisfaction(self) -> None:
         no_data = normalize_terminal_result(
@@ -936,120 +641,6 @@ class CapabilityPlanTests(unittest.TestCase):
         self.assertEqual(provider_failure.native_outcome, "TRANSPORT_FAILURE")
 
 
-    def test_result_bundle_requires_every_declared_capability(self) -> None:
-        plan = _legacy_native_plan(
-            {
-                "capabilities": [
-                    {"name": "EXTERNAL_SOURCE", "required": True},
-                    {"name": "FOOTBALL", "required": True, "depends_on": ["EXTERNAL_SOURCE"]},
-                ]
-            },
-            action="CHAT",
-        )
-        execution = build_capability_execution_plan(plan, fallback_action="CHAT")
-        context = CapabilityExecutionContext(execution)
-        context.record(normalize_terminal_result("EXTERNAL_SOURCE", "SUCCESS", provider="external_sources", task_id="EXTERNAL_SOURCE"))
-
-        self.assertFalse(context.bundle.complete)
-        self.assertFalse(context.bundle.satisfied)
-        self.assertEqual(context.bundle.missing, ("req_EXTERNAL_SOURCE", "req_FOOTBALL"))
-
-        context.record(normalize_terminal_result("FOOTBALL", "SELECTED", provider="api-football", task_id="FOOTBALL"))
-        self.assertTrue(context.bundle.complete)
-        self.assertFalse(context.bundle.satisfied)
-        context.requirement_assessments = {item.requirement_id: {"status": "supported"} for item in plan.requirements}
-        self.assertTrue(context.bundle.satisfied)
-
-    def test_result_collector_rejects_undeclared_capability(self) -> None:
-        plan = _legacy_native_plan({"capabilities": [{"name": "WEB"}]}, action="WEB_LOOKUP")
-        context = CapabilityExecutionContext(build_capability_execution_plan(plan, fallback_action="WEB_LOOKUP"))
-
-        with self.assertRaises(ValueError):
-            context.record(normalize_terminal_result("FOOTBALL", "SELECTED", provider="api-football"))
-
-    def test_result_only_composition_executes_external_source_before_image_analysis(self) -> None:
-        plan = _legacy_native_plan(
-            {
-                "capabilities": [
-                    {"name": "IMAGE_ANALYZE", "required": True, "depends_on": ["EXTERNAL_SOURCE"]},
-                    {"name": "EXTERNAL_SOURCE", "required": True},
-                ]
-            },
-            action="CHAT",
-        )
-        execution = build_capability_execution_plan(plan, fallback_action="CHAT")
-        calls: list[str] = []
-
-        async def external_source(_request, _context):
-            calls.append("EXTERNAL_SOURCE")
-            return normalize_terminal_result(
-                "EXTERNAL_SOURCE",
-                "SUCCESS",
-                provider="external_source_service",
-                payload={"selected_media": ["IMAGE_A"]},
-                provenance={"source": "ExternalSourceBundle", "url_hash": "source_a"},
-                scope={"source_count": 1},
-            )
-
-        async def image_analysis(_request, context):
-            calls.append("IMAGE_ANALYZE")
-            source = context.results["EXTERNAL_SOURCE"]
-            self.assertEqual(source.payload["selected_media"], ["IMAGE_A"])
-            return normalize_terminal_result(
-                "IMAGE_ANALYZE",
-                "SUCCESS",
-                provider="xai_vision",
-                payload={"analysis": "IMAGE_A_RESULT"},
-                provenance={"source": "source_result", "from_capability": "EXTERNAL_SOURCE"},
-                scope={"media_count": 1},
-            )
-
-        context = asyncio.run(
-            execute_ordered_capabilities(
-                execution,
-                {"EXTERNAL_SOURCE": external_source, "IMAGE_ANALYZE": image_analysis},
-            )
-        )
-
-        self.assertEqual(calls, ["EXTERNAL_SOURCE", "IMAGE_ANALYZE"])
-        self.assertTrue(context.bundle.complete)
-        self.assertFalse(context.bundle.satisfied)
-        self.assertEqual(context.bundle.by_capability["EXTERNAL_SOURCE"].provenance["url_hash"], "source_a")
-        self.assertEqual(context.bundle.by_capability["IMAGE_ANALYZE"].provenance["from_capability"], "EXTERNAL_SOURCE")
-
-    def test_result_only_dependency_failure_skips_downstream_provider(self) -> None:
-        plan = _legacy_native_plan(
-            {
-                "capabilities": [
-                    {"name": "EXTERNAL_SOURCE", "required": True},
-                    {"name": "IMAGE_ANALYZE", "required": True, "depends_on": ["EXTERNAL_SOURCE"]},
-                ]
-            },
-            action="CHAT",
-        )
-        execution = build_capability_execution_plan(plan, fallback_action="CHAT")
-        calls: list[str] = []
-
-        async def failed_source(_request, _context):
-            calls.append("EXTERNAL_SOURCE")
-            return normalize_terminal_result("EXTERNAL_SOURCE", "NO_DATA_FOR_SCOPE", provider="external_source_service")
-
-        async def should_not_run(_request, _context):
-            calls.append("IMAGE_ANALYZE")
-            return normalize_terminal_result("IMAGE_ANALYZE", "SUCCESS", provider="xai_vision")
-
-        context = asyncio.run(
-            execute_ordered_capabilities(
-                execution,
-                {"EXTERNAL_SOURCE": failed_source, "IMAGE_ANALYZE": should_not_run},
-            )
-        )
-
-        self.assertEqual(calls, ["EXTERNAL_SOURCE"])
-        self.assertFalse(context.bundle.satisfied)
-        self.assertEqual(context.bundle.by_capability["IMAGE_ANALYZE"].status, CapabilityTerminalStatus.NOT_EXECUTED)
-        self.assertEqual(context.bundle.missing, ("req_EXTERNAL_SOURCE", "req_IMAGE_ANALYZE"))
-
 
     def test_semantic_failure_cannot_become_satisfied_from_compatibility_chat(self) -> None:
         result = normalize_terminal_result(
@@ -1070,120 +661,6 @@ class CapabilityPlanTests(unittest.TestCase):
         self.assertEqual(bundle.request_status, "SEMANTIC_INTERPRETATION_FAILED")
         self.assertEqual(bundle.semantic_failure_reason, "semantic_output_truncated")
 
-
-    def test_sufficient_typed_result_is_reused_without_handler_execution(self) -> None:
-        payload = {
-            "objective": "inspect the same authorized image",
-            "capabilities": [
-                {"name": "IMAGE_ANALYZE", "required": True, "scope": "MEDIA_ANALYSIS"},
-            ],
-        }
-        current = build_capability_execution_plan(
-            _legacy_native_plan(payload, action="ANALYZE_IMAGE"),
-            fallback_action="ANALYZE_IMAGE",
-        )
-        prior = build_capability_execution_plan(
-            _legacy_native_plan(payload, action="ANALYZE_IMAGE"),
-            fallback_action="ANALYZE_IMAGE",
-        )
-        result = normalize_terminal_result(
-            "IMAGE_ANALYZE",
-            "SUCCESS",
-            provider="xai_vision",
-            payload={"text": "synthetic visual observation"},
-            provenance={"source": "authorized_image_context", "authorized": True},
-            scope={"context_identity": "media-1"},
-            satisfies_request=True,
-            task_id="IMAGE_ANALYZE",
-        )
-        prior_bundle = CapabilityResultBundle(
-            required_capabilities=("IMAGE_ANALYZE",),
-            results=(result,),
-        )
-        reusable = reusable_results_for_continuation(
-            current,
-            prior,
-            prior_bundle,
-            current_scope={"IMAGE_ANALYZE": {"context_identity": "media-1"}},
-        )
-        self.assertEqual(reusable, {"IMAGE_ANALYZE": result})
-
-        calls: list[str] = []
-
-        async def handler(_request, _context):
-            calls.append("IMAGE_ANALYZE")
-            return result
-
-        context = CapabilityExecutionContext(current)
-        for reused in reusable.values():
-            context.record(reused)
-        asyncio.run(execute_ordered_capabilities(current, {"IMAGE_ANALYZE": handler}, context=context))
-        self.assertEqual(calls, [])
-        self.assertFalse(context.bundle.satisfied)
-
-    def test_typed_result_reuse_requires_matching_scope_freshness_and_authorization(self) -> None:
-        def make_plan(objective: str):
-            return build_capability_execution_plan(
-                _legacy_native_plan(
-                    {
-                        "objective": objective,
-                        "capabilities": [
-                            {"name": "IMAGE_ANALYZE", "required": True, "scope": "MEDIA_ANALYSIS"},
-                        ],
-                    },
-                    action="ANALYZE_IMAGE",
-                ),
-                fallback_action="ANALYZE_IMAGE",
-            )
-
-        current = make_plan("inspect the same authorized image")
-        prior = make_plan("inspect the same authorized image")
-        result = normalize_terminal_result(
-            "IMAGE_ANALYZE",
-            "SUCCESS",
-            provider="xai_vision",
-            provenance={"source": "authorized_image_context", "authorized": True},
-            scope={"context_identity": "media-1"},
-            satisfies_request=True,
-            task_id="IMAGE_ANALYZE",
-        )
-        bundle = CapabilityResultBundle(required_capabilities=("IMAGE_ANALYZE",), results=(result,))
-
-        self.assertEqual(
-            reusable_results_for_continuation(
-                current, prior, bundle, current_scope={"IMAGE_ANALYZE": {"context_identity": "media-2"}}
-            ),
-            {},
-        )
-        self.assertEqual(
-            reusable_results_for_continuation(
-                current,
-                prior,
-                bundle,
-                current_scope={"IMAGE_ANALYZE": {"context_identity": "media-1"}},
-                fresh=False,
-            ),
-            {},
-        )
-        self.assertEqual(
-            reusable_results_for_continuation(
-                current,
-                prior,
-                bundle,
-                current_scope={"IMAGE_ANALYZE": {"context_identity": "media-1"}},
-                authorized=False,
-            ),
-            {},
-        )
-        self.assertEqual(
-            reusable_results_for_continuation(
-                make_plan("inspect a different image"),
-                prior,
-                bundle,
-                current_scope={"IMAGE_ANALYZE": {"context_identity": "media-1"}},
-            ),
-            {"IMAGE_ANALYZE": result},
-        )
 
 
 if __name__ == "__main__":

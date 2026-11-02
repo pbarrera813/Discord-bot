@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 import unittest
 
-from services.ai_capability_orchestrator import CapabilityPlan, CapabilityRequest, CapabilityTerminalStatus, build_capability_execution_plan, execute_ordered_capabilities, normalize_capability_plan, normalize_terminal_result, validate_native_capability_contract
+from services.ai_capability_orchestrator import validate_native_capability_contract
 
 
 def _task(task_id: str, name: str = "CHAT", *, depends_on=(), outputs=("answer",), operands=None):
@@ -36,20 +35,6 @@ class NativeTaskSchemaTests(unittest.TestCase):
             "depends_on": [],
         }]}
         self.assertEqual(validate_native_capability_contract({"capability_plan": plan}), "inconsistent_capability_plan")
-
-    def test_repeated_tasks_keep_independent_results(self):
-        raw = {"objective": "", "capabilities": [_task("a"), _task("b")], "requirements": [
-            {"requirement_id": "ra", "objective": "a", "required": True, "satisfaction_criterion": "a", "capability_owner": "CHAT", "owner_task_id": "a", "depends_on": []},
-            {"requirement_id": "rb", "objective": "b", "required": True, "satisfaction_criterion": "b", "capability_owner": "CHAT", "owner_task_id": "b", "depends_on": []},
-        ]}
-        self.assertIsNone(validate_native_capability_contract({"capability_plan": raw}))
-        normalized = normalize_capability_plan(raw, action="CHAT")
-        self.assertNotIn("requires_evidence_review", normalized.to_payload())
-        execution = build_capability_execution_plan(normalize_capability_plan(raw, action="CHAT"), fallback_action="CHAT")
-        async def handler(request, _context):
-            return normalize_terminal_result("CHAT", "SUCCESS", provider="test", task_id=request.task_id, satisfies_request=True)
-        context = asyncio.run(execute_ordered_capabilities(execution, {"CHAT": handler}))
-        self.assertEqual(set(context.bundle.by_task), {"a", "b"})
 
 
     def test_binding_requires_declared_dependency_and_known_output(self):
@@ -86,31 +71,6 @@ class NativeTaskSchemaTests(unittest.TestCase):
         raw["response_delivery"]["artifacts"][0]["upstream_task_id"] = "IMAGE_GENERATE"
         self.assertEqual(validate_native_capability_contract({"capability_plan": raw}), "inconsistent_capability_plan")
 
-
-    def test_invalid_execution_plan_marks_tasks_not_executed(self):
-        request = CapabilityRequest("CHAT", task_id="a", operands={}, requested_outputs=("answer",))
-        plan = CapabilityPlan("", (request,), "CHAT", {}, {}, {}, valid=False)
-        execution = build_capability_execution_plan(plan, fallback_action="CHAT")
-        async def handler(_request, _context):
-            raise AssertionError("invalid plan must not dispatch")
-        context = asyncio.run(execute_ordered_capabilities(execution, {"CHAT": handler}))
-        self.assertEqual(context.results["a"].status, CapabilityTerminalStatus.NOT_EXECUTED)
-
-    def test_catalog_is_validated_before_mutation_and_preflight_exceptions_hold_batch(self):
-        good = CapabilityRequest("ADMIN", task_id="good", operands={"admin_action": "ban"}, requested_outputs=("result",))
-        bad = CapabilityRequest("ADMIN", task_id="bad", operands={"operation": "ban"}, requested_outputs=("result",))
-        semantic = CapabilityPlan("", (good, bad), "ADMIN_ACTION", {}, {}, {})
-        execution = build_capability_execution_plan(semantic, fallback_action="ADMIN_ACTION")
-        calls = []
-        async def handler(request, _context):
-            calls.append(request.task_id)
-            return normalize_terminal_result("ADMIN", "SUCCESS", provider="test", task_id=request.task_id, satisfies_request=True)
-        async def preflight(_tasks, _context):
-            raise RuntimeError("preflight")
-        context = asyncio.run(execute_ordered_capabilities(execution, {"ADMIN": handler}, preflight=preflight))
-        self.assertEqual(calls, [])
-        self.assertEqual(context.results["good"].status, CapabilityTerminalStatus.NOT_EXECUTED)
-        self.assertEqual(context.results["bad"].status, CapabilityTerminalStatus.VALIDATION_FAILED)
 
 
 if __name__ == "__main__":

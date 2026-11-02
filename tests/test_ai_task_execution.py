@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from tests.test_ai_tagging import _FakeTTSClient
 
 import unittest
 from types import SimpleNamespace
@@ -14,11 +13,7 @@ from services.ai_capability_orchestrator import (
     CapabilityTerminalStatus,
     CapabilityTerminalResult,
     InputBinding,
-    build_capability_execution_plan,
-    normalize_capability_plan,
-    validate_native_capability_contract,
 )
-from tests.test_ai_tagging import _CaptureChannel, _DummyGuild, _DummyMessage, _async_return
 
 
 class _TaskExecutionTests(unittest.IsolatedAsyncioTestCase):
@@ -67,137 +62,6 @@ class _TaskExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen, ["one.example", "two.example"])
         self.assertEqual(set(context.results), {"mc_a", "mc_b"})
 
-    async def test_native_repeated_web_tasks_keep_task_local_queries_and_results(self) -> None:
-        payload = {
-            "objective": "research two independent questions",
-            "semantic_source": "router",
-            "semantic_status": "SUCCESS",
-            "primary_action": "CHAT",
-            "requirements": [
-                {"requirement_id": "r_a", "objective": "alpha", "satisfaction_criterion": "answer", "required": True, "capability_owner": "WEB", "owner_task_id": "web_a", "depends_on": []},
-                {"requirement_id": "r_b", "objective": "beta", "satisfaction_criterion": "answer", "required": True, "capability_owner": "WEB", "owner_task_id": "web_b", "depends_on": []},
-            ],
-            "capabilities": [
-                {"name": "WEB", "task_id": "web_a", "required": True, "evidence_span": "alpha", "depends_on": [], "scope": "BROAD_RESEARCH", "independent": True, "independent_research": True, "selection_count": 1, "owner_action": None, "operands": {"query": "alpha"}, "input_bindings": [], "source_refs": [], "requested_outputs": ["answer"]},
-                {"name": "WEB", "task_id": "web_b", "required": True, "evidence_span": "beta", "depends_on": [], "scope": "BROAD_RESEARCH", "independent": True, "independent_research": True, "selection_count": 1, "owner_action": None, "operands": {"query": "beta"}, "input_bindings": [], "source_refs": [], "requested_outputs": ["answer"]},
-            ],
-        }
-        diagnostic: list[dict[str, object]] = []
-        self.assertIsNone(validate_native_capability_contract({"capability_plan": payload}, diagnostic_sink=diagnostic), diagnostic)
-        plan = normalize_capability_plan(payload, action="CHAT")
-        self.assertTrue(plan.valid, plan.failure_reason)
-        execution_plan = build_capability_execution_plan(plan, fallback_action="CHAT")
-        cog = AIChatCog.__new__(AIChatCog)
-        seen: list[str] = []
-
-        async def web(_message, prompt, **_kwargs):
-            seen.append(prompt)
-            return CapabilityTerminalResult(
-                "WEB", CapabilityTerminalStatus.SUCCESS, "web", "SUCCESS",
-                payload={"answer": prompt}, satisfies_request=True,
-            )
-
-        cog._execute_web_result_only = web
-        cog._admin_actions = SimpleNamespace()
-        context = await cog._execute_live_media_composition_result_only(
-            SimpleNamespace(guild=SimpleNamespace(id=1), channel=SimpleNamespace(id=2)),
-            "global prompt must not select either task",
-            execution_plan,
-            settings=SimpleNamespace(server_context=""),
-        )
-        self.assertEqual(seen, ["alpha", "beta"])
-        self.assertEqual(context.results["web_a"].payload["answer"], "alpha")
-        self.assertEqual(context.results["web_b"].payload["answer"], "beta")
-
-    async def test_native_repeated_memory_tasks_keep_task_local_keys_and_subjects(self) -> None:
-        payload = {
-            "objective": "look up two independent memories",
-            "semantic_source": "router",
-            "semantic_status": "SUCCESS",
-            "primary_action": "SERVER_MEMORY_LOOKUP",
-            "requirements": [
-                {"requirement_id": "r_a", "objective": "alpha memory", "satisfaction_criterion": "entry", "required": True, "capability_owner": "MEMORY", "owner_task_id": "mem_a", "depends_on": []},
-                {"requirement_id": "r_b", "objective": "beta memory", "satisfaction_criterion": "entry", "required": True, "capability_owner": "MEMORY", "owner_task_id": "mem_b", "depends_on": []},
-            ],
-            "capabilities": [
-                {"name": "MEMORY", "task_id": "mem_a", "required": True, "evidence_span": "alpha", "depends_on": [], "scope": "STRUCTURED_DATA", "independent": True, "independent_research": False, "owner_action": "SERVER_MEMORY_LOOKUP", "operands": {"memory_action": "SERVER_MEMORY_LOOKUP", "memory_type": "SERVER_CONTEXT", "subject": "alpha", "key": "one"}, "input_bindings": [], "source_refs": [], "requested_outputs": ["result"]},
-                {"name": "MEMORY", "task_id": "mem_b", "required": True, "evidence_span": "beta", "depends_on": [], "scope": "STRUCTURED_DATA", "independent": True, "independent_research": False, "owner_action": "SERVER_MEMORY_LOOKUP", "operands": {"memory_action": "SERVER_MEMORY_LOOKUP", "memory_type": "SERVER_CONTEXT", "subject": "beta", "key": "two"}, "input_bindings": [], "source_refs": [], "requested_outputs": ["result"]},
-            ],
-        }
-        diagnostic: list[dict[str, object]] = []
-        self.assertIsNone(validate_native_capability_contract({"capability_plan": payload}, diagnostic_sink=diagnostic), diagnostic)
-        plan = normalize_capability_plan(payload, action="SERVER_MEMORY_LOOKUP")
-        self.assertTrue(plan.valid, plan.failure_reason)
-        execution_plan = build_capability_execution_plan(plan, fallback_action="SERVER_MEMORY_LOOKUP")
-        cog = AIChatCog.__new__(AIChatCog)
-        seen: list[dict[str, object]] = []
-
-        async def memory(_message, decision, **_kwargs):
-            seen.append(dict(decision.memory or {}))
-            return CapabilityTerminalResult(
-                "MEMORY", CapabilityTerminalStatus.SUCCESS, "memory", "SUCCESS",
-                payload=dict(decision.memory or {}), satisfies_request=True,
-            )
-
-        cog._execute_server_memory_action = memory
-        cog._admin_actions = SimpleNamespace()
-        context = await cog._execute_live_media_composition_result_only(
-            SimpleNamespace(guild=SimpleNamespace(id=1), channel=SimpleNamespace(id=2)),
-            "global memory prompt must not select either task",
-            execution_plan,
-            settings=SimpleNamespace(server_context=""),
-        )
-        self.assertEqual([item["subject"] for item in seen], ["alpha", "beta"])
-        self.assertEqual([item["key"] for item in seen], ["one", "two"])
-        self.assertEqual(context.results["mem_a"].payload["subject"], "alpha")
-        self.assertEqual(context.results["mem_b"].payload["subject"], "beta")
-
-
-    async def test_image_edit_consumes_bound_generated_artifact(self) -> None:
-        payload = {
-            "objective": "generate and edit an image",
-            "semantic_source": "router",
-            "semantic_status": "SUCCESS",
-            "primary_action": "EDIT_IMAGE",
-            "requirements": [
-                {"requirement_id": "r_generate", "objective": "generate source", "satisfaction_criterion": "artifact", "required": True, "capability_owner": "IMAGE_GENERATE", "owner_task_id": "generate", "depends_on": []},
-                {"requirement_id": "r_edit", "objective": "edit source", "satisfaction_criterion": "artifact", "required": True, "capability_owner": "IMAGE_EDIT", "owner_task_id": "edit", "depends_on": ["r_generate"]},
-            ],
-            "capabilities": [
-                {"name": "IMAGE_GENERATE", "task_id": "generate", "required": True, "evidence_span": "generate", "depends_on": [], "scope": "IMAGE_GENERATION", "independent": True, "independent_research": False, "owner_action": None, "operands": {"prompt": "a source"}, "input_bindings": [], "source_refs": [], "requested_outputs": ["artifact"]},
-                {"name": "IMAGE_EDIT", "task_id": "edit", "required": True, "evidence_span": "edit", "depends_on": ["generate"], "scope": "IMAGE_EDIT", "independent": False, "independent_research": False, "owner_action": None, "operands": {"prompt": "make it blue"}, "input_bindings": [{"upstream_task_id": "generate", "output_field": "artifact"}], "source_refs": [], "requested_outputs": ["artifact"]},
-            ],
-        }
-        plan = normalize_capability_plan(payload, action="EDIT_IMAGE")
-        self.assertTrue(plan.valid, plan.failure_reason)
-        execution_plan = build_capability_execution_plan(plan, fallback_action="EDIT_IMAGE")
-        cog = AIChatCog.__new__(AIChatCog)
-        seen: list[str | None] = []
-
-        async def generate(_prompt):
-            return cog._image_artifact_terminal_result(
-                "IMAGE_GENERATE", b"source-bytes", source="test", filename="source.png"
-            )
-
-        async def edit(_prompt, source_url, **_kwargs):
-            seen.append(source_url)
-            return CapabilityTerminalResult(
-                "IMAGE_EDIT", CapabilityTerminalStatus.SUCCESS, "image", "SUCCESS",
-                payload={"artifact": b"edited"}, satisfies_request=True,
-            )
-
-        cog._execute_image_generation_result_only = generate
-        cog._execute_image_edit_result_only = edit
-        cog._admin_actions = SimpleNamespace()
-        context = await cog._execute_live_media_composition_result_only(
-            SimpleNamespace(guild=SimpleNamespace(id=1), channel=SimpleNamespace(id=2)),
-            "global image prompt",
-            execution_plan,
-            settings=SimpleNamespace(server_context=""),
-        )
-        self.assertEqual(len(seen), 1)
-        self.assertTrue(str(seen[0]).startswith("data:image/png;base64,"))
-        self.assertEqual(context.results["edit"].status, CapabilityTerminalStatus.SUCCESS)
 
     async def test_missing_native_task_operands_fail_closed_without_global_projection(self) -> None:
         cog = AIChatCog.__new__(AIChatCog)
@@ -222,68 +86,6 @@ class _TaskExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(called)
         self.assertEqual(context.results["mc_a"].reason, "missing_minecraft_address")
 
-    async def test_on_message_native_tasks_keep_distinct_operands(self) -> None:
-        bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
-
-        class _LLM(_FakeTTSClient):
-            def __init__(self) -> None:
-                self.chat_calls: list[dict[str, object]] = []
-
-            async def route_ai_interaction(self, **_kwargs):
-                return {
-                    "participation": "RESPOND",
-                    "action": "MINECRAFT_SERVER_STATUS",
-                    "participation_confidence": 1.0,
-                    "action_confidence": 1.0,
-                    "reason_code": "DIRECT_REQUEST",
-                    "capability_plan": {
-                        "objective": "check both typed servers",
-                        "semantic_source": "router",
-                        "semantic_status": "SUCCESS",
-                        "primary_action": "MINECRAFT_SERVER_STATUS",
-                        "requirements": [
-                            {"requirement_id": "a", "objective": "one", "satisfaction_criterion": "status", "required": True, "capability_owner": "MINECRAFT", "owner_task_id": "mc_a"},
-                            {"requirement_id": "b", "objective": "two", "satisfaction_criterion": "status", "required": True, "capability_owner": "MINECRAFT", "owner_task_id": "mc_b"},
-                        ],
-                        "capabilities": [
-                            {"name": "MINECRAFT", "task_id": "mc_a", "required": True, "evidence_span": "one", "scope": "STRUCTURED_DATA", "independent": True, "independent_research": False, "owner_action": "MINECRAFT_SERVER_STATUS", "operands": {"address": "one.example"}, "input_bindings": [], "depends_on": [], "source_refs": [], "requested_outputs": ["result"]},
-                            {"name": "MINECRAFT", "task_id": "mc_b", "required": True, "evidence_span": "two", "scope": "STRUCTURED_DATA", "independent": True, "independent_research": False, "owner_action": "MINECRAFT_SERVER_STATUS", "operands": {"address": "two.example"}, "input_bindings": [], "depends_on": [], "source_refs": [], "requested_outputs": ["result"]},
-                        ],
-                    },
-                    "valid": True,
-                    "failure": False,
-                }
-
-            async def chat(self, **kwargs):
-                self.chat_calls.append(kwargs)
-                return "combined"
-
-        class _Minecraft:
-            def __init__(self) -> None:
-                self.addresses: list[str] = []
-
-            async def get_status(self, address: str):
-                self.addresses.append(address)
-                return {"online": True, "version": "1.21", "players": {"online": 1, "max": 20}}
-
-        llm = _LLM()
-        minecraft = _Minecraft()
-        db = SimpleNamespace(
-            get_or_create_guild_settings=_async_return(SimpleNamespace(prefix="!", language_code="en", server_context="")),
-            is_ai_channel_allowed=_async_return(True),
-            get_ai_conversation_history=_async_return([]),
-            add_ai_conversation_turn=_async_return(None),
-        )
-        cog = AIChatCog(SimpleNamespace(user=bot_user, application_id=1234, db=db, llm_client=llm, mc_client=minecraft, is_owner_user=lambda _user: False))
-        message = _DummyMessage(attachments=[], content="<@42> check both typed servers", mentions=[bot_user])
-        message.guild = _DummyGuild()
-        message.channel = _CaptureChannel()
-
-        await cog.on_message(message)
-
-        self.assertEqual(minecraft.addresses, ["one.example", "two.example"], message.replies)
-        self.assertEqual(len(llm.chat_calls), 1)
-        self.assertEqual(message.replies, [("combined", True)])
 
     def _admin_message(self, *, channels: list[object], members: list[object] | None = None):
         actor = SimpleNamespace(

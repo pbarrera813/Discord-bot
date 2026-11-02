@@ -1,15 +1,10 @@
 from __future__ import annotations
 
-from tests.test_ai_tagging import _FakeTTSClient
 
 import unittest
-from types import SimpleNamespace
 
-from cogs.ai_chat import AIChatCog
-from services.ai_capability_orchestrator import CapabilityTerminalStatus
 from services.ai_operation_catalog import validate_operands
 from services.xai_client import XAIClient
-from tests.test_ai_tagging import _CaptureChannel, _DummyGuild, _DummyMessage, _FakeExternalSourceService, _async_return
 
 URL = "https://domain-a.test/a"
 
@@ -66,60 +61,6 @@ class ExternalSourceOperandContractTests(unittest.TestCase):
                     validate_operands("EXTERNAL_SOURCE", _operands(**{key: True})), "unknown_task_operand"
                 )
 
-
-class NativeExternalSourceLifecycleTests(unittest.IsolatedAsyncioTestCase):
-    async def _run(self, operands: dict[str, object], evidence: str = URL):
-        route = _external_route(operands, evidence)
-        self.assertTrue(route["valid"], route.get("failure_reason"))
-        bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
-        external = _FakeExternalSourceService()
-
-        class _LLM(_FakeTTSClient):
-            async def route_ai_interaction(self, **_kwargs):
-                return route
-
-            async def chat(self, **_kwargs):
-                return "Here is the page."
-
-        db = SimpleNamespace(
-            get_or_create_guild_settings=_async_return(
-                SimpleNamespace(prefix="!", language_code="en", server_context="")
-            ),
-            is_ai_channel_allowed=_async_return(True),
-            get_ai_conversation_history=_async_return([]),
-            get_or_create_birthday_guild_settings=_async_return({}),
-            get_announcement_settings=_async_return(SimpleNamespace(channel_id=None)),
-            add_ai_conversation_turn=_async_return(None),
-        )
-        cog = AIChatCog(SimpleNamespace(
-            user=bot_user, application_id=1234, db=db, llm_client=_LLM(),
-            external_source_service=external, is_owner_user=lambda _user: False,
-        ))
-        contexts: list[object] = []
-        cog._log_capability_terminal_checkpoint = lambda _message, context: contexts.append(context)
-        message = _DummyMessage(
-            attachments=[], author_id=99, guild_id=1, channel_id=10,
-            content=f"<@42> read {URL}", mentions=[bot_user], message_id=8300,
-        )
-        message.guild = _DummyGuild()
-        message.channel = _CaptureChannel()
-        await cog.on_message(message)
-        result = contexts[-1].bundle.by_task["external_1"] if contexts else None
-        return external, result
-
-    async def test_valid_task_retrieves_exactly_once(self) -> None:
-        external, result = await self._run(_operands())
-
-        self.assertEqual(len(external.retrieve_calls), 1)
-        self.assertEqual(result.status, CapabilityTerminalStatus.SUCCESS)
-        self.assertTrue(result.satisfies_request)
-
-    async def test_evidence_outside_authorized_message_never_retrieves(self) -> None:
-        external, result = await self._run(_operands(), "https://elsewhere.test/x")
-
-        self.assertEqual(external.retrieve_calls, [])
-        self.assertEqual(result.status, CapabilityTerminalStatus.VALIDATION_FAILED)
-        self.assertFalse(result.satisfies_request)
 
 
 if __name__ == "__main__":

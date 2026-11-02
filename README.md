@@ -55,7 +55,6 @@ Required for full feature set:
 
 Common optional settings:
 - `XAI_MODEL` (default `grok-4.3`; model used by the router and the replies, and the one Nitori is developed and tested with)
-- `XAI_VISION_MODEL` (optional image-capable model for AI chat attachments; defaults to `XAI_MODEL`)
 - `XAI_IMAGE_MODEL` (optional image generation/editing model; defaults to `grok-imagine-image-quality`)
 - `XAI_TTS_VOICE` (voice used for native Discord voice messages; defaults to `iris`)
 - `XAI_TTS_LANGUAGE` (language used for native Discord voice messages; defaults to `es-MX`)
@@ -63,7 +62,6 @@ Common optional settings:
 - `XAI_X_SEARCH_ENABLED` (default `false`; reserved for explicit X/social search support)
 - `XAI_WEB_SEARCH_MAX_SOURCES` (default `3`)
 - `XAI_WEB_SEARCH_COOLDOWN_SECONDS` (default `30`)
-- `XAI_ROUTER_OUTPUT_TOKEN_CEILING` (default `0`, which keeps the router's computed output budget; set a number only to cap it)
 - `BOT_OWNER_IDS` (comma-separated Discord user IDs treated as bot owners for trusted behavior rules)
 - `NITORI_LOG_LEVEL` (default `INFO`; `DEBUG` for more detail)
 - `DB_PATH`

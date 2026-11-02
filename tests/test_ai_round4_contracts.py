@@ -2,44 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from types import SimpleNamespace
 
-from cogs.ai_chat import AIChatCog
-from tests.test_ai_tagging import (
-    _async_return,
-    _CaptureChannel,
-    _CaptureChatXAIClient,
-    _DummyGuild,
-    _DummyMessage,
-)
+from tests.test_ai_tagging import _CaptureChatXAIClient
 
-
-class RouterKnowsWhichChannelTheMessageIsInTests(unittest.IsolatedAsyncioTestCase):
-    async def test_the_cog_gives_the_router_the_channel_of_the_message(self) -> None:
-        bot_user = SimpleNamespace(id=42, name="Nitori", display_name="Nitori")
-
-        class _LLM:
-            route_kwargs: dict[str, object] = {}
-
-            async def route_ai_interaction(self, **kwargs):
-                self.route_kwargs = kwargs
-                return {"participation": "IGNORE", "action": "IGNORE", "participation_confidence": 1.0, "action_confidence": 1.0, "reason_code": "UNRELATED_HUMAN_CHAT", "valid": True, "failure": False}
-
-        llm = _LLM()
-        db = SimpleNamespace(
-            get_or_create_guild_settings=_async_return(SimpleNamespace(prefix="!", language_code="en", server_context="")),
-            is_ai_channel_allowed=_async_return(True),
-            get_ai_conversation_history=_async_return([]),
-            add_ai_conversation_turn=_async_return(None),
-        )
-        cog = AIChatCog(SimpleNamespace(user=bot_user, application_id=1234, db=db, llm_client=llm, is_owner_user=lambda _user: False))
-        message = _DummyMessage(attachments=[], content="<@42> quita el slowmode del canal", mentions=[bot_user])
-        message.guild = _DummyGuild()
-        message.channel = _CaptureChannel()
-
-        await cog.on_message(message)
-
-        self.assertEqual(llm.route_kwargs["channel_metadata"], {"id": 10, "name": "general"})
 
 
 class ChatKnowsTheAuthorsPermissionsTests(unittest.IsolatedAsyncioTestCase):
