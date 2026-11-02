@@ -1847,7 +1847,7 @@ class AIChatCog(commands.Cog):
                 for request in batch:
                     result = execution_context.results.get(request.task_id)
                     outputs[request.task_id] = (
-                        self._capability_bundle_prompt_context(self._single_task_context(execution_context, request, result))
+                        self._tool_result_output(result)
                         if result is not None
                         else {"task_id": request.task_id, "status": "NOT_EXECUTED", "reason": "request superseded or cancelled"}
                     )
@@ -1925,13 +1925,82 @@ class AIChatCog(commands.Cog):
         )
 
     @staticmethod
-    def _single_task_context(context: CapabilityExecutionContext, request: CapabilityRequest, result) -> CapabilityExecutionContext:
-        """One call's result, judged against that call alone (the turn is still in progress)."""
-        plan = context.execution_plan
-        semantic_plan = replace(plan.semantic_plan, capabilities=(request,), requirements=tuple(
-            item for item in plan.semantic_plan.requirements if item.owner_task_id == request.task_id))
-        return replace(context, results={request.task_id: result},
-                       execution_plan=replace(plan, semantic_plan=semantic_plan, ordered_capabilities=(request,)))
+    def _tool_result_output(result: CapabilityTerminalResult) -> dict[str, object]:
+        """What Grok reads back for one call: its status, why it failed, and its data without empty or internal fields."""
+        def pruned(value):
+            if isinstance(value, bytes):
+                return None
+            if isinstance(value, dict):
+                value = {key: pruned(item) for key, item in value.items() if key != "request_plan"}
+                return {key: item for key, item in value.items() if item not in (None, "", [], {})}
+            if isinstance(value, (list, tuple)):
+                return [item for item in map(pruned, value) if item not in (None, "", [], {})]
+            return value
+
+        payload, key, data = result.payload, "data", None
+        if isinstance(payload, FootballRetrievalResult):
+            plan = payload.requested_scope.get("request_plan")
+            names = plan.get("output_payload") if isinstance(plan, dict) and plan.get("output_payload") else [
+                item.name for item in dataclass_fields(payload) if item.name not in {
+                    "outcome", "endpoints", "match_data", "football_entity_context", "repair_observations",
+                    "repair_scope_observations", "repair_failed_slots", "repair_feedback",
+                }
+            ]
+            data = {
+                "ambiguity_candidates": payload.ambiguity_candidates[:5], "missing_inputs": payload.missing_inputs,
+                "fallback_evidence": payload.fallback_evidence,
+                **{name: getattr(payload, name) for name in names if isinstance(name, str) and hasattr(payload, name)},
+                "entity_context": payload.football_entity_context, "requested_scope": payload.requested_scope,
+                "resolved_entities": payload.resolved_entities, "notes": payload.notes,
+            }
+            if isinstance(data.get("standings_table"), list):
+                data["standings_table"] = [_compact_standing(row) for row in data["standings_table"] if isinstance(row, dict)]
+            if payload.requested_scope.get("operation_type") in {"fixture_next", "fixture_last"} and isinstance(data.get("fixtures"), list):
+                data["fixtures"] = [_compact_fixture(item) for item in data["fixtures"] if isinstance(item, dict)]
+        elif isinstance(payload, ExternalSourceBundle):
+            # Page text is written by third parties, so Grok must read it as data rather than instructions.
+            key, data = "untrusted_data", external_source_context(
+                payload, max_chars=12000, request_date=str(result.scope.get("request_date") or "") or None,
+            )
+        elif isinstance(payload, WebResearchResult):
+            data = format_web_research_context(
+                payload, max_sources=3, request_date=str(result.scope.get("request_date") or "") or None, max_chars=12000,
+            )
+        elif result.capability in {"IMAGE_GENERATE", "IMAGE_EDIT", "MEME"} and isinstance(payload, dict):
+            if isinstance(payload.get("artifact"), bytes) and payload["artifact"]:
+                data = {"image": "attached to your reply; present it as done", "filename": payload.get("filename")}
+        elif result.capability in {"MEMORY", "ADMIN", "MINECRAFT", "NINJAS", "CODE", "REMINDER", "BIRTHDAY"} and isinstance(payload, dict):
+            # Program output and text written by members can carry prompt injection.
+            untrusted = (
+                result.capability in {"CODE", "REMINDER"}
+                or payload.get("operation") == "SERVER_MEMORY_LIST" or bool(payload.get("candidates"))
+                or (result.capability == "BIRTHDAY" and payload.get("operation") in {"template_list", "event"})
+                or (result.capability == "ADMIN" and payload.get("admin_action") in {
+                    "user_info", "server_context_view", "color_list", "color_remove",
+                })
+            )
+            key, data = ("untrusted_data" if untrusted else "data"), payload
+        elif isinstance(payload, dict) and (payload.get("text") or payload.get("analysis")):
+            data = {"analysis": payload.get("text") or payload.get("analysis")}
+
+        output: dict[str, object] = {"task_id": result.task_id, "status": result.status.value}
+        if result.native_outcome and result.native_outcome != result.status.value:
+            output["outcome"] = result.native_outcome
+        if result.reason:
+            output["reason"] = result.reason
+        if isinstance(payload, FootballRetrievalResult) and payload.missing_inputs:
+            arguments = {
+                "league": "league_candidates", "team": "team_candidates", "player": "player_candidates",
+                "opponent": "team_candidates (both teams)",
+            }
+            output["reason"] = "missing required argument: " + ", ".join(
+                dict.fromkeys(arguments.get(slot, slot) for slot in payload.missing_inputs)
+            )
+        data = pruned(data)
+        if data not in (None, "", [], {}):
+            serialized = json.dumps(data, ensure_ascii=False, default=str)
+            output[key] = data if len(serialized) <= 12000 else serialized[:12000] + " [truncated]"
+        return output
 
     @staticmethod
     def _tool_call_request(
@@ -3010,7 +3079,16 @@ class AIChatCog(commands.Cog):
         content = message.content.strip()
         if not content or self._looks_like_command_message(content, configured_prefix=prefix):
             return False
-        return not await self._is_passive_ai_blocked_channel(message.guild, message.channel, settings)
+        if await self._is_passive_ai_blocked_channel(message.guild, message.channel, settings):
+            logging.info(
+                "AI continuation rejected guild=%s channel=%s message=%s author=%s continuation_rejected_reason=passive_blocked_channel",
+                getattr(message.guild, "id", None),
+                getattr(message.channel, "id", None),
+                getattr(message, "id", None),
+                getattr(message.author, "id", None),
+            )
+            return False
+        return True
 
     def _valid_lease_for_message(self, message: discord.Message) -> ContinuationLease | None:
         key = self._message_channel_key(message)

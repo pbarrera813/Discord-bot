@@ -466,7 +466,7 @@ TOOL_DESCRIPTIONS = {
         "API-Football data: fixtures, live matches, events, lineups, statistics, standings, teams, squads, players, "
         "coaches, venues, rounds, predictions, odds, injuries, transfers, trophies, top scorers, and starting or "
         "stopping live match updates in this channel (live_watch_start/live_watch_stop, only when explicitly asked). "
-        "operation_family and data_focus are executable selectors. Candidates are names as the user wrote them, "
+        "operation_family and data_focus are executable selectors. Candidates are names as written in the conversation (this message or earlier turns), "
         "resolved by the provider: team_candidates holds exactly one name per actual participant, in user order. "
         "Use fixture_count for a bounded next/last sample and fixture_round only for an exact provider round name. "
         "On AMBIGUOUS or NOT_FOUND, retry with a better name or show the candidates to the user."
