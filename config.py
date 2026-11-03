@@ -21,8 +21,6 @@ class Settings:
     xai_tts_language: str
     xai_web_search_enabled: bool
     xai_x_search_enabled: bool
-    xai_web_search_max_sources: int
-    xai_web_search_cooldown_seconds: float
     db_path: str
     default_prefix: str
     bot_owner_ids: tuple[int, ...]
@@ -52,12 +50,6 @@ def load_settings() -> Settings:
     nitori_log_level = _env_log_level("NITORI_LOG_LEVEL", default=logging.INFO)
     xai_web_search_enabled = _env_bool("XAI_WEB_SEARCH_ENABLED", default=False)
     xai_x_search_enabled = _env_bool("XAI_X_SEARCH_ENABLED", default=False)
-    xai_web_search_max_sources = _env_int("XAI_WEB_SEARCH_MAX_SOURCES", default=3, minimum=1, maximum=5)
-    xai_web_search_cooldown_seconds = _env_float(
-        "XAI_WEB_SEARCH_COOLDOWN_SECONDS",
-        default=30.0,
-        minimum=0.0,
-    )
     db_path = os.getenv("DB_PATH", "data/bot.db").strip()
     default_prefix = os.getenv("DEFAULT_PREFIX", "!").strip() or "!"
     raw_owner_ids = os.getenv("BOT_OWNER_IDS", "").strip()
@@ -89,8 +81,6 @@ def load_settings() -> Settings:
         xai_tts_language=xai_tts_language,
         xai_web_search_enabled=xai_web_search_enabled,
         xai_x_search_enabled=xai_x_search_enabled,
-        xai_web_search_max_sources=xai_web_search_max_sources,
-        xai_web_search_cooldown_seconds=xai_web_search_cooldown_seconds,
         db_path=db_path,
         default_prefix=default_prefix,
         bot_owner_ids=tuple(owner_ids),
@@ -114,20 +104,3 @@ def _env_log_level(name: str, *, default: int) -> int:
     raw = os.getenv(name, "").strip().upper()
     return logging.getLevelNamesMapping().get(raw, default)
 
-
-def _env_int(name: str, *, default: int, minimum: int, maximum: int) -> int:
-    raw = os.getenv(name, "").strip()
-    try:
-        parsed = int(raw)
-    except ValueError:
-        parsed = default
-    return max(minimum, min(maximum, parsed))
-
-
-def _env_float(name: str, *, default: float, minimum: float) -> float:
-    raw = os.getenv(name, "").strip()
-    try:
-        parsed = float(raw)
-    except ValueError:
-        parsed = default
-    return max(minimum, parsed)

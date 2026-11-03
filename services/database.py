@@ -2466,45 +2466,6 @@ class Database:
                 for row in rows
             ]
 
-    async def get_recent_ai_conversation_turns(
-        self,
-        guild_id: int,
-        since_iso: str,
-        *,
-        limit: int = 400,
-    ) -> list[dict[str, str]]:
-        async with self._connect() as conn:
-            cursor = await conn.execute(
-                """
-                SELECT guild_id, channel_id, role, speaker, content, message_id,
-                       author_user_id, parent_message_id, action_type,
-                       resolved_request, created_at
-                FROM ai_conversation_turns
-                WHERE guild_id = ? AND created_at >= ?
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (guild_id, since_iso, limit),
-            )
-            rows = await cursor.fetchall()
-            rows = list(reversed(rows))
-            return [
-                {
-                    "guild_id": str(row["guild_id"]),
-                    "channel_id": str(row["channel_id"]),
-                    "role": str(row["role"]),
-                    "speaker": str(row["speaker"]),
-                    "content": str(row["content"]),
-                    "message_id": "" if row["message_id"] is None else str(row["message_id"]),
-                    "author_user_id": "" if row["author_user_id"] is None else str(row["author_user_id"]),
-                    "parent_message_id": "" if row["parent_message_id"] is None else str(row["parent_message_id"]),
-                    "action_type": "" if row["action_type"] is None else str(row["action_type"]),
-                    "resolved_request": "" if row["resolved_request"] is None else str(row["resolved_request"]),
-                    "created_at": str(row["created_at"]),
-                }
-                for row in rows
-            ]
-
     async def get_ai_turn_by_message_id(
         self,
         guild_id: int,

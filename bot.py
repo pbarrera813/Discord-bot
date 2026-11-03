@@ -21,17 +21,13 @@ from utils.i18n import tr
 
 
 async def dynamic_prefix(bot: "DiscordModBot", message: discord.Message) -> Any:
-    default_prefix = bot.settings.default_prefix
+    # A mention is always for Nitori; commands use slash or the text prefix.
     if message.guild is None:
-        return commands.when_mentioned_or(default_prefix)(bot, message)
-
-    prefix = default_prefix
+        return bot.settings.default_prefix
     try:
-        settings = await bot.db.get_guild_settings(message.guild.id)
-        prefix = settings.prefix
+        return (await bot.db.get_guild_settings(message.guild.id)).prefix
     except Exception:
-        pass
-    return commands.when_mentioned_or(prefix)(bot, message)
+        return bot.settings.default_prefix
 
 
 class DiscordModBot(commands.Bot):
@@ -168,8 +164,6 @@ class DiscordModBot(commands.Bot):
         }
         if command_name.startswith("football "):
             labels["query"] = ("Search", "Búsqueda")
-        if command_name == "football schedule":
-            labels["count"] = ("Match position", "Posición del partido")
         parts: list[str] = []
 
         def walk(options: list[dict[str, Any]]) -> None:

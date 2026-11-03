@@ -19,7 +19,7 @@ Nitori was built as a single, no-paywall Discord bot for communities that want b
 - One AI capability set behind natural language: chat, football, Minecraft status, API Ninjas lookups, code runs, reminders, birthdays, translation, memes, web research, link reading, image generation/editing/analysis, reactions, server administration and server memory.
 - AI image generation, image analysis, and image editing from current or replied image messages, including follow-ups on the image Nitori just made ("now make it blue").
 - AI football answers grounded in API-Football data, including teams, players, coaches, venues, leagues, fixtures, standings, scorers, injuries, transfers, match events, statistics (including half-time), lineups, pre-match and live odds, predictions, shootouts, squads, career and trophy history, summaries, previews, current score/status, and live-watch updates.
-- Link reading: summarize, explain, compare, extract or verify the content of links you send or reply to (public pages and images only; private or unsafe addresses are refused).
+- Link reading: summarize, explain, compare, extract or verify the content of links you send or reply to. Grok opens the page itself through web search, so this needs `XAI_WEB_SEARCH_ENABLED`.
 - Optional xAI web search for current external information and API-Football gaps (off by default).
 - Structured server memory and trusted owner/admin behavior rules for server-specific style and context, managed with commands or in plain words. A fact about a member is linked to that member and only comes up in chat when they are talking, mentioned, replied to or part of the recent conversation, with a cooldown so a joke is not repeated.
 - Translation command with preset target languages; in chat Nitori translates into any language you name.
@@ -40,7 +40,6 @@ Nitori was built as a single, no-paywall Discord bot for communities that want b
 - API Ninjas key (joke/dadjoke/advice/whois/convert)
 - API-Football key (supported football leagues)
 - Code runner access token (`GLOT_API_TOKEN`, the runner's `API_ACCESS_TOKEN`) (/code)
-- Optional: Playwright with Chromium (`playwright install chromium`) so Nitori can read JavaScript-heavy pages when you ask about a link
 
 ## Environment Variables
 Use `.env.example` as base.
@@ -59,9 +58,7 @@ Common optional settings:
 - `XAI_TTS_VOICE` (voice used for native Discord voice messages; defaults to `iris`)
 - `XAI_TTS_LANGUAGE` (language used for native Discord voice messages; defaults to `es-MX`)
 - `XAI_WEB_SEARCH_ENABLED` (default `false`; web lookups, including the football web fallback, run only when this is `true`)
-- `XAI_X_SEARCH_ENABLED` (default `false`; reserved for explicit X/social search support)
-- `XAI_WEB_SEARCH_MAX_SOURCES` (default `3`)
-- `XAI_WEB_SEARCH_COOLDOWN_SECONDS` (default `30`)
+- `XAI_X_SEARCH_ENABLED` (default `false`; lets Grok search X posts when web search is also enabled)
 - `BOT_OWNER_IDS` (comma-separated Discord user IDs treated as bot owners for trusted behavior rules)
 - `NITORI_LOG_LEVEL` (default `INFO`; `DEBUG` for more detail)
 - `DB_PATH`
@@ -78,8 +75,6 @@ python -m venv .venv
 # source .venv/bin/activate
 
 pip install -r requirements.txt
-# optional, to read JavaScript-heavy linked pages
-# playwright install chromium
 python bot.py
 ```
 
@@ -252,34 +247,24 @@ Admin commands (slash-visible for admins only):
 
 The six-milestone Football command/card upgrade and command cleanup are complete and operator-accepted as of 2026-10-28.
 
-- `/football live <league>`
-- `/football today <league>`
-- `/football next <league> [target:<count-or-team>] [season]`
-- `/football last <league> [team] [count] [season]`
+- `/football match [team] [when:auto|live|next|last]`
+- `/football fixtures <league> [when:auto|live|today|next|last]`
+- `/football team [team]`
 - `/football table <league>`
-- `/football team <league> <team> [season]`
-- `/football match team:<name> [when:auto|live|next|last] [league]`
-- `/football schedule team:<name> date:<next|last> [league] [count]`
-- `/football player <player> [league] [season] [team]`
-- `/football injuries <team> [league]`
-- `/football transfers <team> [league]`
-- `/football h2h team:<name> opponent:<name> [league] [matches]`
+- `/football player <player> [team]`
+- `/football h2h <team> <opponent>`
 - `/football top [category:scorers|assists|yellowcards|redcards] [league]`
-- `/football odds-reference [scope:bookmakers|bets|live_bets] [query]`
-- `/football odds-mapping [page]`
-- `/football timezones`
-- `/football countries [filter:name|code|search] [query]`
-- `/football seasons`
+- `/football myteam [team]`
 
-Schedule selects one match: `count` is its position, defaults to 1 and accepts 1-50. For example, `/football schedule team:Tigres UANL date:next count:2` opens the second upcoming match. With no league supplied, Schedule resolves the team's current domestic league; an explicit league changes that scope. H2H's `matches` is a sample quantity, defaults to 10 and accepts 1-50. Its optional league helps identify the teams; the returned meetings can span competitions. Next's `target` accepts either a fixture quantity (default 10, maximum 50) or a team name; Last's `count` is a fixture quantity with the same default and limit.
+`match` and `team` use your saved team when no team is given; save it once with `/football myteam <team>`. `match` with `when:auto` opens the live match, otherwise today's, otherwise the next ones; `when:last` lists the previous ones. `team` uses the team's current domestic league. `fixtures` with `when:auto` shows the league's live matches, then today's, then the next ten. `h2h` shows the last 10 meetings.
 
-Player statistics use the explicit season when supplied, the selected league's current season when a league is supplied without a season, or the player's latest registered season otherwise. The chosen season is labeled, each team/competition statistics block stays separate, and the optional team field narrows ambiguous player identities.
+`player` shows every competition of the player's latest registered season as its own page, with the season before it one tap away; when several players share the name, a menu lists them by age, position, team and nationality.
 
-Main Football views are standalone image cards. Section menus and Previous/Next buttons expose the available records; fixture lists let you select a match and return to the same list page. Only the requesting user can operate the controls. Text sends the current card's information as paginated ephemeral replies visible only to that user. After three minutes of inactivity, controls expire and the command must be run again. Browsing loaded pages reuses their data; Refresh respects the provider cache. Successful empty results use contextual text messages.
+Main Football views are standalone image cards. Section menus and Previous/Next buttons expose the available records; fixture lists let you select a match and return to the same list page. Only the requesting user can operate the controls. After three minutes of inactivity, controls expire and the command must be run again. Browsing loaded pages reuses their data; Refresh respects the provider cache. Successful empty results use contextual text messages.
 
-The match menu includes preview, lineups, statistics, events, player performances, period scores, season comparisons, provider forecasts and odds. Forecasts and odds load only when opened. For an upcoming match, use `/football match team:<name> when:next`; for a current match, use `when:live`. Open the desired section after selecting the match. Scorers are available through `/football top category:scorers`. These menu sections replace the former standalone preview, lineup, stats, summary, odds, live-odds and scorers commands.
+The match menu includes preview, lineups, statistics, events, player performances, period scores, season comparisons, provider forecasts and odds. Forecasts and odds load only when opened. For an upcoming match, use `/football match team:<name> when:next`; for a current match, use `when:live`. Open the desired section after selecting the match. Scorers are available through `/football top category:scorers`.
 
-Team cards also offer current squads, registered seasons, coach profiles and venue details. Player cards offer career teams, transfer history, trophies and recorded absences. These sections load only when opened. The squad is current even when viewing another season; career/history sections retain their full recorded scope.
+Team cards also offer season statistics, the current squad, coach, venue, injuries and transfers. Player cards offer the previous season, career teams, transfer history, trophies and recorded absences. These sections load only when opened; career/history sections retain their full recorded scope.
 
 League fields support provider-backed autocomplete and league-name searches, subject to API-Football's league/season coverage. Existing shortcuts remain available:
 - `ligamx`

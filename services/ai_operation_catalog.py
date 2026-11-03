@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -71,7 +70,8 @@ def is_memory_lifecycle(operands: dict) -> bool:
     )
 FOOTBALL_MUTATING_OPERATIONS = frozenset({"live_watch_start", "live_watch_stop"})
 # Every NINJAS operation is a read-only lookup against the existing provider client.
-NINJAS_OPERATIONS = frozenset({"joke", "dadjoke", "advice", "whois", "unit_conversion"})
+# Grok tells jokes, gives advice and converts units itself; whois is the live data it cannot know.
+NINJAS_OPERATIONS = frozenset({"whois"})
 # CODE runs a user-supplied program on the remote Glot runner (never locally); the
 # language enum is the runner's slug table, and command/stdin are never operands.
 CODE_OPERATIONS = frozenset({"run", "languages"})
@@ -137,10 +137,6 @@ OPERATION_VALUES = {
 }
 
 KNOWN_OUTPUTS = {
-    "WEB": {"answer", "sources", "citations", "media_candidates", "grounded_visual_observation", "result"},
-    # ``media`` is a deliberate structural projection of authorized
-    # ``ExternalSourceBundle.selected_media`` for visual consumers.
-    "EXTERNAL_SOURCE": {"sources", "results", "selected_media", "media", "result"},
     # Result-only vision handlers return these concrete payload keys.  The
     # whole terminal result remains available for structural consumers.
     "IMAGE_ANALYZE": {"text", "media_urls", "rendered_media_count", "result"},
@@ -152,7 +148,7 @@ KNOWN_OUTPUTS = {
         "team_season_statistics", "rounds", "venues", "predictions", "odds", "coach_context_row",
         "trophies", "sidelined", "coverage", "reference_rows", "player_context_row",
         "team_context_row", "league_context_row", "standings_table", "standing_row", "generic_rows",
-        "requested_scope", "resolved_entities", "fallback_evidence", "result",
+        "requested_scope", "resolved_entities", "result",
     },
     "MINECRAFT": {"result"},
     "NINJAS": {"result"},
@@ -168,15 +164,6 @@ KNOWN_OUTPUTS = {
     "REACTION": {"reaction", "result"},
     "CHAT": {"answer", "result"},
     "CLARIFICATION": {"question", "result"},
-}
-ARTIFACT_OUTPUT_FIELDS = frozenset({"artifact"})
-# Only consumers with a typed resource/media input constrain the producer
-# output.  Ordered dependencies without a binding remain valid.
-CONSUMER_OUTPUT_FIELDS = {
-    "ADMIN": frozenset({"resource_handle"}),
-    "IMAGE_ANALYZE": frozenset({"media", "artifact"}),
-    "IMAGE_EDIT": frozenset({"media", "artifact"}),
-    "MEME": frozenset({"answer", "text", "result"}),
 }
 
 
@@ -217,10 +204,6 @@ def _string(max_length: int, *, nullable: bool = True, enum: frozenset[str] | No
 
 def _integer(*, minimum: int | None = None, maximum: int | None = None) -> OperandDescriptor:
     return OperandDescriptor("integer", minimum=minimum, maximum=maximum)
-
-
-def _number(*, minimum: float | None = None, maximum: float | None = None) -> OperandDescriptor:
-    return OperandDescriptor("number", minimum=minimum, maximum=maximum)
 
 
 def _boolean() -> OperandDescriptor:
@@ -269,8 +252,7 @@ OPERAND_DESCRIPTORS: dict[str, dict[str, OperandDescriptor]] = {
     "MINECRAFT": {"address": _string(255)},
     "NINJAS": {
         "ninjas_action": _string(40, nullable=False, enum=NINJAS_OPERATIONS),
-        "domain": _string(253), "amount": _number(),
-        "from_unit": _string(60), "to_unit": _string(60),
+        "domain": _string(253),
     },
     "CODE": {
         "code_action": _string(40, nullable=False, enum=CODE_OPERATIONS),
@@ -310,13 +292,8 @@ OPERAND_DESCRIPTORS: dict[str, dict[str, OperandDescriptor]] = {
         "meme_top": _string(200), "meme_bottom": _string(200), "meme_text_slot": _string(6, enum=MEME_TEXT_SLOTS),
     },
     "REACTION": {"emoji": _string(120), "emojis": _strings()},
-    "WEB": {"query": _string(900), "research_question": _string(900)},
-    "EXTERNAL_SOURCE": {
-        "url": _string(2400), "source_url": _string(2400), "source_scope": _string(40),
-        "expected_content": _string(30), "operation": _string(40),
-    },
     "IMAGE_GENERATE": {"prompt": _string(1200)},
-    "IMAGE_EDIT": {"prompt": _string(1200), "source_url": _string(2400)},
+    "IMAGE_EDIT": {"prompt": _string(1200)},
     "IMAGE_ANALYZE": {"selection_count": OperandDescriptor("integer", nullable=False, minimum=1, maximum=4)},
 }
 
@@ -369,13 +346,6 @@ def validate_operands(family: str, operands: object) -> str | None:
                 return "task_operand_type_or_bounds_invalid"
             if descriptor.maximum is not None and value > descriptor.maximum:
                 return "task_operand_type_or_bounds_invalid"
-        elif descriptor.kind == "number":
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-                return "task_operand_type_or_bounds_invalid"
-            if descriptor.minimum is not None and value < descriptor.minimum:
-                return "task_operand_type_or_bounds_invalid"
-            if descriptor.maximum is not None and value > descriptor.maximum:
-                return "task_operand_type_or_bounds_invalid"
         elif descriptor.kind == "boolean":
             if not isinstance(value, bool):
                 return "task_operand_type_or_bounds_invalid"
@@ -397,10 +367,6 @@ def canonical_operations(family: str) -> frozenset[str]:
 
 def known_output_fields(family: str) -> frozenset[str]:
     return frozenset(KNOWN_OUTPUTS.get(str(family or "").strip().upper(), set()))
-
-
-def compatible_input_outputs(family: str) -> frozenset[str] | None:
-    return CONSUMER_OUTPUT_FIELDS.get(str(family or "").strip().upper())
 
 
 def _operation(request: Any) -> str:
@@ -448,7 +414,7 @@ def operation_effect(request: Any) -> str | None:
         return "read" if operation in BIRTHDAY_OPERATIONS else None
     if family in {"IMAGE_GENERATE", "IMAGE_EDIT", "MEME"}:
         return "artifact"
-    if family in {"CHAT", "MINECRAFT", "TRANSLATE", "WEB", "EXTERNAL_SOURCE", "IMAGE_ANALYZE", "CLARIFICATION"}:
+    if family in {"CHAT", "MINECRAFT", "TRANSLATE", "IMAGE_ANALYZE", "CLARIFICATION"}:
         return "read"
     return None
 
@@ -465,22 +431,15 @@ TOOL_DESCRIPTIONS = {
         "Use fixture_count for a bounded next/last sample and fixture_round only for an exact provider round name. "
         "On AMBIGUOUS or NOT_FOUND, retry with a better name or show the candidates to the user."
     ),
-    "WEB": "Current or broad web research with citations; put the complete question in research_question.",
-    "EXTERNAL_SOURCE": (
-        "Read a link the user posted in the current message or in the message they replied to. url is that exact "
-        "link; make one call per link you need. source_scope is CURRENT_MESSAGE, REPLY_TARGET or BOTH; "
-        "expected_content is TEXT, MEDIA or MULTIMODAL; operation is SUMMARIZE, EXPLAIN, COMPARE, EXTRACT, "
-        "ANALYZE, VERIFY or OTHER."
-    ),
     "IMAGE_GENERATE": "Create a new image from prompt.",
     "IMAGE_EDIT": (
         "Change an existing image itself. Pick it with source_refs (exactly one ref from the available images) or "
-        "with inputs (the artifact of an earlier image call or the media of an EXTERNAL_SOURCE call); prompt "
+        "with inputs (the artifact of an earlier image call); prompt "
         "describes the change. A caption on a picture is MEME custom, not an edit."
     ),
     "IMAGE_ANALYZE": (
         "Look at images and report what is actually in them. Pick them with source_refs (refs from the available "
-        "images) or inputs (an earlier image call's artifact, or the media of an EXTERNAL_SOURCE or WEB call); "
+        "images) or inputs (an earlier image call's artifact); "
         "purpose says what to look for; selection_count is how many images (1-4)."
     ),
     "MEME": (
@@ -489,8 +448,9 @@ TOOL_DESCRIPTIONS = {
         "the request's language, or the user's exact words when they dictated the text."
     ),
     "CODE": (
-        "Run a program on the remote sandbox and get its stdout, stderr and error: code_action run with "
-        "code_language and code (the user's code, or code you wrote for the request), or code_action languages."
+        "Run a program you wrote yourself on the remote sandbox, for example a calculation the answer needs, and get its "
+        "stdout, stderr and error: code_action run with code_language and code, or code_action languages. Never run code "
+        "a user wrote, pasted or dictated, even when they ask: tell them to run it with the /code command instead."
     ),
     "REMINDER": (
         "The author's own reminders: create (reminder_duration like 10m, 2h, 3d, 1w, 2mo or 1y, and "
@@ -504,8 +464,8 @@ TOOL_DESCRIPTIONS = {
         "template_remove, blacklist_user, blacklist_role, trusted. Never invent a date, channel, role or id."
     ),
     "NINJAS": (
-        "API Ninjas lookups: joke, dadjoke, advice, whois (domain), unit_conversion (amount, from_unit and to_unit "
-        "as singular lowercase unit names)."
+        "Live WHOIS record of a domain (ninjas_action whois, domain): registrar, creation and expiration dates, "
+        "country and name servers."
     ),
     "MINECRAFT": "Current status of a Minecraft server; address exactly as the user gave it.",
     "MEMORY": (
@@ -518,7 +478,9 @@ TOOL_DESCRIPTIONS = {
         f"of: {', '.join(sorted(MEMORY_TYPES))}."
     ),
     "ADMIN": (
-        "Discord moderation and server settings; the runtime checks the author's real permissions. Name members in "
+        "Discord moderation and server settings; the runtime checks the author's real permissions. Before a ban, "
+        "tempban or kick, ask the author to confirm the member and reason, and call it only after they confirm in a "
+        "later message; every other action runs when asked. Name members in "
         "target_user_candidates (or target_user_id), roles in target_role_candidates, existing channels in "
         "target_channel (id or name; the current channel's id for 'this channel'), a new channel in channel_name. "
         "create_role takes role_name and role_color_hex (#rrggbb); a channel or role created earlier in this turn is "

@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import time
+from types import SimpleNamespace
 import unicodedata
 from typing import Any, Final
 from urllib.parse import urlparse
@@ -64,16 +65,13 @@ from services.ai_operation_catalog import (
 )
 from services.api_ninjas import NinjasOperandError, execute_operation as execute_ninjas_operation
 from services.glot import RUN_FILENAMES, execute_run, truncate_output
-from services.football_analysis_context import _compact_fixture, _compact_standing, build_fixture_context, build_player_context, build_standings_context, build_team_context, football_grounding_prompt
+from services.football_analysis_context import _compact_fixture, _compact_standing
 from services.football_formatter import fixture_score, fixture_status, fixture_teams
-from services.football_live_match_service import FootballLiveMatchService, compact_match_data, match_requested_stat
+from services.football_live_match_service import FootballLiveMatchService
 from services.football_operation_service import (
-    FootballIdentityReplan,
-    FootballIdentityScopeCandidate,
     FootballOperationService,
     FootballOutcome,
     FootballRetrievalResult,
-    football_web_fallback_eligible,
 )
 from services.football_query_service import FootballQueryOperation, build_operation, compile_football_operation
 from services.football_api_request_compiler import InvalidFootballApiRequest
@@ -86,25 +84,8 @@ from services.football_watch import (
     snapshot_from_fixture,
 )
 from services import football_resolver
-from services.server_memory import SELF_DECIDABLE_MEMORY_TYPES, ServerMemoryInput, ServerMemoryService
+from services.server_memory import MEMORY_TYPES, SELF_DECIDABLE_MEMORY_TYPES, ServerMemoryInput, ServerMemoryService
 from services.server_memory_context import ServerMemoryContextBuilder
-from services.external_sources import (
-    ExternalExpectedContent,
-    ExternalMediaArtifact,
-    ExternalMediaSource,
-    ExternalSourceBundle,
-    ExternalSourceIntent,
-    ExternalSourceOperation,
-    ExternalSourceScope,
-    ExternalSourceService,
-    ExternalSourceStatus,
-    UrlSafetyPolicy,
-    external_source_context,
-    external_source_grounding_prompt,
-    extract_urls,
-    hash_text,
-    is_supported_image_url,
-)
 from services.voice_messages import (
     ALLOWED_TTS_TAGS,
     DiscordVoiceMessageSender,
@@ -114,8 +95,6 @@ from services.voice_messages import (
     sanitize_tts_text,
 )
 from services.xai_client import ADMIN_ACTION_OPERATIONS, XAICompletionError, XAITTSAuthorizationError
-from services.web_research import WebResearchRequest, WebResearchResult, WebResearchService
-from services.web_research_context import football_web_grounding_prompt, format_web_research_context
 from services.ai_capability_orchestrator import (
     CapabilityExecutionPlan,
     CapabilityExecutionContext,
@@ -127,23 +106,30 @@ from services.ai_capability_orchestrator import (
     CapabilityTerminalStatus,
     CapabilityTerminalResult,
     execute_ordered_capabilities,
-    football_plan_from_route_payload,
     normalize_terminal_result,
-    normalize_capability_plan,
-    reusable_results_for_continuation,
     evidence_read_key,
+    hash_text,
 )
 from utils.i18n import tr
 
 
-STAGE4_RESULT_ONLY_CAPABILITIES = frozenset({"WEB", "EXTERNAL_SOURCE", "IMAGE_ANALYZE"})
-STAGE3_COMPOSABLE_CAPABILITIES = frozenset({"FOOTBALL", "EXTERNAL_SOURCE", "MINECRAFT", "NINJAS", "CODE", "REMINDER", "BIRTHDAY", "TRANSLATE", "WEB", "IMAGE_ANALYZE", "IMAGE_GENERATE", "IMAGE_EDIT", "REACTION", "MEME"})
-RESULT_ONLY_MULTI_CAPABILITIES = STAGE3_COMPOSABLE_CAPABILITIES | {"ADMIN", "MEMORY", "CHAT"}
 MAX_RESULT_IMAGE_ARTIFACT_BYTES: Final[int] = 8 * 1024 * 1024
+NOTHING_DONE_STATUSES = frozenset({
+    CapabilityTerminalStatus.NOT_EXECUTED, CapabilityTerminalStatus.VALIDATION_FAILED,
+    CapabilityTerminalStatus.PERMISSION_DENIED, CapabilityTerminalStatus.UNSUPPORTED,
+})
+
+
+def is_supported_image_url(url: object, content_type: object = None) -> bool:
+    if str(content_type or "").split(";", 1)[0].strip().casefold() in {"image/png", "image/jpeg", "image/jpg", "image/webp"}:
+        return True
+    parsed = urlparse(str(url or ""))
+    if parsed.path.casefold().endswith((".jpg", ".jpeg", ".png", ".webp")):
+        return True
+    return any(marker in parsed.query.casefold() for marker in ("format=jpg", "format=jpeg", "format=png", "format=webp", "name=large"))
 ADMIN_CONFIG_CHANNEL_OPERATIONS = frozenset({"set_modlog", "ai_channel_add", "ai_channel_remove", "server_context_learn"})
 ADMIN_CONFIG_OPERATIONS = ADMIN_CONFIG_CHANNEL_OPERATIONS | {"set_prefix", "set_language", "set_antispam", "set_antilink", "ai_channel_list", "ai_channel_clear", "server_context_view", "server_context_reset"}
 ADMIN_COLOR_OPERATIONS = frozenset({"color_setup", "color_list", "color_publish", "color_reload", "color_add", "color_remove"})
-ADMIN_TYPED_ONLY_OPERATIONS = ADMIN_CONFIG_OPERATIONS | ADMIN_COLOR_OPERATIONS | {"help", "user_info", "say", "set_slowmode", "set_nickname", "clear_channel", "clone_channel", "purge_user_messages"}
 
 
 @dataclass(frozen=True)
@@ -216,39 +202,13 @@ class RouteDecision:
     emojis: tuple[str, ...] = ()
     send_text: bool = True
     response_delivery: dict[str, Any] | None = None
-    external_source: dict[str, Any] | None = None
     pending_operation: str | None = None
     memory: dict[str, Any] | None = None
     admin: dict[str, Any] | None = None
     capability_plan: dict[str, Any] | None = None
-    semantic_interpretation: dict[str, Any] | None = None
     valid: bool = True
     failure: bool = False
     failure_reason: str | None = None
-
-    def __post_init__(self) -> None:
-        if self.semantic_interpretation is None:
-            object.__setattr__(
-                self,
-                "semantic_interpretation",
-                {
-                    "status": "FAILED" if self.failure else "SUCCESS",
-                    "failure_reason": self.failure_reason,
-                },
-            )
-        if self.capability_plan is None:
-            if str(self.semantic_interpretation.get("status", "SUCCESS")).upper() != "SUCCESS":
-                return
-            object.__setattr__(
-                self,
-                "capability_plan",
-                normalize_capability_plan(
-                    None,
-                    action=self.action,
-                    response_delivery=self.response_delivery,
-                    external_source=self.external_source,
-                ).to_payload(),
-            )
 
 
 @dataclass
@@ -262,19 +222,6 @@ class PendingInteraction:
     version: int
     created_at: float
     canceled: bool = False
-
-
-@dataclass
-class MissedResponseCandidate:
-    guild_id: int
-    channel_id: int
-    author_user_id: int
-    message_id: int | None
-    created_at: float
-    anchor_type: str
-    reason: str
-    snippet: str
-    author_name: str
 
 
 @dataclass
@@ -300,122 +247,10 @@ class FootballLiveWatch:
 
 
 STRONG_ANCHORS: Final[set[str]] = {"DIRECT_MENTION", "REPLY_TO_AI", "NAME_AT_START", "REPLY_TO_WATCH"}
-AMBIGUOUS_ANCHORS: Final[set[str]] = {"NAME_REFERENCE", "SAME_USER_CONTINUATION", "PENDING_FOLLOWUP"}
-AMBIGUOUS_ROUTING_CONFIDENCE: Final[float] = 0.85
-IMAGE_ACTION_CONFIDENCE: Final[float] = 0.85
 # Keep typed continuity available through ordinary pauses while retaining bounded freshness.
 CONTINUATION_LEASE_SECONDS: Final[float] = 600.0
 PENDING_INTERACTION_SECONDS: Final[float] = 90.0
-ROUTE_PARTICIPATIONS: Final[set[str]] = {"RESPOND", "REACT_ONLY", "IGNORE"}
-ROUTE_ACTIONS: Final[set[str]] = {
-    "CHAT",
-    "ADD_REACTION",
-    "REACT_ONLY",
-    "GENERATE_IMAGE",
-    "EDIT_IMAGE",
-    "ANALYZE_IMAGE",
-    "CLARIFY",
-    "CANCEL_PENDING",
-    "CONFIRM_PENDING",
-    "MODIFY_PENDING",
-    "IGNORE",
-    "NONE",
-    "FOOTBALL_LOOKUP",
-    "FOOTBALL_TABLE",
-    "FOOTBALL_MATCH_CENTER",
-    "FOOTBALL_TEAM_QUERY",
-    "FOOTBALL_PLAYER_QUERY",
-    "FOOTBALL_FIXTURE_QUERY",
-    "FOOTBALL_PREVIEW",
-    "FOOTBALL_SUMMARY",
-    "FOOTBALL_COMPARISON",
-    "FOOTBALL_WATCH_TODAY",
-    "FOOTBALL_LIVE_WATCH_START",
-    "FOOTBALL_LIVE_WATCH_STOP",
-    "FOOTBALL_EXPLAIN_RESULT",
-    "WEB_LOOKUP",
-    "ADMIN_ACTION",
-    "SERVER_MEMORY_LOOKUP",
-    "SERVER_MEMORY_WRITE",
-    "SERVER_MEMORY_UPDATE",
-    "SERVER_MEMORY_DELETE",
-    "SERVER_MEMORY_CLARIFY",
-    "SERVER_MEMORY_LIST",
-    "SERVER_MEMORY_APPROVE",
-    "SERVER_MEMORY_REJECT",
-    "MINECRAFT_SERVER_STATUS",
-}
-ROUTE_REASON_CODES: Final[set[str]] = {
-    "DIRECT_REQUEST",
-    "REPLY_CONTINUATION",
-    "NAME_AT_START_REQUEST",
-    "NAME_REFERENCE_REQUEST",
-    "SAME_USER_CONTINUATION",
-    "IMAGE_GENERATION_REQUEST",
-    "IMAGE_ANALYSIS_REQUEST",
-    "IMAGE_CONTEXT_EDIT",
-    "REACTION_ACK",
-    "CLARIFICATION_NEEDED",
-    "ADDRESSED_TO_OTHER_USER",
-    "QUOTING_OR_DISCUSSING_BOT",
-    "NO_MEANINGFUL_CONTENT",
-    "COMMAND_TRAFFIC",
-    "UNRELATED_HUMAN_CHAT",
-    "ROUTER_FAILURE",
-    "MISSED_RESPONSE_REPAIR",
-    "SERVER_MEMORY_REQUEST",
-    "ADMIN_ACTION_REQUEST",
-}
-AMBIGUOUS_ALLOWED_REASON_CODES: Final[set[str]] = {
-    "SAME_USER_CONTINUATION",
-    "NAME_REFERENCE_REQUEST",
-    "MISSED_RESPONSE_REPAIR",
-    "IMAGE_CONTEXT_EDIT",
-    "IMAGE_GENERATION_REQUEST",
-    "IMAGE_ANALYSIS_REQUEST",
-    "CLARIFICATION_NEEDED",
-    "REACTION_ACK",
-    "DIRECT_REQUEST",
-}
 
-
-SUPPORTED_TRANSLATE_LANGUAGES: Final[tuple[str, ...]] = (
-    "english",
-    "spanish",
-    "german",
-    "japanese",
-    "russian",
-    "french",
-    "italian",
-    "portuguese",
-)
-
-TRANSLATE_LANGUAGE_ALIASES: Final[dict[str, str]] = {
-    "english": "english",
-    "en": "english",
-    "ingles": "english",
-    "spanish": "spanish",
-    "es": "spanish",
-    "espanol": "spanish",
-    "german": "german",
-    "de": "german",
-    "aleman": "german",
-    "japanese": "japanese",
-    "ja": "japanese",
-    "japones": "japanese",
-    "russian": "russian",
-    "ru": "russian",
-    "ruso": "russian",
-    "french": "french",
-    "fr": "french",
-    "frances": "french",
-    "italian": "italian",
-    "it": "italian",
-    "italiano": "italian",
-    "portuguese": "portuguese",
-    "pt": "portuguese",
-    "portugues": "portuguese",
-}
 
 class AIChatCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
@@ -427,8 +262,6 @@ class AIChatCog(commands.Cog):
         self._football_turn_contexts: dict[tuple[int, int, int], FootballTurnContext] = {}
         self._pending_interactions: dict[tuple[int, int, int, int | None], PendingInteraction] = {}
         self._pending_versions: dict[tuple[int, int, int, int | None], int] = {}
-        self._missed_response_ttl_seconds = 90.0
-        self._missed_response_candidates: dict[tuple[int, int, int], MissedResponseCandidate] = {}
         self._football_live_watches: dict[tuple[int, int], FootballLiveWatch] = {}
         self._football_live_watch_poll_seconds = 30.0
         self._football_live_watch_max_seconds = 7200.0
@@ -437,8 +270,6 @@ class AIChatCog(commands.Cog):
         self._channel_noisy_until: dict[tuple[int, int], float] = {}
         self._channel_noise_window_seconds = 20.0
         self._channel_noise_decay_seconds = 20.0
-        self._reaction_cooldown_seconds = 45.0
-        self._reaction_cooldowns: dict[tuple[int, int], float] = {}
         self._conversation_history: dict[tuple[int, int], deque[dict[str, str]]] = defaultdict(
             lambda: deque(maxlen=120)
         )
@@ -454,18 +285,6 @@ class AIChatCog(commands.Cog):
         )
         self._admin_actions = AdminActionService(bot)
         settings = getattr(self.bot, "settings", None)
-        self._web_research = getattr(self.bot, "web_research_service", None) or WebResearchService(
-            getattr(self.bot, "llm_client", None),
-            enabled=bool(getattr(settings, "xai_web_search_enabled", False)),
-            x_search_enabled=bool(getattr(settings, "xai_x_search_enabled", False)),
-            max_sources=int(getattr(settings, "xai_web_search_max_sources", 3) or 3),
-            cooldown_seconds=float(getattr(settings, "xai_web_search_cooldown_seconds", 30.0) or 30.0),
-        )
-        self._external_sources = getattr(self.bot, "external_source_service", None) or ExternalSourceService(
-            max_sources=int(getattr(settings, "xai_web_search_max_sources", 3) or 3),
-            max_media=4,
-            web_research_service=self._web_research,
-        )
         self._history_entry_max_chars = 900
         self._chat_response_id_limit = 600
         self._chat_response_ids: deque[int] = deque(maxlen=self._chat_response_id_limit)
@@ -481,12 +300,6 @@ class AIChatCog(commands.Cog):
             if watch.task is not None:
                 watch.task.cancel()
         self._football_live_watches.clear()
-        close_external_sources = getattr(self._external_sources, "close", None)
-        if close_external_sources is not None:
-            try:
-                asyncio.create_task(close_external_sources())
-            except RuntimeError:
-                pass
 
     async def _is_ai_allowed_in_channel(
         self,
@@ -510,7 +323,6 @@ class AIChatCog(commands.Cog):
         lease_key = self._message_channel_key(message)
         self._invalidate_lease_for_intervening_human(message)
         self._invalidate_pending_for_intervening_human(message)
-        self._invalidate_missed_response_for_intervening_human(message)
 
         settings = await self.bot.db.get_or_create_guild_settings(message.guild.id)
         prefix = settings.prefix
@@ -602,6 +414,13 @@ class AIChatCog(commands.Cog):
             else RepliedMessageContext()
         )
         llm_prompt = self._apply_image_context_note(self._apply_replied_message_context(user_prompt, replied_context), image_context)
+        recent_messages = await self._channel_history_intent_context(message)
+        if recent_messages:
+            # Messages the bot was not part of are not in its conversation history; Grok needs them to know who is talking to whom.
+            bot_id = getattr(self.bot.user, "id", None)
+            llm_prompt += "\n\n[RECENT_CHANNEL_MESSAGES] oldest first, before this message:\n" + "\n".join(
+                f"{'you' if item.get('author_id') == bot_id else item['author']}: {item['content']}" for item in recent_messages
+            )
         image_sources = self._image_source_projection(image_context)
         if image_sources:
             llm_prompt += "\n\n[AVAILABLE_IMAGES] " + json.dumps(
@@ -614,6 +433,9 @@ class AIChatCog(commands.Cog):
         )
         if anchor_type == "SAME_USER_CONTINUATION":
             conversation_mode = "continuation"
+        elif anchor_type == "NAME_REFERENCE":
+            # Only the name appears: no mention, no reply. Grok decides whether it is being talked to.
+            conversation_mode = "name"
         route_decision = RouteDecision("RESPOND", "CHAT", 1.0, 1.0, "DIRECT_REQUEST")
         pending_for_send = self._set_pending_interaction(
             message,
@@ -622,18 +444,19 @@ class AIChatCog(commands.Cog):
         )
         server_context = await self._server_context_with_memory(
             message, base_context=settings.server_context, route_action="CHAT", current_text=user_prompt,
-            replied_message=replied_message,
+            replied_message=replied_message, participants=recent_messages,
         )
         await message.channel.typing()
         reply_to_trigger = self._should_reply_to_trigger(message, is_direct_trigger=anchor_type in STRONG_ANCHORS)
         plan = CapabilityPlan(
             objective=user_prompt[:300], capabilities=(), primary_action="CHAT",
-            response_delivery={}, external_source={}, football={},
+            response_delivery={}, football={},
         )
         execution_context = CapabilityExecutionContext(
             CapabilityExecutionPlan(semantic_plan=plan, ordered_capabilities=(), dispatch_action="CHAT")
         )
         control: dict[str, object] = {"silent": False, "artifacts": None}
+        tools = tool_definitions() + self._native_search_tools()
         completed_changes: dict[str, str] = {}
 
         async def run_tools(calls: list[dict[str, Any]]) -> list[object]:
@@ -662,7 +485,8 @@ class AIChatCog(commands.Cog):
                         # A change that already ran (or whose outcome is uncertain) is never repeated in the same turn.
                         key = hash_text(json.dumps([request.name, dict(request.operands)], sort_keys=True, default=str))
                         error = f"identical change already requested as task {completed_changes[key]}" if key in completed_changes else None
-                        completed_changes.setdefault(key, call_id)
+                        if error is None:
+                            completed_changes[key] = call_id
                     if error is not None:
                         outputs[call_id] = {"task_id": call_id, "status": "VALIDATION_FAILED", "reason": error}
                     else:
@@ -680,8 +504,8 @@ class AIChatCog(commands.Cog):
                 )
                 await self._execute_live_media_composition_result_only(
                     message, user_prompt, replace(execution_context.execution_plan, ordered_capabilities=tuple(batch)),
-                    settings=settings, replied_message=replied_message, football_lang=lang, memory_lang=lang,
-                    admin_lang=lang, football_anchor_type=anchor_type, football_reply_to_trigger=reply_to_trigger,
+                    settings=settings, replied_message=replied_message, memory_lang=lang,
+                    admin_lang=lang, football_anchor_type=anchor_type,
                     image_context=image_context, execution_context=execution_context,
                     can_continue=lambda: self._pending_can_send(pending_for_send),
                 )
@@ -692,6 +516,10 @@ class AIChatCog(commands.Cog):
                 }
                 for request in batch:
                     result = execution_context.results.get(request.task_id)
+                    if result is not None and result.status in NOTHING_DONE_STATUSES:
+                        # Nothing was changed, so a corrected or repeated call may run.
+                        for key in [key for key, task_id in completed_changes.items() if task_id == request.task_id]:
+                            del completed_changes[key]
                     outputs[request.task_id] = (
                         self._tool_result_output(result)
                         if result is not None
@@ -718,7 +546,7 @@ class AIChatCog(commands.Cog):
                 image_urls=list(image_context.urls),
                 reply_language=lang,
                 author_permissions=self._author_permissions_text(message),
-                tools=tool_definitions(),
+                tools=tools,
                 run_tools=run_tools,
             )
         except Exception as exc:
@@ -727,7 +555,6 @@ class AIChatCog(commands.Cog):
                 await self._send_ai_failure_reply(
                     message, exc, lang=lang, image_urls=image_context.urls, reply_to_trigger=reply_to_trigger,
                 )
-            self._store_missed_response_candidate(message, anchor_type, "chat_error")
             self._clear_pending_interaction(pending_for_send, event="error")
             return
         self._log_capability_terminal_checkpoint(message, execution_context)
@@ -735,8 +562,10 @@ class AIChatCog(commands.Cog):
             self._log_pending_event(message, "stale_suppressed", pending_for_send)
             return
         acted = any(result.satisfies_request for result in execution_context.results.values())
+        if str(reply).strip() in {tool.get("name") for tool in tools}:
+            # Grok wrote a function name as text instead of calling it; a bare function name is never a reply.
+            reply, control["silent"] = "", True
         if control["silent"] and not acted:
-            self._store_missed_response_candidate(message, anchor_type, "stay_silent")
             self._invalidate_owner_lease_for_rejection(message, "route_ignore")
             self._clear_pending_interaction(pending_for_send, event="stay_silent")
             return
@@ -766,9 +595,15 @@ class AIChatCog(commands.Cog):
             message, reply=str(reply), convo_key=convo_key, user_prompt=user_prompt, dispatch_action="CHAT",
             route_decision=route_decision, result_only_composition=True, execution_plan=delivery_plan,
             execution_context=execution_context, pending_for_send=pending_for_send, reply_to_trigger=reply_to_trigger,
-            anchor_type=anchor_type, image_context=image_context, available_emojis=available_emojis,
-            conversation_mode=conversation_mode,
+            anchor_type=anchor_type,
         )
+
+    def _native_search_tools(self) -> list[dict[str, str]]:
+        """xAI runs these searches inside the same Grok request, so no second model call is made."""
+        settings = getattr(self.bot, "settings", None)
+        if not getattr(settings, "xai_web_search_enabled", False):
+            return []
+        return [{"type": "web_search"}] + ([{"type": "x_search"}] if getattr(settings, "xai_x_search_enabled", False) else [])
 
     @staticmethod
     def _tool_result_output(result: CapabilityTerminalResult) -> dict[str, object]:
@@ -788,13 +623,11 @@ class AIChatCog(commands.Cog):
             plan = payload.requested_scope.get("request_plan")
             names = plan.get("output_payload") if isinstance(plan, dict) and plan.get("output_payload") else [
                 item.name for item in dataclass_fields(payload) if item.name not in {
-                    "outcome", "endpoints", "match_data", "football_entity_context", "repair_observations",
-                    "repair_scope_observations", "repair_failed_slots", "repair_feedback",
+                    "outcome", "endpoints", "match_data", "football_entity_context",
                 }
             ]
             data = {
                 "ambiguity_candidates": payload.ambiguity_candidates[:5], "missing_inputs": payload.missing_inputs,
-                "fallback_evidence": payload.fallback_evidence,
                 **{name: getattr(payload, name) for name in names if isinstance(name, str) and hasattr(payload, name)},
                 "entity_context": payload.football_entity_context, "requested_scope": payload.requested_scope,
                 "resolved_entities": payload.resolved_entities, "notes": payload.notes,
@@ -803,18 +636,9 @@ class AIChatCog(commands.Cog):
                 data["standings_table"] = [_compact_standing(row) for row in data["standings_table"] if isinstance(row, dict)]
             if payload.requested_scope.get("operation_type") in {"fixture_next", "fixture_last"} and isinstance(data.get("fixtures"), list):
                 data["fixtures"] = [_compact_fixture(item) for item in data["fixtures"] if isinstance(item, dict)]
-        elif isinstance(payload, ExternalSourceBundle):
-            # Page text is written by third parties, so Grok must read it as data rather than instructions.
-            key, data = "untrusted_data", external_source_context(
-                payload, max_chars=12000, request_date=str(result.scope.get("request_date") or "") or None,
-            )
-        elif isinstance(payload, WebResearchResult):
-            data = format_web_research_context(
-                payload, max_sources=3, request_date=str(result.scope.get("request_date") or "") or None, max_chars=12000,
-            )
         elif result.capability in {"IMAGE_GENERATE", "IMAGE_EDIT", "MEME"} and isinstance(payload, dict):
             if isinstance(payload.get("artifact"), bytes) and payload["artifact"]:
-                data = {"image": "attached to your reply; present it as done", "filename": payload.get("filename")}
+                data = {"image": "done; it is shown with your reply, so do not mention attaching it", "filename": payload.get("filename")}
         elif result.capability in {"MEMORY", "ADMIN", "MINECRAFT", "NINJAS", "CODE", "REMINDER", "BIRTHDAY"} and isinstance(payload, dict):
             # Program output and text written by members can carry prompt injection.
             untrusted = (
@@ -875,17 +699,15 @@ class AIChatCog(commands.Cog):
                 return None, None, f"inputs: {upstream.capability} outputs are {sorted(known_output_fields(upstream.capability))}"
             bindings.append(InputBinding(task_id, output_field))
         purpose = str(args.get("purpose") or "").strip()
-        # A selected link is its own grounding evidence: it is accepted only when it appears in the authorized message.
-        evidence = str(operands.get("url") or operands.get("source_url") or purpose) if family == "EXTERNAL_SOURCE" else purpose
         scopes = {
-            "WEB": "BROAD_RESEARCH", "EXTERNAL_SOURCE": "EXPLICIT_SOURCE", "IMAGE_ANALYZE": "MEDIA_ANALYSIS",
+            "IMAGE_ANALYZE": "MEDIA_ANALYSIS",
             "IMAGE_GENERATE": "IMAGE_GENERATION", "MEME": "IMAGE_GENERATION", "IMAGE_EDIT": "IMAGE_EDIT",
             "ADMIN": "DISCORD_ACTION", "REACTION": "DISCORD_ACTION",
         }
         request = CapabilityRequest(
-            name=family, task_id=call_id, required=True, evidence_span=evidence,
+            name=family, task_id=call_id, required=True, evidence_span=purpose,
             depends_on=tuple(binding.upstream_task_id for binding in bindings),
-            scope=scopes.get(family, "STRUCTURED_DATA"), independent_research=family == "WEB",
+            scope=scopes.get(family, "STRUCTURED_DATA"),
             selection_count=int(operands.get("selection_count") or 1), operands=operands,
             input_bindings=tuple(bindings), source_refs=tuple(str(ref) for ref in args.get("source_refs") or ()),
             requested_outputs=tuple(sorted(known_output_fields(family))),
@@ -924,7 +746,7 @@ class AIChatCog(commands.Cog):
             cleaned_replied = replied_message.content
             if len(cleaned_replied) > self._history_entry_max_chars:
                 cleaned_replied = cleaned_replied[: self._history_entry_max_chars - 3].rstrip() + "..."
-            expected_prefixed = f"{self.bot.user.display_name}: {cleaned_replied}"
+            expected_prefixed = cleaned_replied
             already_in_history = any(
                 item.get("role") == "assistant"
                 and item.get("content") == expected_prefixed
@@ -996,7 +818,7 @@ class AIChatCog(commands.Cog):
     async def _deliver_turn_reply(
         self, message, *, reply: str, convo_key, user_prompt: str, dispatch_action: str, route_decision: RouteDecision,
         result_only_composition: bool, execution_plan, execution_context: CapabilityExecutionContext, pending_for_send,
-        reply_to_trigger: bool, anchor_type: str, image_context: ChatImageContext, available_emojis, conversation_mode: str,
+        reply_to_trigger: bool, anchor_type: str,
     ) -> None:
         if not self._pending_can_send(pending_for_send):
             self._log_pending_event(message, "stale_suppressed", pending_for_send)
@@ -1063,12 +885,8 @@ class AIChatCog(commands.Cog):
                             and result.provenance.get("source") == "generate_image"
                             and result.provenance.get("execution_path") == "image_generate"
                             or request.name == "IMAGE_EDIT"
-                            and (
-                                result.provenance.get("source") == "edit_image"
-                                and result.provenance.get("execution_path") == "direct_image_edit"
-                                or result.provenance.get("source") == "native_url_edit"
-                                and result.provenance.get("execution_path") == "native_url_edit"
-                            )
+                            and result.provenance.get("source") == "edit_image"
+                            and result.provenance.get("execution_path") == "direct_image_edit"
                             or request.name == "MEME"
                             and result.provenance.get("source") == "memegen"
                             and result.provenance.get("execution_path") in {"memegen_template", "memegen_random", "memegen_custom"}
@@ -1309,23 +1127,7 @@ class AIChatCog(commands.Cog):
             )
         if dispatch_action == "CHAT":
             self._mark_football_context_dormant(message)
-        self._clear_missed_response_candidate(message, "success")
         self._clear_pending_interaction(pending_for_send, event="success")
-        required_capabilities = {
-            getattr(item, "name", "")
-            for item in getattr(execution_plan, "ordered_capabilities", ()) or ()
-            if bool(getattr(item, "required", False))
-        }
-        if not delivery_files and "REACTION" not in required_capabilities:
-            await self._maybe_add_ai_reaction(
-                target=image_context.reaction_target,
-                reaction_key=convo_key,
-                user_prompt=user_prompt,
-                assistant_reply=reply,
-                channel_name=getattr(message.channel, "name", "unknown"),
-                available_emojis=available_emojis,
-                conversation_mode=conversation_mode,
-            )
 
     @commands.hybrid_command(
         name="roast",
@@ -1674,8 +1476,15 @@ class AIChatCog(commands.Cog):
         *,
         text: str | None = None,
     ) -> None:
+        # Discord drops a slash command not acknowledged within 3 seconds, and Grok can take longer.
+        if ctx.interaction and not ctx.interaction.response.is_done():
+            try:
+                await ctx.defer()
+            except (discord.NotFound, discord.HTTPException):
+                pass
         lang = await self._lang(ctx.guild)
-        target = self._normalize_target_language(language)
+        # Any language Grok can translate to; Grok also notices when the text is already in it.
+        target = " ".join(language.split())[:40]
         if not target:
             await ctx.send(self._translate_usage_message(lang))
             return
@@ -1692,16 +1501,6 @@ class AIChatCog(commands.Cog):
                     lang,
                     "Reply to a message and use `translate <language>`, or provide text after the language.",
                     "Responde a un mensaje y usa `translate <idioma>`, o agrega texto después del idioma.",
-                )
-            )
-            return
-
-        if self._is_same_language(source_text, target):
-            await ctx.send(
-                tr(
-                    lang,
-                    "The original text it's already on that language!",
-                    "El mensaje original ya estaba en ese idioma!",
                 )
             )
             return
@@ -1766,12 +1565,12 @@ class AIChatCog(commands.Cog):
             return False
         return bool(getattr(message, "embeds", None))
 
+    def _mentions_bot(self, message: discord.Message) -> bool:
+        # Only a mention written in the text: a reply ping also lists the replied-to bot in message.mentions.
+        return self.bot.user is not None and self.bot.user.id in getattr(message, "raw_mentions", ())
+
     def _message_mentions_bot_with_prompt(self, message: discord.Message) -> bool:
-        return (
-            self.bot.user is not None
-            and self.bot.user in getattr(message, "mentions", [])
-            and bool(self._remove_bot_mentions(message.content, self.bot.user.id))
-        )
+        return self._mentions_bot(message) and bool(self._remove_bot_mentions(message.content, self.bot.user.id))
 
     async def _is_reply_to_ai_message(
         self,
@@ -1870,7 +1669,7 @@ class AIChatCog(commands.Cog):
     ) -> str:
         if self.bot.user is None:
             return "NONE"
-        if self.bot.user in message.mentions:
+        if self._mentions_bot(message):
             stripped = self._remove_bot_mentions(message.content, self.bot.user.id)
             return "DIRECT_MENTION" if stripped else "NONE"
         if is_reply_to_ai:
@@ -1976,80 +1775,6 @@ class AIChatCog(commands.Cog):
                 getattr(message.author, "id", None),
             )
 
-    def _missed_response_key(self, message: discord.Message) -> tuple[int, int, int]:
-        return (
-            int(message.guild.id),
-            int(message.channel.id),
-            int(message.author.id),
-        )
-
-    def _valid_missed_response_candidate(self, message: discord.Message) -> MissedResponseCandidate | None:
-        key = self._missed_response_key(message)
-        candidate = self._missed_response_candidates.get(key)
-        if candidate is None:
-            return None
-        if time.monotonic() - candidate.created_at > self._missed_response_ttl_seconds:
-            self._missed_response_candidates.pop(key, None)
-            return None
-        return candidate
-
-    def _store_missed_response_candidate(self, message: discord.Message, anchor_type: str, reason: str) -> None:
-        allowed = {"NAME_REFERENCE", "SAME_USER_CONTINUATION", "PENDING_FOLLOWUP"}
-        strong_failure_reasons = {"api_exception", "http_error", "timeout", "invalid_json", "validation_exception", "chat_error"}
-        if anchor_type not in allowed and anchor_type != "REPLY_TO_AI" and not (anchor_type in STRONG_ANCHORS and reason in strong_failure_reasons):
-            return
-        snippet = " ".join(str(getattr(message, "content", "") or "").split())[:220]
-        if not snippet:
-            return
-        self._missed_response_candidates[self._missed_response_key(message)] = MissedResponseCandidate(
-            guild_id=int(message.guild.id),
-            channel_id=int(message.channel.id),
-            author_user_id=int(message.author.id),
-            message_id=getattr(message, "id", None),
-            created_at=time.monotonic(),
-            anchor_type=anchor_type,
-            reason=reason,
-            snippet=snippet,
-            author_name=getattr(message.author, "display_name", "unknown"),
-        )
-        logging.info(
-            "AI missed response candidate stored guild=%s channel=%s message=%s author=%s anchor=%s reason=%s",
-            getattr(message.guild, "id", None),
-            getattr(message.channel, "id", None),
-            getattr(message, "id", None),
-            getattr(message.author, "id", None),
-            anchor_type,
-            reason,
-        )
-
-    def _clear_missed_response_candidate(self, message: discord.Message, event: str) -> None:
-        candidate = self._missed_response_candidates.pop(self._missed_response_key(message), None)
-        if candidate is None:
-            return
-        logging.info(
-            "AI missed response candidate cleared guild=%s channel=%s message=%s author=%s event=%s",
-            candidate.guild_id,
-            candidate.channel_id,
-            candidate.message_id,
-            candidate.author_user_id,
-            event,
-        )
-
-    def _invalidate_missed_response_for_intervening_human(self, message: discord.Message) -> None:
-        guild_id = int(message.guild.id)
-        channel_id = int(message.channel.id)
-        author_id = int(message.author.id)
-        for key, candidate in list(self._missed_response_candidates.items()):
-            if candidate.guild_id == guild_id and candidate.channel_id == channel_id and candidate.author_user_id != author_id:
-                self._missed_response_candidates.pop(key, None)
-                logging.info(
-                    "AI missed response candidate cleared guild=%s channel=%s message=%s author=%s event=intervening_human",
-                    candidate.guild_id,
-                    candidate.channel_id,
-                    candidate.message_id,
-                    candidate.author_user_id,
-                )
-
     def _invalidate_owner_lease_for_rejection(self, message: discord.Message, reason: str) -> None:
         lease = self._valid_lease_for_message(message)
         if lease is None:
@@ -2154,33 +1879,6 @@ class AIChatCog(commands.Cog):
             return None
         return context
 
-    def _store_football_turn_context(
-        self,
-        message: discord.Message,
-        *,
-        last_bot_response_id: int | None,
-        action: str,
-        payload: dict[str, object] | None,
-    ) -> None:
-        key = self._football_context_key(message)
-        if key is None or not payload:
-            return
-        cleaned = {str(k): v for k, v in payload.items() if v not in (None, "", [], {})}
-        if not cleaned:
-            return
-        now = time.monotonic()
-        self._football_turn_contexts[key] = FootballTurnContext(
-            guild_id=key[0],
-            channel_id=key[1],
-            owner_user_id=key[2],
-            payload=cleaned,
-            last_operation=action,
-            source_user_message_id=getattr(message, "id", None),
-            source_assistant_message_id=last_bot_response_id,
-            updated_at=now,
-            expires_at=now + self._continuation_lease_seconds,
-            dormant=False,
-        )
 
     def _mark_football_context_dormant(self, message: discord.Message) -> None:
         context = self._valid_football_turn_context(message)
@@ -2372,23 +2070,17 @@ class AIChatCog(commands.Cog):
         decision: RouteDecision,
         *,
         lang: str,
-        replied_message: discord.Message | None,
-        reply_to_trigger: bool,
-        result_only: bool = False,
         resolution_message: discord.Message | None = None,
-        native_task: bool = False,
-    ) -> str | CapabilityTerminalResult:
+    ) -> CapabilityTerminalResult:
         guild = message.guild
         if guild is None:
-            if result_only:
-                return self._admin_result_only_failure(
-                    "VALIDATION_FAILED",
-                    reason="missing_guild",
-                    direct_message=tr(lang, "This action requires a server.", "Esta accion requiere un servidor."),
-                )
-            return "VALIDATION_FAILED"
+            return self._admin_result_only_failure(
+                "VALIDATION_FAILED",
+                reason="missing_guild",
+                direct_message=tr(lang, "This action requires a server.", "Esta accion requiere un servidor."),
+            )
         resolution_message = resolution_message or message
-        admin_plan = self._coerce_admin_plan(decision.admin, native=native_task)
+        admin_plan = self._coerce_admin_plan(decision.admin)
         logging.info(
             "AI admin action plan guild=%s channel=%s author=%s admin_action=%s confidence=%.2f duration_seconds=%s time_window_seconds=%s message_count=%s reason_present=%s",
             getattr(guild, "id", None),
@@ -2402,32 +2094,22 @@ class AIChatCog(commands.Cog):
             bool(admin_plan.get("reason")),
         )
         if not admin_plan.get("valid"):
-            if result_only:
-                return self._admin_result_only_failure(
-                    "VALIDATION_FAILED",
-                    reason="invalid_admin_plan",
-                    payload={
-                        "admin_action": admin_plan.get("admin_action", "unknown"),
-                        "outcome_code": "invalid_admin_plan",
-                    },
-                    direct_message=admin_plan.get("clarification_question")
-                    or tr(lang, "I need a clearer admin action before doing that.", "Necesito una accion de admin mas clara antes de hacer eso."),
-                )
-            await self._send_long_reply(
-                message,
-                admin_plan.get("clarification_question") or tr(lang, "I need a clearer admin action before doing that.", "Necesito una accion de admin mas clara antes de hacer eso."),
-                reply_to_trigger=reply_to_trigger,
-                mention_author=True,
+            return self._admin_result_only_failure(
+                "VALIDATION_FAILED",
+                reason="invalid_admin_plan",
+                payload={
+                    "admin_action": admin_plan.get("admin_action", "unknown"),
+                    "outcome_code": "invalid_admin_plan",
+                },
+                direct_message=admin_plan.get("clarification_question")
+                or tr(lang, "I need a clearer admin action before doing that.", "Necesito una accion de admin mas clara antes de hacer eso."),
             )
-            return "VALIDATION_FAILED"
         action = str(admin_plan["admin_action"])
         if action in {"join_stats", "leave_stats"}:
             return await self._execute_member_event_stats(
                 message,
                 admin_plan,
                 lang=lang,
-                reply_to_trigger=reply_to_trigger,
-                result_only=result_only,
             )
         if action == "delete_messages":
             result = await self._admin_actions.delete_recent_messages(
@@ -2438,7 +2120,7 @@ class AIChatCog(commands.Cog):
                 int(admin_plan.get("message_count") or 0),
                 lang=lang,
             )
-            if result_only and result.success:
+            if result.success:
                 return normalize_terminal_result(
                     "ADMIN",
                     "SUCCESS",
@@ -2463,36 +2145,24 @@ class AIChatCog(commands.Cog):
                     },
                     satisfies_request=True,
                 )
-            if result_only:
-                return self._admin_result_only_failure(
-                    str(result.code or "PROVIDER_FAILURE"),
-                    reason="delete_messages_failed",
-                    payload={
-                        "admin_action": "delete_messages",
-                        "outcome_code": str(result.code or "PROVIDER_FAILURE")[:80],
-                    },
-                    direct_message=str(result.message or "")[:500],
-                )
-            await self._send_long_reply(
-                message,
-                result.message,
-                reply_to_trigger=reply_to_trigger,
-                mention_author=True,
-                delete_after=5 if result.success else None,
+            return self._admin_result_only_failure(
+                str(result.code or "PROVIDER_FAILURE"),
+                reason="delete_messages_failed",
+                payload={
+                    "admin_action": "delete_messages",
+                    "outcome_code": str(result.code or "PROVIDER_FAILURE")[:80],
+                },
+                direct_message=str(result.message or "")[:500],
             )
-            return "SUCCESS" if result.success else result.code
         if action == "delete_role":
             role = await self._resolve_admin_role_for_execution(resolution_message, admin_plan, lang)
             if isinstance(role, str):
-                if result_only:
-                    return self._admin_result_only_failure(
-                        "VALIDATION_FAILED",
-                        reason="delete_role_target_invalid",
-                        payload={"admin_action": "delete_role", "outcome_code": "target_invalid"},
-                        direct_message=str(role)[:500],
-                    )
-                await self._send_long_reply(message, str(role), reply_to_trigger=reply_to_trigger, mention_author=True)
-                return "VALIDATION_FAILED"
+                return self._admin_result_only_failure(
+                    "VALIDATION_FAILED",
+                    reason="delete_role_target_invalid",
+                    payload={"admin_action": "delete_role", "outcome_code": "target_invalid"},
+                    direct_message=str(role)[:500],
+                )
             result = await self._admin_actions.delete_role(
                 guild,
                 message.author,
@@ -2500,7 +2170,7 @@ class AIChatCog(commands.Cog):
                 reason=admin_plan.get("reason"),
                 lang=lang,
             )
-            if result_only and result.success:
+            if result.success:
                 return normalize_terminal_result(
                     "ADMIN",
                     "SUCCESS",
@@ -2521,18 +2191,15 @@ class AIChatCog(commands.Cog):
                     },
                     satisfies_request=True,
                 )
-            if result_only:
-                return self._admin_result_only_failure(
-                    str(result.code or "PROVIDER_FAILURE"),
-                    reason="delete_role_failed",
-                    payload={
-                        "admin_action": "delete_role",
-                        "outcome_code": str(result.code or "PROVIDER_FAILURE")[:80],
-                    },
-                    direct_message=str(result.message or "")[:500],
-                )
-            await self._send_long_reply(message, result.message, reply_to_trigger=reply_to_trigger, mention_author=True)
-            return "SUCCESS" if result.success else result.code
+            return self._admin_result_only_failure(
+                str(result.code or "PROVIDER_FAILURE"),
+                reason="delete_role_failed",
+                payload={
+                    "admin_action": "delete_role",
+                    "outcome_code": str(result.code or "PROVIDER_FAILURE")[:80],
+                },
+                direct_message=str(result.message or "")[:500],
+            )
         if action == "create_role":
             role_name = str(admin_plan.get("role_name") or "")
             result = await self._admin_actions.create_role(
@@ -2543,7 +2210,7 @@ class AIChatCog(commands.Cog):
                 reason=admin_plan.get("reason"),
                 lang=lang,
             )
-            if result_only and result.success:
+            if result.success:
                 resource_handle = getattr(result, "resource_handle", None)
                 return normalize_terminal_result(
                     "ADMIN",
@@ -2565,37 +2232,28 @@ class AIChatCog(commands.Cog):
                     },
                     satisfies_request=True,
                 )
-            if result_only:
-                return self._admin_result_only_failure(
-                    str(result.code or "PROVIDER_FAILURE"),
-                    reason="create_role_failed",
-                    payload={
-                        "admin_action": "create_role",
-                        "outcome_code": str(result.code or "PROVIDER_FAILURE")[:80],
-                    },
-                    direct_message=str(result.message or "")[:500],
-                )
-            await self._send_long_reply(message, result.message, reply_to_trigger=reply_to_trigger, mention_author=True)
-            return "SUCCESS" if result.success else result.code
+            return self._admin_result_only_failure(
+                str(result.code or "PROVIDER_FAILURE"),
+                reason="create_role_failed",
+                payload={
+                    "admin_action": "create_role",
+                    "outcome_code": str(result.code or "PROVIDER_FAILURE")[:80],
+                },
+                direct_message=str(result.message or "")[:500],
+            )
         if action in {"add_role", "remove_role"}:
             target = await self._resolve_admin_target_member(resolution_message, admin_plan, lang)
             role = await self._resolve_admin_role_for_execution(resolution_message, admin_plan, lang)
             if isinstance(target, str) or isinstance(role, str):
                 error = target if isinstance(target, str) else role
-                if result_only:
-                    return self._admin_result_only_failure("VALIDATION_FAILED", reason="role_assignment_target_invalid", payload={"admin_action": action, "outcome_code": "target_invalid"}, direct_message=str(error)[:500])
-                await self._send_long_reply(message, str(error), reply_to_trigger=reply_to_trigger, mention_author=True)
-                return "VALIDATION_FAILED"
+                return self._admin_result_only_failure("VALIDATION_FAILED", reason="role_assignment_target_invalid", payload={"admin_action": action, "outcome_code": "target_invalid"}, direct_message=str(error)[:500])
             result = await getattr(self._admin_actions, action)(guild, message.author, target, role, reason=admin_plan.get("reason"), lang=lang)
             state = "added" if action == "add_role" else "removed"
             scope = {"guild_id": getattr(guild, "id", None), "user_id": getattr(target, "id", None), "role_id": getattr(role, "id", None)}
         elif action in {"kick", "ban", "tempban", "warn", "list_warnings", "remove_warning", "clear_warnings", "set_nickname", "user_info", "purge_user_messages"}:
             target = await self._resolve_admin_target_member(resolution_message, admin_plan, lang)
             if isinstance(target, str):
-                if result_only:
-                    return self._admin_result_only_failure("VALIDATION_FAILED", reason="member_target_invalid", payload={"admin_action": action, "outcome_code": "target_invalid"}, direct_message=str(target)[:500])
-                await self._send_long_reply(message, str(target), reply_to_trigger=reply_to_trigger, mention_author=True)
-                return "VALIDATION_FAILED"
+                return self._admin_result_only_failure("VALIDATION_FAILED", reason="member_target_invalid", payload={"admin_action": action, "outcome_code": "target_invalid"}, direct_message=str(target)[:500])
             if action == "kick":
                 result = await self._admin_actions.kick_member(guild, message.author, target, reason=admin_plan.get("reason"), lang=lang)
                 state = "kicked"
@@ -2642,10 +2300,7 @@ class AIChatCog(commands.Cog):
         elif action in {"delete_channel", "set_slowmode", "clear_channel", "clone_channel", "color_publish"} | ADMIN_CONFIG_CHANNEL_OPERATIONS:
             channel = await self._resolve_admin_channel_for_execution(resolution_message, admin_plan, lang)
             if isinstance(channel, str):
-                if result_only:
-                    return self._admin_result_only_failure("VALIDATION_FAILED", reason="channel_target_invalid", payload={"admin_action": action, "outcome_code": "target_invalid"}, direct_message=str(channel)[:500])
-                await self._send_long_reply(message, str(channel), reply_to_trigger=reply_to_trigger, mention_author=True)
-                return "VALIDATION_FAILED"
+                return self._admin_result_only_failure("VALIDATION_FAILED", reason="channel_target_invalid", payload={"admin_action": action, "outcome_code": "target_invalid"}, direct_message=str(channel)[:500])
             if action == "set_slowmode":
                 result = await self._admin_actions.set_slowmode(guild, message.author, channel, int(admin_plan["slowmode_seconds"]), lang=lang)
                 state = "updated"
@@ -2744,7 +2399,7 @@ class AIChatCog(commands.Cog):
                 partial["channel_count"], partial["channel_ids"] = len(partial["channel_ids"]), partial["channel_ids"][:25]
             if action in {"create_channel", "clone_channel"} and isinstance(getattr(result, "resource_handle", None), dict):
                 partial["resource_handle"] = result.resource_handle
-            if result_only and result.success:
+            if result.success:
                 payload = {"admin_action": action, "outcome_code": str(result.code or "success")[:80], "state": state, **partial}
                 if action == "tempban":
                     payload["duration"] = int(admin_plan["duration_seconds"])
@@ -2766,22 +2421,16 @@ class AIChatCog(commands.Cog):
                         permissions=list(profile.get("permissions", []))[:50],
                     )
                 return normalize_terminal_result("ADMIN", "SUCCESS", provider="admin_actions", payload=payload, provenance={"source": "AdminActionService", "authorized": True}, scope=scope, satisfies_request=True)
-            if result_only:
-                return self._admin_result_only_failure(str(result.code or "PROVIDER_FAILURE"), reason=f"{action}_failed", payload={"admin_action": action, "outcome_code": str(result.code or "PROVIDER_FAILURE")[:80], **partial}, direct_message=str(result.message or "")[:500])
-            await self._send_long_reply(message, result.message, reply_to_trigger=reply_to_trigger, mention_author=True)
-            return "SUCCESS" if result.success else result.code
+            return self._admin_result_only_failure(str(result.code or "PROVIDER_FAILURE"), reason=f"{action}_failed", payload={"admin_action": action, "outcome_code": str(result.code or "PROVIDER_FAILURE")[:80], **partial}, direct_message=str(result.message or "")[:500])
         if action in {"mute", "tempmute", "unmute"}:
             target = await self._resolve_admin_target_member(resolution_message, admin_plan, lang)
             if isinstance(target, str):
-                if result_only:
-                    return self._admin_result_only_failure(
-                        "VALIDATION_FAILED",
-                        reason="member_target_invalid",
-                        payload={"admin_action": action, "outcome_code": "target_invalid"},
-                        direct_message=str(target)[:500],
-                    )
-                await self._send_long_reply(message, str(target), reply_to_trigger=reply_to_trigger, mention_author=True)
-                return "VALIDATION_FAILED"
+                return self._admin_result_only_failure(
+                    "VALIDATION_FAILED",
+                    reason="member_target_invalid",
+                    payload={"admin_action": action, "outcome_code": "target_invalid"},
+                    direct_message=str(target)[:500],
+                )
             if action == "unmute":
                 result = await self._admin_actions.unmute_member(
                     guild,
@@ -2801,7 +2450,7 @@ class AIChatCog(commands.Cog):
                     mute_mode="auto",
                     lang=lang,
                 )
-            if action == "unmute" and result_only and result.success:
+            if action == "unmute" and result.success:
                 return normalize_terminal_result(
                     "ADMIN",
                     "SUCCESS",
@@ -2815,7 +2464,7 @@ class AIChatCog(commands.Cog):
                     scope={"guild_id": getattr(guild, "id", None)},
                     satisfies_request=True,
                 )
-            if action in {"mute", "tempmute"} and result_only and result.success:
+            if action in {"mute", "tempmute"} and result.success:
                 duration = admin_plan.get("duration_seconds")
                 return normalize_terminal_result(
                     "ADMIN",
@@ -2832,30 +2481,24 @@ class AIChatCog(commands.Cog):
                     scope={"guild_id": getattr(guild, "id", None)},
                     satisfies_request=True,
                 )
-            if result_only:
-                return self._admin_result_only_failure(
-                    str(result.code or "PROVIDER_FAILURE"),
-                    reason=f"{action}_failed",
-                    payload={
-                        "admin_action": action,
-                        "outcome_code": str(result.code or "PROVIDER_FAILURE")[:80],
-                    },
-                    direct_message=str(result.message or "")[:500],
-                )
-            await self._send_long_reply(message, result.message, reply_to_trigger=reply_to_trigger, mention_author=True)
-            return "SUCCESS" if result.success else result.code
+            return self._admin_result_only_failure(
+                str(result.code or "PROVIDER_FAILURE"),
+                reason=f"{action}_failed",
+                payload={
+                    "admin_action": action,
+                    "outcome_code": str(result.code or "PROVIDER_FAILURE")[:80],
+                },
+                direct_message=str(result.message or "")[:500],
+            )
         if action in {"lock_channel", "unlock_channel"}:
             channel = await self._resolve_admin_channel_for_execution(resolution_message, admin_plan, lang)
             if isinstance(channel, str):
-                if result_only:
-                    return self._admin_result_only_failure(
-                        "VALIDATION_FAILED",
-                        reason="channel_target_invalid",
-                        payload={"admin_action": action, "outcome_code": "target_invalid"},
-                        direct_message=str(channel)[:500],
-                    )
-                await self._send_long_reply(message, str(channel), reply_to_trigger=reply_to_trigger, mention_author=True)
-                return "VALIDATION_FAILED"
+                return self._admin_result_only_failure(
+                    "VALIDATION_FAILED",
+                    reason="channel_target_invalid",
+                    payload={"admin_action": action, "outcome_code": "target_invalid"},
+                    direct_message=str(channel)[:500],
+                )
             result = await self._admin_actions.set_channel_lock(
                 guild,
                 message.author,
@@ -2863,7 +2506,7 @@ class AIChatCog(commands.Cog):
                 locked=action == "lock_channel",
                 lang=lang,
             )
-            if action in {"lock_channel", "unlock_channel"} and result_only and result.success:
+            if action in {"lock_channel", "unlock_channel"} and result.success:
                 return normalize_terminal_result(
                     "ADMIN",
                     "SUCCESS",
@@ -2884,32 +2527,21 @@ class AIChatCog(commands.Cog):
                     },
                     satisfies_request=True,
                 )
-            if result_only:
-                return self._admin_result_only_failure(
-                    str(result.code or "PROVIDER_FAILURE"),
-                    reason=f"{action}_failed",
-                    payload={
-                        "admin_action": action,
-                        "outcome_code": str(result.code or "PROVIDER_FAILURE")[:80],
-                    },
-                    direct_message=str(result.message or "")[:500],
-                )
-            await self._send_long_reply(message, result.message, reply_to_trigger=reply_to_trigger, mention_author=True)
-            return "SUCCESS" if result.success else result.code
-        if result_only:
             return self._admin_result_only_failure(
-                "UNSUPPORTED",
-                reason="unsupported_admin_action",
-                payload={"admin_action": action},
-                direct_message=tr(lang, "I cannot do that admin action yet.", "Todavia no puedo hacer esa accion de admin."),
+                str(result.code or "PROVIDER_FAILURE"),
+                reason=f"{action}_failed",
+                payload={
+                    "admin_action": action,
+                    "outcome_code": str(result.code or "PROVIDER_FAILURE")[:80],
+                },
+                direct_message=str(result.message or "")[:500],
             )
-        await self._send_long_reply(
-            message,
-            tr(lang, "I cannot do that admin action yet.", "Todavia no puedo hacer esa accion de admin."),
-            reply_to_trigger=reply_to_trigger,
-            mention_author=True,
+        return self._admin_result_only_failure(
+            "UNSUPPORTED",
+            reason="unsupported_admin_action",
+            payload={"admin_action": action},
+            direct_message=tr(lang, "I cannot do that admin action yet.", "Todavia no puedo hacer esa accion de admin."),
         )
-        return "UNSUPPORTED"
 
     @staticmethod
     def _admin_result_only_failure(
@@ -2924,7 +2556,7 @@ class AIChatCog(commands.Cog):
             outcome,
             provider="admin_actions",
             payload=payload,
-            provenance={"source": "AdminActionService", "direct_delivery": False},
+            provenance={"source": "AdminActionService"},
             delivery_metadata={"direct_failure_message": direct_message} if direct_message else None,
             reason=reason,
             satisfies_request=False,
@@ -2934,7 +2566,7 @@ class AIChatCog(commands.Cog):
     def _admin_cog_unavailable(lang: str) -> AdminActionResult:
         return AdminActionResult(False, tr(lang, "That is not available right now.", "Eso no esta disponible ahora."), "not_configured")
 
-    def _coerce_admin_plan(self, raw: object, *, native: bool = False) -> dict[str, Any]:
+    def _coerce_admin_plan(self, raw: object) -> dict[str, Any]:
         if not isinstance(raw, dict):
             return {"valid": False, "admin_action": "unknown", "confidence": 0.0}
         action = str(raw.get("admin_action", "unknown") or "unknown").strip().casefold()
@@ -2990,11 +2622,7 @@ class AIChatCog(commands.Cog):
         bound_channel_handle = isinstance(resource_handle, dict) and action in {
             "lock_channel", "unlock_channel", "delete_channel", "set_slowmode", "clear_channel", "clone_channel", "color_publish"
         } | ADMIN_CONFIG_CHANNEL_OPERATIONS
-        valid = bool(raw.get("valid", True)) and action in allowed and (native or confidence >= 0.70)
-        if not native and action in ADMIN_TYPED_ONLY_OPERATIONS:
-            # These exist only as validated typed tasks (whole-batch preflight); the compatibility path has no preflight for them.
-            valid = False
-            clarification = "I can only do that from a planned request."
+        valid = bool(raw.get("valid", True)) and action in allowed
         if action == "tempmute" and (
             duration_seconds is None
             or duration_seconds <= 0
@@ -3010,7 +2638,11 @@ class AIChatCog(commands.Cog):
             clarification = clarification or "How many previous messages should I delete?"
         if action == "delete_role" and not target_role_candidates:
             valid = False
-            clarification = clarification or "Which role should I delete?"
+            clarification = clarification or "Which role should I delete? Name it in target_role_candidates."
+        if action in {"add_role", "remove_role"} and not target_role_candidates and target_role_id is None and resource_handle is None:
+            # role_name only names a role to create; an existing role is named in target_role_candidates.
+            valid = False
+            clarification = clarification or "Which role? Name it in target_role_candidates."
         if action == "create_role" and not role_name:
             valid = False
             clarification = clarification or "What role name should I create?"
@@ -3029,9 +2661,9 @@ class AIChatCog(commands.Cog):
         if action == "delete_channel" and not target_channel and not bound_channel_handle:
             valid = False
             clarification = clarification or "Which channel should I delete?"
-        if native and action in {"lock_channel", "unlock_channel", "set_slowmode"} and not target_channel and not bound_channel_handle:
+        if action in {"lock_channel", "unlock_channel", "set_slowmode"} and not target_channel and not bound_channel_handle:
             valid = False
-            clarification = clarification or "Which channel should I target?"
+            clarification = clarification or "Which channel should I target? Name it in target_channel."
         if action in {"clear_channel", "clone_channel"} and not target_channel and not bound_channel_handle:
             # Never the current channel and never a channel mentioned in the message: the plan must name it.
             valid = False
@@ -3087,7 +2719,7 @@ class AIChatCog(commands.Cog):
         if (action in ADMIN_CONFIG_OPERATIONS - ADMIN_CONFIG_CHANNEL_OPERATIONS or action in ADMIN_COLOR_OPERATIONS - {"color_publish"} or action == "help") and (target_channel or resource_handle is not None):
             valid = False
             clarification = clarification or "That action does not take a channel."
-        if native and action in {
+        if action in {
             "add_role", "remove_role", "kick", "ban", "tempban", "mute", "tempmute",
             "unmute", "warn", "list_warnings", "remove_warning", "clear_warnings", "set_nickname", "user_info", "purge_user_messages",
         } and target_user_id is None and not target_user_candidates:
@@ -3148,9 +2780,7 @@ class AIChatCog(commands.Cog):
         admin_plan: dict[str, Any],
         *,
         lang: str,
-        reply_to_trigger: bool,
-        result_only: bool = False,
-    ) -> str | CapabilityTerminalResult:
+    ) -> CapabilityTerminalResult:
         authority = self._route_authority_metadata(message)
         if not (
             authority["author_is_bot_owner"]
@@ -3166,42 +2796,26 @@ class AIChatCog(commands.Cog):
                 authority["author_is_bot_owner"],
                 authority["author_has_manage_guild"],
             )
-            if result_only:
-                return self._admin_result_only_failure(
-                    "PERMISSION_DENIED",
-                    reason="missing_manage_guild",
-                    payload={
-                        "admin_action": admin_plan.get("admin_action", "unknown"),
-                        "outcome_code": "missing_manage_guild",
-                    },
-                    direct_message=tr(lang, "You need Manage Server permission to ask for member stats.", "Necesitas Gestionar servidor para pedir estadisticas de miembros."),
-                )
-            await self._send_long_reply(
-                message,
-                tr(lang, "You need Manage Server permission to ask for member stats.", "Necesitas Gestionar servidor para pedir estadisticas de miembros."),
-                reply_to_trigger=reply_to_trigger,
-                mention_author=True,
+            return self._admin_result_only_failure(
+                "PERMISSION_DENIED",
+                reason="missing_manage_guild",
+                payload={
+                    "admin_action": admin_plan.get("admin_action", "unknown"),
+                    "outcome_code": "missing_manage_guild",
+                },
+                direct_message=tr(lang, "You need Manage Server permission to ask for member stats.", "Necesitas Gestionar servidor para pedir estadisticas de miembros."),
             )
-            return "PERMISSION_DENIED"
         seconds = int(admin_plan.get("time_window_seconds") or 0)
         if seconds <= 0:
-            if result_only:
-                return self._admin_result_only_failure(
-                    "VALIDATION_FAILED",
-                    reason="missing_time_window",
-                    payload={
-                        "admin_action": admin_plan.get("admin_action", "unknown"),
-                        "outcome_code": "missing_time_window",
-                    },
-                    direct_message=tr(lang, "Tell me the time window to count.", "Dime la ventana de tiempo que quieres contar."),
-                )
-            await self._send_long_reply(
-                message,
-                tr(lang, "Tell me the time window to count.", "Dime la ventana de tiempo que quieres contar."),
-                reply_to_trigger=reply_to_trigger,
-                mention_author=True,
+            return self._admin_result_only_failure(
+                "VALIDATION_FAILED",
+                reason="missing_time_window",
+                payload={
+                    "admin_action": admin_plan.get("admin_action", "unknown"),
+                    "outcome_code": "missing_time_window",
+                },
+                direct_message=tr(lang, "Tell me the time window to count.", "Dime la ventana de tiempo que quieres contar."),
             )
-            return "VALIDATION_FAILED"
         event_type = "join" if admin_plan.get("admin_action") == "join_stats" else "leave"
         since = datetime.now(timezone.utc) - timedelta(seconds=seconds)
         count = await self.bot.db.count_member_events(message.guild.id, event_type, since)
@@ -3222,22 +2836,19 @@ class AIChatCog(commands.Cog):
             seconds,
             count,
         )
-        if result_only:
-            return normalize_terminal_result(
-                "ADMIN",
-                "SUCCESS",
-                provider="database",
-                payload={
-                    "event_type": event_type,
-                    "count": max(0, int(count)),
-                    "time_window_seconds": seconds,
-                },
-                provenance={"source": "count_member_events"},
-                scope={"guild_id": getattr(message.guild, "id", None)},
-                satisfies_request=True,
-            )
-        await self._send_long_reply(message, text, reply_to_trigger=reply_to_trigger, mention_author=True)
-        return "SUCCESS"
+        return normalize_terminal_result(
+            "ADMIN",
+            "SUCCESS",
+            provider="database",
+            payload={
+                "event_type": event_type,
+                "count": max(0, int(count)),
+                "time_window_seconds": seconds,
+            },
+            provenance={"source": "count_member_events"},
+            scope={"guild_id": getattr(message.guild, "id", None)},
+            satisfies_request=True,
+        )
 
     async def _resolve_admin_target_member(
         self,
@@ -3452,7 +3063,8 @@ class AIChatCog(commands.Cog):
         lang: str,
     ) -> discord.TextChannel | str:
         named = str(admin_plan.get("target_channel") or "").strip()
-        target = named.lstrip("#").casefold()
+        # An id, a name, or a channel mention (<#id>), the form the prompt asks Grok to use.
+        target = named.removeprefix("<#").removesuffix(">").lstrip("#").casefold()
         channels = getattr(message.guild, "text_channels", []) or []
         by_id = [channel for channel in channels if str(getattr(channel, "id", "")) == target]
         if by_id:
@@ -3490,28 +3102,21 @@ class AIChatCog(commands.Cog):
         decision: RouteDecision,
         *,
         lang: str,
-        replied_message: discord.Message | None,
-        reply_to_trigger: bool,
-        result_only: bool = False,
-    ) -> str | CapabilityTerminalResult | None:
+    ) -> str | CapabilityTerminalResult:
         guild = message.guild
         if guild is None or self._server_memory is None:
             return "NOT_CONFIGURED"
-        payload = decision.memory or {}
-        if decision.action == "SERVER_MEMORY_CLARIFY" or not payload:
-            await self._send_long_reply(
-                message,
-                tr(lang, "Tell me exactly what to remember, who it is about, and the value.", "Dime exactamente que debo recordar, de quien es y cual es el valor."),
-                reply_to_trigger=reply_to_trigger,
-                mention_author=True,
+
+        def refused(outcome: str, reason: str) -> CapabilityTerminalResult:
+            # The reason goes back to Grok, which fixes the arguments or tells the user; nothing is posted from here.
+            return normalize_terminal_result(
+                "MEMORY", outcome, provider="server_memory", provenance={"source": "ServerMemoryService"}, reason=reason,
             )
-            return
-        raw_memory_type = payload.get("memory_type", "SERVER_FACT")
-        untyped_lookup = (
-            decision.action == "SERVER_MEMORY_LOOKUP"
-            and "memory_type" in payload
-            and raw_memory_type is None
-        )
+
+        payload = decision.memory or {}
+        raw_memory_type = payload.get("memory_type")
+        # Grok leaves memory_type out of a lookup when the user named no category: that searches every category.
+        untyped_lookup = decision.action == "SERVER_MEMORY_LOOKUP" and raw_memory_type is None
         memory_type_identity = str(raw_memory_type or "")
         normalization_identity = (
             "SERVER_FACT" if raw_memory_type is None and not untyped_lookup else memory_type_identity
@@ -3520,19 +3125,9 @@ class AIChatCog(commands.Cog):
         input_type_name = type(raw_memory_type).__name__
         if input_type_name not in {"str", "int", "float", "bool", "list", "tuple", "dict", "NoneType"}:
             input_type_name = "other"
-        semantic_source = (
-            decision.capability_plan.get("semantic_source")
-            if isinstance(decision.capability_plan, dict)
-            else None
-        )
-        semantic_source = (
-            semantic_source
-            if semantic_source in {"router", "compatibility_action"}
-            else "unknown"
-        )
         logging.info(
             "AI server memory input boundary guild=%s channel=%s message=%s author=%s action=%s "
-            "semantic_source=%s payload_present=%s memory_type_present=%s input_type=%s "
+            "payload_present=%s memory_type_present=%s input_type=%s "
             "input_length=%s input_length_capped=%s memory_type_identity_hash=%s "
             "key_present=%s value_present=%s subject_present=%s stage=before_memory_type_normalization",
             getattr(guild, "id", None),
@@ -3540,7 +3135,6 @@ class AIChatCog(commands.Cog):
             getattr(message, "id", None),
             getattr(message.author, "id", None),
             decision.action,
-            semantic_source,
             decision.memory is not None,
             "memory_type" in payload,
             input_type_name,
@@ -3557,13 +3151,7 @@ class AIChatCog(commands.Cog):
             try:
                 memory_type = ServerMemoryService.normalize_memory_type(normalization_identity)
             except ValueError:
-                await self._send_long_reply(
-                    message,
-                    tr(lang, "That memory type is not supported.", "Ese tipo de memoria no esta soportado."),
-                    reply_to_trigger=reply_to_trigger,
-                    mention_author=True,
-                )
-                return
+                return refused("VALIDATION_FAILED", f"memory_type must be one of {sorted(MEMORY_TYPES)} or left out")
         authority = self._route_authority_metadata(message)
         if memory_type == "BOT_BEHAVIOR_RULE" and not authority["author_can_manage_bot_behavior"]:
             logging.info(
@@ -3576,14 +3164,8 @@ class AIChatCog(commands.Cog):
                 authority["author_has_manage_guild"],
                 authority["author_can_manage_bot_behavior"],
             )
-            await self._send_long_reply(
-                message,
-                tr(lang, "I cannot change server behavior from that message.", "No puedo cambiar el comportamiento del servidor con ese mensaje."),
-                reply_to_trigger=reply_to_trigger,
-                mention_author=True,
-            )
-            return "PERMISSION_DENIED"
-        subject_user_id = self._memory_subject_user_id(message, replied_message, payload)
+            return refused("PERMISSION_DENIED", "bot behavior rules need Manage Server or the bot owner")
+        subject_user_id = self._memory_subject_user_id(message, payload)
         subject_channel_id = self._memory_subject_channel_id(message, payload)
         # A lookup naming only a type (no key, no subject) lists that type; it must not search an invented default key.
         type_level_lookup = (
@@ -3602,18 +3184,6 @@ class AIChatCog(commands.Cog):
 
         if decision.action == "SERVER_MEMORY_LOOKUP":
             normalized_key = ServerMemoryService.normalize_key(key)
-            if untyped_lookup and not normalized_key:
-                await self._send_long_reply(
-                    message,
-                    tr(
-                        lang,
-                        "Which exact memory key should I look up?",
-                        "Que clave exacta de memoria debo buscar?",
-                    ),
-                    reply_to_trigger=reply_to_trigger,
-                    mention_author=True,
-                )
-                return "VALIDATION_FAILED"
             rows = await self._server_memory.list_memories(
                 guild.id,
                 memory_type=memory_type,
@@ -3627,7 +3197,7 @@ class AIChatCog(commands.Cog):
             bounded_requested_key = requested_key_identity[:120]
             scope_identity = str(payload.get("scope") or "")[:120]
             subject_identity = str(payload.get("subject") or "")[:120]
-            ambiguous_matches = untyped_lookup and len(rows) > 1
+            ambiguous_matches = untyped_lookup and bool(normalized_key) and len(rows) > 1
             lookup_outcome = (
                 "VALIDATION_FAILED"
                 if ambiguous_matches
@@ -3656,118 +3226,78 @@ class AIChatCog(commands.Cog):
                 lookup_outcome,
             )
             if not rows:
-                if result_only:
-                    return normalize_terminal_result(
-                        "MEMORY",
-                        "NO_DATA",
-                        provider="server_memory",
-                        payload={
-                            "memory_type": memory_type,
-                            "requested_key": normalized_key,
-                            "subject": str(payload.get("subject") or "")[:120] or None,
-                            "scope": str(payload.get("scope") or "")[:120] or None,
-                            "rows": [],
-                        },
-                        provenance={"source": "ServerMemoryService"},
-                        scope={"guild_id": getattr(guild, "id", None)},
-                        reason="memory_not_found",
-                        satisfies_request=False,
-                    )
-                await self._send_long_reply(
-                    message,
-                    tr(lang, "I do not have that stored for this server.", "No tengo eso guardado para este servidor."),
-                    reply_to_trigger=reply_to_trigger,
-                    mention_author=True,
-                )
-                return "NO_DATA"
-            if ambiguous_matches:
-                if result_only:
-                    return normalize_terminal_result(
-                        "MEMORY",
-                        "VALIDATION_FAILED",
-                        provider="server_memory",
-                        payload={
-                            "memory_type": memory_type,
-                            "requested_key": normalized_key,
-                            "subject": str(payload.get("subject") or "")[:120] or None,
-                            "scope": str(payload.get("scope") or "")[:120] or None,
-                            "match_count": len(rows),
-                            "rows": [],
-                        },
-                        provenance={"source": "ServerMemoryService"},
-                        scope={"guild_id": getattr(guild, "id", None)},
-                        reason="multiple_exact_matches",
-                        satisfies_request=False,
-                    )
-                await self._send_long_reply(
-                    message,
-                    tr(
-                        lang,
-                        "I found more than one matching memory. Which memory category should I use?",
-                        "Encontre mas de una memoria coincidente. Que categoria de memoria debo usar?",
-                    ),
-                    reply_to_trigger=reply_to_trigger,
-                    mention_author=True,
-                )
-                return "VALIDATION_FAILED"
-            if result_only:
-                normalized_rows = [
-                    {
-                        key: row.get(key)
-                        for key in (
-                            "id",
-                            "memory_type",
-                            "subject_user_id",
-                            "subject_channel_id",
-                            "key",
-                            "value",
-                        )
-                        if row.get(key) is not None
-                    }
-                    for row in rows[:10]
-                    if isinstance(row, dict)
-                ]
                 return normalize_terminal_result(
                     "MEMORY",
-                    "SUCCESS",
+                    "NO_DATA",
                     provider="server_memory",
                     payload={
                         "memory_type": memory_type,
                         "requested_key": normalized_key,
                         "subject": str(payload.get("subject") or "")[:120] or None,
                         "scope": str(payload.get("scope") or "")[:120] or None,
-                        "rows": normalized_rows,
+                        "rows": [],
                     },
                     provenance={"source": "ServerMemoryService"},
                     scope={"guild_id": getattr(guild, "id", None)},
-                    satisfies_request=True,
+                    reason="memory_not_found",
+                    satisfies_request=False,
                 )
-            await self._send_long_reply(
-                message,
-                self._format_memory_lookup(rows, lang),
-                reply_to_trigger=reply_to_trigger,
-                mention_author=True,
+            if ambiguous_matches:
+                return normalize_terminal_result(
+                    "MEMORY",
+                    "VALIDATION_FAILED",
+                    provider="server_memory",
+                    payload={
+                        "memory_type": memory_type,
+                        "requested_key": normalized_key,
+                        "subject": str(payload.get("subject") or "")[:120] or None,
+                        "scope": str(payload.get("scope") or "")[:120] or None,
+                        "match_count": len(rows),
+                        "rows": [],
+                    },
+                    provenance={"source": "ServerMemoryService"},
+                    scope={"guild_id": getattr(guild, "id", None)},
+                    reason="multiple_exact_matches",
+                    satisfies_request=False,
+                )
+            normalized_rows = [
+                {
+                    key: row.get(key)
+                    for key in (
+                        "id",
+                        "memory_type",
+                        "subject_user_id",
+                        "subject_channel_id",
+                        "key",
+                        "value",
+                    )
+                    if row.get(key) is not None
+                }
+                for row in rows[:10]
+                if isinstance(row, dict)
+            ]
+            return normalize_terminal_result(
+                "MEMORY",
+                "SUCCESS",
+                provider="server_memory",
+                payload={
+                    "memory_type": memory_type,
+                    "requested_key": normalized_key,
+                    "subject": str(payload.get("subject") or "")[:120] or None,
+                    "scope": str(payload.get("scope") or "")[:120] or None,
+                    "rows": normalized_rows,
+                },
+                provenance={"source": "ServerMemoryService"},
+                scope={"guild_id": getattr(guild, "id", None)},
+                satisfies_request=True,
             )
-            return "SUCCESS"
 
         if decision.action in {"SERVER_MEMORY_WRITE", "SERVER_MEMORY_UPDATE"}:
             value = payload.get("value", "")
             if memory_type.startswith("USER_") and subject_user_id is None:
-                await self._send_long_reply(
-                    message,
-                    tr(lang, "Mention the user this memory is about.", "Menciona al usuario de quien es esta memoria."),
-                    reply_to_trigger=reply_to_trigger,
-                    mention_author=True,
-                )
-                return "VALIDATION_FAILED"
+                return refused("VALIDATION_FAILED", f"{memory_type} needs subject: the member's name, mention or id")
             if not value:
-                await self._send_long_reply(
-                    message,
-                    tr(lang, "What value should I remember?", "Que valor debo recordar?"),
-                    reply_to_trigger=reply_to_trigger,
-                    mention_author=True,
-                )
-                return "VALIDATION_FAILED"
+                return refused("VALIDATION_FAILED", "missing required argument: value")
             needs_approval = ServerMemoryService.should_require_approval(
                 memory_type,
                 author_can_manage=authority["author_can_manage_bot_behavior"],
@@ -3813,30 +3343,27 @@ class AIChatCog(commands.Cog):
                 authority["author_has_manage_guild"],
                 authority["author_can_manage_bot_behavior"],
             )
-            if result_only:
-                record_id = row.get("id")
-                if isinstance(record_id, str):
-                    record_id = record_id[:120]
-                elif not isinstance(record_id, int):
-                    record_id = None
-                outcome = "PENDING" if needs_approval else "SUCCESS"
-                return normalize_terminal_result(
-                    "MEMORY",
-                    outcome,
-                    provider="server_memory",
-                    payload={
-                        "memory_type": memory_type,
-                        "record_id": record_id,
-                        "action": decision.action,
-                        "state": "pending" if needs_approval else "approved",
-                    },
-                    provenance={"source": "ServerMemoryService"},
-                    scope={"guild_id": getattr(guild, "id", None)},
-                    reason="approval_required" if needs_approval else None,
-                    satisfies_request=not needs_approval,
-                )
-            await self._send_long_reply(message, text, reply_to_trigger=reply_to_trigger, mention_author=True)
-            return "PENDING" if needs_approval else "SUCCESS"
+            record_id = row.get("id")
+            if isinstance(record_id, str):
+                record_id = record_id[:120]
+            elif not isinstance(record_id, int):
+                record_id = None
+            outcome = "PENDING" if needs_approval else "SUCCESS"
+            return normalize_terminal_result(
+                "MEMORY",
+                outcome,
+                provider="server_memory",
+                payload={
+                    "memory_type": memory_type,
+                    "record_id": record_id,
+                    "action": decision.action,
+                    "state": "pending" if needs_approval else "approved",
+                },
+                provenance={"source": "ServerMemoryService"},
+                scope={"guild_id": getattr(guild, "id", None)},
+                reason="approval_required" if needs_approval else None,
+                satisfies_request=not needs_approval,
+            )
 
         if decision.action == "SERVER_MEMORY_DELETE":
             rows = await self._server_memory.list_memories(
@@ -3850,73 +3377,49 @@ class AIChatCog(commands.Cog):
             normalized_key = ServerMemoryService.normalize_key(key)
             target = next((row for row in rows if str(row.get("key")) == normalized_key), None)
             if target is None:
-                if result_only:
-                    # Keys are free-form router names, so a miss hands back the stored candidates (with ids) for the user to pick.
-                    candidates = [self._memory_row_summary(row) for row in rows[:10]]
-                    return normalize_terminal_result(
-                        "MEMORY",
-                        "NO_DATA",
-                        provider="server_memory",
-                        payload={
-                            "memory_type": memory_type,
-                            "action": decision.action,
-                            "state": "needs_selection" if candidates else "not_found",
-                            "candidates": candidates,
-                        },
-                        provenance={"source": "ServerMemoryService"},
-                        scope={"guild_id": getattr(guild, "id", None)},
-                        reason="memory_needs_selection" if candidates else "memory_not_found",
-                        satisfies_request=False,
-                    )
-                await self._send_long_reply(
-                    message,
-                    tr(lang, "I could not find that memory.", "No encontre esa memoria."),
-                    reply_to_trigger=reply_to_trigger,
-                    mention_author=True,
-                )
-                return "NO_DATA"
-            if self._memory_decider_error(message, target):
-                if result_only:
-                    return normalize_terminal_result(
-                        "MEMORY",
-                        "PERMISSION_DENIED",
-                        provider="orchestrator",
-                        provenance={"source": "typed_task_operands"},
-                        scope={"guild_id": getattr(guild, "id", None)},
-                        reason="memory_lifecycle_not_authorized",
-                        satisfies_request=False,
-                    )
-                await self._send_long_reply(
-                    message,
-                    tr(lang, "Only an admin or the person it is about can forget that memory.", "Solo un admin o la persona de quien trata puede olvidar esa memoria."),
-                    reply_to_trigger=reply_to_trigger,
-                    mention_author=True,
-                )
-                return "PERMISSION_DENIED"
-            record_id = int(target["id"])
-            await self._server_memory.delete_memory(guild.id, record_id)
-            if result_only:
+                # Keys are free-form router names, so a miss hands back the stored candidates (with ids) for the user to pick.
+                candidates = [self._memory_row_summary(row) for row in rows[:10]]
                 return normalize_terminal_result(
                     "MEMORY",
-                    "SUCCESS",
+                    "NO_DATA",
                     provider="server_memory",
                     payload={
                         "memory_type": memory_type,
-                        "record_id": record_id,
                         "action": decision.action,
-                        "state": "deleted",
+                        "state": "needs_selection" if candidates else "not_found",
+                        "candidates": candidates,
                     },
                     provenance={"source": "ServerMemoryService"},
                     scope={"guild_id": getattr(guild, "id", None)},
-                    satisfies_request=True,
+                    reason="memory_needs_selection" if candidates else "memory_not_found",
+                    satisfies_request=False,
                 )
-            await self._send_long_reply(
-                message,
-                tr(lang, "Forgot that server memory.", "Olvide esa memoria del servidor."),
-                reply_to_trigger=reply_to_trigger,
-                mention_author=True,
+            if self._memory_decider_error(message, target):
+                return normalize_terminal_result(
+                    "MEMORY",
+                    "PERMISSION_DENIED",
+                    provider="orchestrator",
+                    provenance={"source": "typed_task_operands"},
+                    scope={"guild_id": getattr(guild, "id", None)},
+                    reason="memory_lifecycle_not_authorized",
+                    satisfies_request=False,
+                )
+            record_id = int(target["id"])
+            await self._server_memory.delete_memory(guild.id, record_id)
+            return normalize_terminal_result(
+                "MEMORY",
+                "SUCCESS",
+                provider="server_memory",
+                payload={
+                    "memory_type": memory_type,
+                    "record_id": record_id,
+                    "action": decision.action,
+                    "state": "deleted",
+                },
+                provenance={"source": "ServerMemoryService"},
+                scope={"guild_id": getattr(guild, "id", None)},
+                satisfies_request=True,
             )
-            return "SUCCESS"
 
         return "UNSUPPORTED"
 
@@ -3928,12 +3431,12 @@ class AIChatCog(commands.Cog):
         route_action: str,
         current_text: str,
         replied_message: discord.Message | None,
+        participants: list[dict[str, Any]],
     ) -> str:
         guild = message.guild
         if guild is None or self._server_memory_context is None:
             return base_context
         try:
-            participants = await self._channel_history_intent_context(message)
             memory_context = await self._server_memory_context.build_context(
                 guild_id=guild.id,
                 channel_id=getattr(message.channel, "id", None),
@@ -3967,20 +3470,12 @@ class AIChatCog(commands.Cog):
     def _memory_subject_user_id(
         self,
         message: discord.Message,
-        replied_message: discord.Message | None,
         payload: dict[str, str],
     ) -> int | None:
+        # Grok names the subject; identity only: exactly one member's id, mention or name links the memory to that member.
         subject = " ".join(str(payload.get("subject") or "").split()).casefold()
-        non_bot_mentions = [user for user in message.mentions if not getattr(user, "bot", False)]
-        if non_bot_mentions:
-            return int(non_bot_mentions[0].id)
-        if subject in {"author", "self", "me", "yo"}:
-            return int(message.author.id)
-        if subject in {"replied_user", "reply_author"} and replied_message is not None:
-            return int(replied_message.author.id)
         if not subject:
             return None
-        # Identity only: a subject that is exactly one member's id, mention or name links the memory to that member.
         members = [member for member in getattr(message.guild, "members", None) or () if not getattr(member, "bot", False)]
         token = re.fullmatch(r"<@!?(\d+)>|(\d{5,})", subject)
         if token:
@@ -4008,13 +3503,6 @@ class AIChatCog(commands.Cog):
             return "preference"
         return memory_type.casefold()
 
-    @staticmethod
-    def _format_memory_lookup(rows: list[dict[str, object]], lang: str) -> str:
-        lines = [tr(lang, "Stored server memories:", "Memorias guardadas del servidor:")]
-        for row in rows[:10]:
-            key = str(row.get("key", "memory")).replace("_", " ")
-            lines.append(f"- `{int(row.get('id', 0))}` {row.get('memory_type')}: {key}: {row.get('value')}")
-        return "\n".join(lines)
 
     def _log_capability_terminal_checkpoint(
         self,
@@ -4085,84 +3573,6 @@ class AIChatCog(commands.Cog):
             diagnostics["satisfied"],
         )
 
-    async def _execute_external_source_result_only(
-        self,
-        message: discord.Message,
-        intent: ExternalSourceIntent | None,
-        *,
-        replied_message: discord.Message | None = None,
-    ) -> CapabilityTerminalResult:
-        if intent is None or not intent.required:
-            return normalize_terminal_result(
-                "EXTERNAL_SOURCE",
-                ExternalSourceStatus.MALFORMED_SOURCE,
-                provider="external_sources",
-                provenance={"source": "current_message_grounding"},
-                reason=(intent.failure_reason if intent is not None else "missing_external_intent")
-                or "external_source_not_validated",
-            )
-
-        reply_authorized, reply_text = self._authorized_reply_source(message, replied_message)
-        sources = self._external_sources.ground_sources(
-            intent=intent,
-            current_text=message.content or "",
-            current_embeds=list(getattr(message, "embeds", []) or []),
-            reply_text=reply_text,
-            reply_embeds=list(getattr(replied_message, "embeds", []) or []) if reply_authorized else [],
-        )
-        if intent.selected_urls:
-            sources = [source for source in sources if source.original_url in intent.selected_urls]
-
-        if not sources:
-            return normalize_terminal_result(
-                "EXTERNAL_SOURCE",
-                ExternalSourceStatus.MALFORMED_SOURCE,
-                provider="external_sources",
-                provenance={"source": "ground_sources"},
-                reason="no_grounded_sources",
-            )
-        try:
-            bundle = await self._external_sources.retrieve_bundle(
-                intent=intent,
-                sources=sources,
-                guild_id=getattr(message.guild, "id", None),
-                user_id=getattr(message.author, "id", None),
-            )
-        except Exception as exc:
-            logging.exception("AI external source result-only retrieval failed")
-            return normalize_terminal_result(
-                "EXTERNAL_SOURCE",
-                ExternalSourceStatus.TRANSPORT_FAILURE,
-                provider="external_sources",
-                provenance={"source": "retrieve_bundle"},
-                scope={"source_count": len(sources)},
-                reason=type(exc).__name__,
-            )
-        logging.info(
-            "AI external source grounding guild=%s channel=%s message=%s external_source_required=true grounded_url_count=%s source_resolved=%s media_discovered=%s media_authorized=%s media_relevant=%s selected_media=%s",
-            getattr(message.guild, "id", None),
-            getattr(message.channel, "id", None),
-            getattr(message, "id", None),
-            len(bundle.sources),
-            bool(bundle.sources),
-            sum(getattr(result, "media_discovered", len(result.media)) for result in bundle.results),
-            sum(getattr(result, "media_authorized", len(result.media)) for result in bundle.results),
-            sum(getattr(result, "media_relevant", 0) for result in bundle.results),
-            len(bundle.selected_media),
-        )
-        return normalize_terminal_result(
-            "EXTERNAL_SOURCE",
-            bundle.outcome,
-            provider="external_sources",
-            payload=bundle,
-            provenance={"source": "ExternalSourceBundle", "source_count": len(bundle.sources)},
-            scope={
-                "source_scope": intent.source_scope.value,
-                "request_date": self._web_request_date(message),
-            },
-            reason=None if bundle.outcome == ExternalSourceStatus.SUCCESS else bundle.outcome.value,
-        )
-
     async def _execute_ninjas_result_only(self, operands: dict[str, object]) -> CapabilityTerminalResult:
         operation = operands.get("ninjas_action")
         scope = {"operation": operation}
@@ -4182,9 +3592,6 @@ class AIChatCog(commands.Cog):
                 client,
                 str(operation),
                 domain=operands.get("domain"),
-                amount=operands.get("amount"),
-                from_unit=operands.get("from_unit"),
-                to_unit=operands.get("to_unit"),
             )
         except NinjasOperandError:
             return normalize_terminal_result(
@@ -4204,18 +3611,8 @@ class AIChatCog(commands.Cog):
                 provider="api_ninjas",
                 provenance={"source": "ApiNinjasClient"},
                 scope=scope,
-                reason=type(exc).__name__,
-                satisfies_request=False,
-            )
-        if operation == "unit_conversion" and payload.get("converted_value") is None:
-            return normalize_terminal_result(
-                "NINJAS",
-                CapabilityTerminalStatus.NO_DATA,
-                provider="api_ninjas",
-                payload=payload,
-                provenance={"source": "ApiNinjasClient"},
-                scope=scope,
-                reason="target_unit_not_found",
+                # The provider's own message, so Grok can see what to fix.
+                reason=str(exc)[:200] or type(exc).__name__,
                 satisfies_request=False,
             )
         return normalize_terminal_result(
@@ -4966,99 +4363,20 @@ class AIChatCog(commands.Cog):
         selection_count: int = 1,
         dependency_task_ids: tuple[str, ...] = (),
     ) -> CapabilityTerminalResult:
-        dependency_results = [context.results.get(task_id) for task_id in dependency_task_ids]
-        source_result = next(
-            (result for result in dependency_results if result is not None and result.capability == "EXTERNAL_SOURCE"),
-            None,
-        )
-        web_result = next(
-            (result for result in dependency_results if result is not None and result.capability == "WEB"),
-            None,
-        )
-        if not dependency_task_ids:
-            source_result = context.results.get("EXTERNAL_SOURCE")
-            web_result = context.results.get("WEB")
-        bundle = source_result.payload if source_result is not None else None
-        if bundle is not None:
-            provider_visual_result = next(
-                (
-                    item
-                    for item in getattr(bundle, "results", ()) or ()
-                    if bool(getattr(item, "visual_complete", False))
-                    and getattr(item, "grounded_visual_observation", None)
-                ),
-                None,
-            )
-            if provider_visual_result is not None:
-                observation = str(provider_visual_result.grounded_visual_observation or "")
-                logging.info(
-                    "AI external source vision_input_prepared guild=%s channel=%s message=%s media_candidates=%s media_authorized=%s media_relevant=%s selected_media=0 vision_input_count=0 vision_execution=provider_grounded_visual_observation native_visual_authority=success local_media_bridge=skipped direct_vision=skipped",
-                    getattr(message.guild, "id", None),
-                    getattr(message.channel, "id", None),
-                    getattr(message, "id", None),
-                    len(getattr(provider_visual_result, "media", ()) or ()),
-                    getattr(provider_visual_result, "media_authorized", 0),
-                    getattr(provider_visual_result, "media_relevant", 0),
-                )
-                return normalize_terminal_result(
-                    "IMAGE_ANALYZE",
-                    "SUCCESS",
-                    provider="xai_web_search",
-                    payload={
-                        "text": observation,
-                        "visual_authority": "AUTHORITATIVE_GROUNDED_VISUAL_OBSERVATION",
-                    },
-                    provenance={
-                        "source": "ExternalSourceResult",
-                        "adapter": provider_visual_result.retrieval_adapter,
-                        "tool_usage": tuple(provider_visual_result.visual_tool_usage),
-                    },
-                    scope={"visual_observation": True},
-                )
-        if web_result is not None and isinstance(web_result.payload, WebResearchResult):
-            observation = web_result.payload.grounded_visual_observation
-            if observation:
-                logging.info(
-                    "AI external source vision_input_prepared guild=%s channel=%s message=%s media_candidates=0 media_authorized=0 media_relevant=0 selected_media=0 vision_input_count=0 vision_execution=provider_grounded_visual_observation native_visual_authority=success local_media_bridge=skipped direct_vision=skipped",
-                    getattr(message.guild, "id", None),
-                    getattr(message.channel, "id", None),
-                    getattr(message, "id", None),
-                )
-                return normalize_terminal_result(
-                    "IMAGE_ANALYZE",
-                    "SUCCESS",
-                    provider="xai_web_search",
-                    payload={
-                        "text": observation,
-                        "visual_authority": "AUTHORITATIVE_GROUNDED_VISUAL_OBSERVATION",
-                    },
-                    provenance={
-                        "source": "WebResearchResult",
-                        "tool_usage": tuple(web_result.payload.server_side_tool_usage),
-                    },
-                    scope={"visual_observation": True},
-                )
         target_selection_count = max(1, min(4, int(selection_count or 1)))
-        selected_media = list(
-            self._external_sources.select_vision_media(
-                tuple(getattr(bundle, "selected_media", ()) or ()),
-                limit=target_selection_count,
-            )
-        )
-
-        def build_vision_inputs(media_items: list[ExternalMediaSource]) -> list[object]:
-            inputs: list[object] = []
-            for media in media_items:
-                artifact = getattr(media, "artifact", None)
-                if artifact is not None:
-                    inputs.append(artifact)
-                elif getattr(media, "url", None):
-                    inputs.append(str(media.url))
-            return inputs
-
-        vision_inputs = build_vision_inputs(selected_media)
+        dependency_results = [context.results.get(task_id) for task_id in dependency_task_ids]
+        # An image produced earlier in the same request is inspected from its own bytes.
+        vision_inputs: list[object] = [
+            SimpleNamespace(data=result.payload["artifact"], content_type=str(result.payload.get("content_type") or "image/png"))
+            for result in dependency_results
+            if result is not None and result.capability in {"IMAGE_GENERATE", "IMAGE_EDIT", "MEME"}
+            and result.satisfies_request and isinstance(result.payload, dict) and isinstance(result.payload.get("artifact"), bytes)
+        ][:target_selection_count]
+        evidence_source = "generated_artifact"
+        if not vision_inputs:
+            vision_inputs = list(dict.fromkeys(str(url) for url in fallback_media_urls if url))[:target_selection_count]
+            evidence_source = "authorized_image_context"
         media_urls = [item for item in vision_inputs if isinstance(item, str)]
-        evidence_source = "ExternalSourceBundle"
         fallback_media_source_kind = str(fallback_media_source_kind or "none").strip() or "none"
 
         def media_provenance(source: str) -> dict[str, object]:
@@ -5076,75 +4394,7 @@ class AIChatCog(commands.Cog):
                 )
             return provenance
 
-        if not selected_media:
-            # An image produced earlier in the same request is inspected from its own bytes.
-            selected_media = [
-                ExternalMediaSource(
-                    url="", content_type=str(result.payload.get("content_type") or "image/png"), provenance="generated_artifact",
-                    artifact=ExternalMediaArtifact(result.payload["artifact"], str(result.payload.get("content_type") or "image/png")),
-                )
-                for result in dependency_results
-                if result is not None and result.capability in {"IMAGE_GENERATE", "IMAGE_EDIT", "MEME"}
-                and result.satisfies_request and isinstance(result.payload, dict) and isinstance(result.payload.get("artifact"), bytes)
-            ][:target_selection_count]
-            if selected_media:
-                vision_inputs = build_vision_inputs(selected_media)
-                media_urls = []
-                evidence_source = "generated_artifact"
-        if not selected_media and fallback_media_urls:
-            selected_media = list(
-                self._external_sources.select_vision_media(
-                    self._external_sources.authorized_direct_media(
-                        fallback_media_urls,
-                        limit=target_selection_count,
-                    ),
-                    limit=target_selection_count,
-                )
-            )
-            vision_inputs = build_vision_inputs(selected_media)
-            media_urls = [item for item in vision_inputs if isinstance(item, str)]
-            evidence_source = "authorized_image_context"
-        if not selected_media and web_result is not None and isinstance(web_result.payload, WebResearchResult):
-            logging.info(
-                "AI external source native_visual_authority=unavailable local_media_bridge=selected direct_vision=pending",
-            )
-            try:
-                web_media = await self._external_sources.acquire_media_from_web_result(
-                    web_result.payload,
-                    guild_id=getattr(message.guild, "id", None),
-                    user_id=getattr(message.author, "id", None),
-                    required_media_count=target_selection_count,
-                )
-            except Exception:
-                logging.exception("AI WEB grounded media acquisition failed")
-                web_media = ()
-            selected_media = list(web_media)
-            vision_inputs = build_vision_inputs(selected_media)
-            media_urls = [item for item in vision_inputs if isinstance(item, str)]
-            if selected_media:
-                evidence_source = "WebResearchResult.local_media_acquisition"
-
-        # Vision must consume the canonical selected collection, never a raw URL side list.
-        if len(selected_media) != len(vision_inputs):
-            logging.warning(
-                "AI external source vision selection mismatch selected_media=%s vision_input_count=%s",
-                len(selected_media),
-                len(vision_inputs),
-            )
-            selected_media = selected_media[: len(vision_inputs)]
-            vision_inputs = build_vision_inputs(selected_media)
-            media_urls = [item for item in vision_inputs if isinstance(item, str)]
         if not vision_inputs:
-            logging.info(
-                "AI external source vision_input_prepared guild=%s channel=%s message=%s media_candidates=%s media_authorized=%s media_relevant=%s selected_media=%s vision_input_count=0 vision_execution=not_started reason=authorized_relevant_media_unavailable",
-                getattr(message.guild, "id", None),
-                getattr(message.channel, "id", None),
-                getattr(message, "id", None),
-                len(getattr(bundle, "selected_media", ()) or ()),
-                0,
-                0,
-                0,
-            )
             return normalize_terminal_result(
                 "IMAGE_ANALYZE",
                 "NO_DATA_FOR_SCOPE",
@@ -5152,55 +4402,17 @@ class AIChatCog(commands.Cog):
                 provenance={**media_provenance(evidence_source), "media_selection": "none"},
                 reason="authorized_media_unavailable",
             )
-        vision_input_count = len(vision_inputs[:4])
-        payload_context_sources = (
-            "system_instructions",
-            "author_identity",
-            "channel_identity",
-            "current_user_message",
-            f"authorized_media:{evidence_source}:{fallback_media_source_kind}",
-        )
+        vision_input_count = len(vision_inputs)
         logging.info(
-            "AI external source vision_input_prepared guild=%s channel=%s message=%s media_candidates=%s media_authorized=%s media_relevant=%s selected_media=%s vision_input_count=%s media_source=%s media_source_kind=%s payload_context_sources=%s",
+            "AI image analysis vision_input_prepared guild=%s channel=%s message=%s vision_input_count=%s media_source=%s media_source_kind=%s",
             getattr(message.guild, "id", None),
             getattr(message.channel, "id", None),
             getattr(message, "id", None),
-            len(selected_media),
-            len(selected_media),
-            len(selected_media),
-            len(selected_media),
             vision_input_count,
             evidence_source,
             fallback_media_source_kind,
-            payload_context_sources,
         )
-        logging.info(
-            "AI external source vision_media_selection source=%s candidates=%s",
-            evidence_source,
-            tuple(
-                "|".join(
-                    (
-                        media.diagnostic_hash,
-                        str(getattr(media, "content_type", None) or "unknown"),
-                        str(getattr(media, "provenance", "unknown")),
-                        str(getattr(getattr(media, "role", None), "value", getattr(media, "role", "unknown"))),
-                        str(getattr(media, "association", "unknown")),
-                        str(getattr(getattr(media, "relevance", None), "value", getattr(media, "relevance", "unknown"))),
-                    )
-                )
-                for media in selected_media[:target_selection_count]
-            ),
-        )
-        if bundle is not None:
-            prompt = external_source_grounding_prompt(user_prompt, external_source_context(bundle), has_media=True)
-        elif web_result is not None and isinstance(web_result.payload, WebResearchResult):
-            prompt = (
-                f"{user_prompt}\n\n"
-                f"{format_web_research_context(web_result.payload, max_sources=3)}\n\n"
-                "Use the authorized attached image as part of the same request. Preserve the web result scope."
-            )
-        else:
-            prompt = user_prompt
+        prompt = user_prompt
         try:
             reply = await self.bot.llm_client.chat(
                 server_context=getattr(settings, "server_context", ""),
@@ -5215,10 +4427,7 @@ class AIChatCog(commands.Cog):
                 relay_instruction="",
                 is_owner=self.bot.is_owner_user(message.author),
                 conversation_mode="mention",
-                image_urls=media_urls[:vision_input_count] if not any(
-                    not isinstance(item, str) for item in vision_inputs[:vision_input_count]
-                ) else [],
-                image_inputs=vision_inputs[:vision_input_count],
+                image_inputs=vision_inputs,
             )
         except Exception as exc:
             logging.exception("AI result-only image analysis failed")
@@ -5232,12 +4441,12 @@ class AIChatCog(commands.Cog):
             )
         analysis_text = reply
         logging.info(
-            "AI external source vision_execution outcome=SUCCESS input_count=%s source=%s",
+            "AI image analysis vision_execution outcome=SUCCESS input_count=%s source=%s",
             vision_input_count,
             evidence_source,
         )
         logging.info(
-            "AI external source vision_output source=%s output_length=%s output_hash=%s output_empty=%s",
+            "AI image analysis vision_output source=%s output_length=%s output_hash=%s output_empty=%s",
             evidence_source,
             len(analysis_text),
             hash_text(analysis_text),
@@ -5245,7 +4454,7 @@ class AIChatCog(commands.Cog):
         )
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             logging.debug(
-                "AI external source vision_output_excerpt source=%s output_hash=%s excerpt=%s",
+                "AI image analysis vision_output_excerpt source=%s output_hash=%s excerpt=%s",
                 evidence_source,
                 hash_text(analysis_text),
                 self._bounded_diagnostic_excerpt(
@@ -5285,60 +4494,6 @@ class AIChatCog(commands.Cog):
             },
         )
 
-    async def _execute_web_result_only(
-        self,
-        message: discord.Message,
-        user_prompt: str,
-        *,
-        settings: object,
-        visual_objective: str | None = None,
-        visual_selection_count: int = 1,
-    ) -> CapabilityTerminalResult:
-        query = str(user_prompt or "")
-        request = WebResearchRequest(
-            query=query,
-            lookup_type="general",
-            max_sources=int(getattr(getattr(self.bot, "settings", None), "xai_web_search_max_sources", 3) or 3),
-            request_date=self._football_request_temporal_context(message)[0],
-            enable_image_understanding=bool(visual_objective),
-            enable_image_search=bool(visual_objective),
-            visual_objective=visual_objective,
-            visual_selection_count=max(1, min(4, int(visual_selection_count or 1))),
-        )
-        try:
-            result = await self._web_research.research(
-                request,
-                guild_id=getattr(message.guild, "id", None),
-                user_id=getattr(message.author, "id", None),
-                turn_id=getattr(message, "id", None),
-            )
-        except Exception as exc:
-            logging.exception("AI result-only web retrieval failed")
-            return normalize_terminal_result(
-                "WEB",
-                "PROVIDER_FAILURE",
-                provider="web_research",
-                provenance={"source": "WebResearchService"},
-                scope={"lookup_type": request.lookup_type},
-                reason=type(exc).__name__,
-            )
-        has_data = bool(result.answer or result.sources or result.citations)
-        outcome = str(result.failure_reason) if result.failure_reason else "SUCCESS" if has_data else "NO_DATA"
-        return normalize_terminal_result(
-            "WEB",
-            outcome,
-            provider=str(result.tool_used or "web_research"),
-            payload=result,
-            provenance={"source": "WebResearchResult", "cache_hit": result.cache_hit},
-            scope={
-                "lookup_type": request.lookup_type,
-                "source_count": len(result.sources),
-                "request_date": request.request_date,
-            },
-            reason=result.failure_reason,
-        )
-
-
     @staticmethod
     def _football_standings_diagnostic(standings: object) -> tuple[int, str, int, str]:
         rows = standings if isinstance(standings, list) else []
@@ -5361,207 +4516,6 @@ class AIChatCog(commands.Cog):
         return len(rows), hash_text(serialized), len(serialized), serialized
 
 
-    @staticmethod
-    def _is_native_url_edit_plan(
-        execution_plan: object,
-        external_intent: ExternalSourceIntent | None,
-    ) -> bool:
-        if external_intent is None or not (
-            external_intent.required
-            and external_intent.explicit
-            and external_intent.expected_content == ExternalExpectedContent.MEDIA
-            and external_intent.source_scope in {
-                ExternalSourceScope.CURRENT_MESSAGE,
-                ExternalSourceScope.REPLY_TARGET,
-                ExternalSourceScope.BOTH,
-            }
-        ):
-            return False
-        semantic_plan = getattr(execution_plan, "semantic_plan", None)
-        evidence_source = str(getattr(semantic_plan, "evidence_source", "") or "").strip().upper()
-        expected_evidence_source = {
-            ExternalSourceScope.CURRENT_MESSAGE: "CURRENT_MESSAGE",
-            ExternalSourceScope.REPLY_TARGET: "EXPLICIT_REPLY_TARGET",
-            ExternalSourceScope.BOTH: "CURRENT_MESSAGE_AND_REPLY",
-        }.get(external_intent.source_scope)
-        if evidence_source != expected_evidence_source:
-            return False
-        requests = tuple(getattr(semantic_plan, "capabilities", ()) or ())
-        image_edit = next(
-            (
-                item
-                for item in requests
-                if getattr(item, "name", "") == "IMAGE_EDIT"
-                and bool(getattr(item, "required", False))
-            ),
-            None,
-        )
-        external_source = next(
-            (
-                item
-                for item in requests
-                if getattr(item, "name", "") == "EXTERNAL_SOURCE"
-                and bool(getattr(item, "required", False))
-            ),
-            None,
-        )
-        return bool(
-            image_edit is not None
-            and external_source is not None
-            and getattr(external_source, "task_id", "") in tuple(getattr(image_edit, "depends_on", ()) or ())
-        )
-
-    async def _execute_native_url_image_edit_result_only(
-        self,
-        message: discord.Message,
-        user_prompt: str,
-        intent: ExternalSourceIntent | None,
-        execution_plan: object,
-        *,
-        replied_message: discord.Message | None,
-    ) -> tuple[CapabilityTerminalResult, bytes | None, dict[str, object]]:
-        if not self._is_native_url_edit_plan(execution_plan, intent):
-            return (
-                normalize_terminal_result(
-                    "EXTERNAL_SOURCE",
-                    "VALIDATION_FAILED",
-                    provider="orchestrator",
-                    provenance={"source": "native_url_edit_admission"},
-                    reason="native_url_edit_predicate_failed",
-                ),
-                None,
-                {},
-            )
-        assert intent is not None
-        reply_authorized, reply_text = self._authorized_reply_source(message, replied_message)
-        sources = self._external_sources.ground_sources(
-            intent=intent,
-            current_text=message.content or "",
-            current_embeds=list(getattr(message, "embeds", []) or []),
-            reply_text=reply_text,
-            reply_embeds=list(getattr(replied_message, "embeds", []) or []) if reply_authorized else [],
-        )
-        if not sources:
-            return (
-                normalize_terminal_result(
-                    "EXTERNAL_SOURCE",
-                    "VALIDATION_FAILED",
-                    provider="external_sources",
-                    provenance={"source": "native_url_edit_grounding"},
-                    reason="no_grounded_sources",
-                ),
-                None,
-                {},
-            )
-        safety_policy = getattr(self._external_sources, "safety_policy", None) or UrlSafetyPolicy()
-        for source in sources:
-            safe, reason = await safety_policy.validate(source.original_url)
-            if not safe:
-                return (
-                    normalize_terminal_result(
-                        "EXTERNAL_SOURCE",
-                        "VALIDATION_FAILED",
-                        provider="external_sources",
-                        provenance={"source": "native_url_edit_url_safety"},
-                        scope={"source_count": len(sources)},
-                        reason=reason,
-                    ),
-                    None,
-                    {},
-                )
-        source_urls = tuple(source.original_url for source in sources)
-        provider_start = time.perf_counter()
-        try:
-            native_result = await self.bot.llm_client.native_url_image_edit(
-                user_prompt,
-                source_urls,
-            )
-        except Exception:
-            logging.exception(
-                "AI native URL image edit failure guild=%s channel=%s source_count=%s",
-                getattr(message.guild, "id", None),
-                getattr(message.channel, "id", None),
-                len(source_urls),
-            )
-            return (
-                normalize_terminal_result(
-                    "EXTERNAL_SOURCE",
-                    "PROVIDER_FAILURE",
-                    provider="xai_responses",
-                    provenance={
-                        "source": "native_url_edit",
-                        "source_scope": intent.source_scope.value,
-                        "source_count": len(source_urls),
-                        "provider_duration_ms": int((time.perf_counter() - provider_start) * 1000),
-                    },
-                    reason="provider_failure",
-                ),
-                None,
-                {},
-            )
-        provider_duration_ms = int((time.perf_counter() - provider_start) * 1000)
-        if not isinstance(native_result, dict):
-            return (
-                normalize_terminal_result(
-                    "EXTERNAL_SOURCE",
-                    "PROVIDER_FAILURE",
-                    provider="xai_responses",
-                    provenance={"source": "native_url_edit", "provider_duration_ms": provider_duration_ms},
-                    reason="malformed_response",
-                ),
-                None,
-                {},
-            )
-        image_bytes = native_result.get("image_bytes")
-        diagnostics = native_result.get("diagnostics")
-        bounded_diagnostics = dict(diagnostics) if isinstance(diagnostics, dict) else {}
-        bounded_diagnostics["provider_duration_ms"] = provider_duration_ms
-        transaction_id = str(
-            bounded_diagnostics.get("transaction_id")
-            or hash_text("|".join(source_urls) + "|" + user_prompt)
-        )[:32]
-        if not isinstance(image_bytes, bytes):
-            return (
-                normalize_terminal_result(
-                    "EXTERNAL_SOURCE",
-                    "PROVIDER_FAILURE",
-                    provider="xai_responses",
-                    provenance={
-                        "source": "native_url_edit",
-                        "transaction_id": transaction_id,
-                        "provider_duration_ms": provider_duration_ms,
-                        **bounded_diagnostics,
-                    },
-                    reason="missing_image_artifact",
-                ),
-                None,
-                bounded_diagnostics,
-            )
-        external_result = normalize_terminal_result(
-            "EXTERNAL_SOURCE",
-            "SUCCESS",
-            provider="xai_responses",
-            payload={
-                "native_composition": True,
-                "source_scope": intent.source_scope.value,
-                "source_count": len(source_urls),
-            },
-            provenance={
-                "source": "native_url_edit",
-                "authorized": True,
-                "transaction_id": transaction_id,
-                "source_scope": intent.source_scope.value,
-                "source_url_hashes": tuple(hash_text(url) for url in source_urls),
-                **bounded_diagnostics,
-            },
-            scope={
-                "source_scope": intent.source_scope.value,
-                "source_count": len(source_urls),
-                "transaction_id": transaction_id,
-            },
-        )
-        return external_result, image_bytes, bounded_diagnostics
-
     async def _execute_live_media_composition_result_only(
         self,
         message: discord.Message,
@@ -5570,35 +4524,16 @@ class AIChatCog(commands.Cog):
         *,
         settings: object,
         replied_message: discord.Message | None = None,
-        external_intent: ExternalSourceIntent | None = None,
-        football_decision: RouteDecision | None = None,
-        football_lang: str = "en",
         football_anchor_type: str = "MENTION",
-        football_reply_to_trigger: bool = True,
-        memory_decision: RouteDecision | None = None,
         memory_lang: str = "en",
-        admin_decision: RouteDecision | None = None,
         admin_lang: str = "en",
-        reaction_decision: RouteDecision | None = None,
-        image_urls: list[str] | tuple[str, ...] = (),
-        image_source_kind: str = "none",
-        source_message_id: int | None = None,
-        image_operation_prompt: str | None = None,
-        image_edit_source_url: str | None = None,
         image_context: ChatImageContext | None = None,
-        prior_typed_context: tuple[CapabilityExecutionPlan, CapabilityResultBundle] | None = None,
-        current_scope: dict[str, object] | None = None,
-        resolution_message: discord.Message | None = None,
-        direct_chat: dict[str, object] | None = None,
         execution_context: CapabilityExecutionContext | None = None,
         can_continue=None,
     ) -> CapabilityExecutionContext:
-        # Every native task must carry its own typed operands.  Compatibility
-        # routes may still use the legacy projections supplied by the caller.
+        # Every task is one of Grok's function calls and carries its own typed operands.
         semantic_plan = getattr(execution_plan, "semantic_plan", None)
-        semantic_source = getattr(semantic_plan, "semantic_source", "")
-        native_task_plan = semantic_source == "router"
-        resolution_message = resolution_message or message
+        resolution_message = message
         preflight_lang = admin_lang
 
         def _task_operands(request: object, context: CapabilityExecutionContext) -> dict[str, object]:
@@ -5620,10 +4555,6 @@ class AIChatCog(commands.Cog):
                         else:
                             payload = value.payload
                             value = payload.get(part) if isinstance(payload, dict) and part in payload else getattr(payload, part, None)
-                            if value is None and isinstance(payload, ExternalSourceBundle) and part == "media":
-                                # EXTERNAL_SOURCE advertises authorized media, not
-                                # discovery candidates. Keep that boundary explicit.
-                                value = payload.selected_media
                     elif isinstance(value, dict):
                         value = value.get(part)
                     else:
@@ -5638,17 +4569,6 @@ class AIChatCog(commands.Cog):
                 if field:
                     resolved[field.rsplit(".", 1)[-1]] = output_value(upstream, field)
             return resolved
-
-        def _native_external_source_input(request: object, operands: dict[str, object]) -> dict[str, object]:
-            # Supplemental source reads support an existing requirement instead of owning another user outcome.
-            return {
-                **operands,
-                "required": bool(getattr(request, "required", False)) or (
-                    execution_context is not None and getattr(request, "task_id", "") in execution_context.evidence_requirements
-                ),
-                "explicit": True,
-                "evidence_span": getattr(request, "evidence_span", ""),
-            }
 
         def _task_objective(request: object, operands: dict[str, object]) -> str | None:
             for key in ("objective", "prompt", "query", "research_question", "request"):
@@ -5676,80 +4596,12 @@ class AIChatCog(commands.Cog):
             )
 
         capability_requests = tuple(execution_plan.ordered_capabilities)
-        capability_by_task_id = {
-            getattr(item, "task_id", ""): item
-            for item in capability_requests
-            if getattr(item, "task_id", "")
-        }
-
-        def web_visual_for(web_task_id: str = "") -> tuple[str | None, int]:
-            # Typed structure only: the required IMAGE_ANALYZE task depending on this WEB task
-            # (any WEB task when no id is given) owns the visual objective and selection count.
-            objective: str | None = None
-            visual_request = next(
-                (
-                    item
-                    for item in capability_requests
-                    if getattr(item, "name", "") == "IMAGE_ANALYZE"
-                    and any(
-                        (dependency == web_task_id)
-                        if web_task_id
-                        else getattr(capability_by_task_id.get(dependency), "name", "") == "WEB"
-                        for dependency in tuple(getattr(item, "depends_on", ()) or ())
-                    )
-                    and bool(getattr(item, "required", True))
-                ),
-                None,
-            )
-            if visual_request is None:
-                return None, 1
-            requirement = next(
-                (
-                    item
-                    for item in tuple(getattr(semantic_plan, "requirements", ()) or ())
-                    if getattr(item, "capability_owner", "") == "IMAGE_ANALYZE"
-                    and getattr(item, "owner_task_id", None) in {None, getattr(visual_request, "task_id", None)}
-                    and bool(getattr(item, "required", True))
-                ),
-                None,
-            )
-            if requirement is not None:
-                objective = "; ".join(
-                    value
-                    for value in (
-                        str(getattr(requirement, "objective", "") or "").strip(),
-                        str(getattr(requirement, "satisfaction_criterion", "") or "").strip(),
-                    )
-                    if value
-                )[:480] or None
-            return objective, max(1, min(4, int(getattr(visual_request, "selection_count", 1) or 1)))
-
-        admission_intent = external_intent
-        source_task = next(
-            (
-                item
-                for item in capability_requests
-                if getattr(item, "name", "") == "EXTERNAL_SOURCE" and bool(getattr(item, "required", False))
-            ),
-            None,
-        )
-        if native_task_plan and source_task is not None:
-            # The source task is the single authority, exactly as external_handler executes it.
-            admission_intent = self._validated_external_source_intent_for_message(
-                message,
-                _native_external_source_input(source_task, dict(getattr(source_task, "operands", None) or {})),
-                replied_message=replied_message,
-            )
-        native_url_edit = self._is_native_url_edit_plan(execution_plan, admission_intent)
-        native_transaction: dict[str, object] = {}
         prepared_live_watch_fixtures: dict[str, dict[str, Any]] = {}
 
         async def chat_handler(_request, _context):
             task_operands = _task_operands(_request, _context)
             objective = _task_objective(_request, task_operands)
-            if direct_chat is not None and len(capability_requests) == 1:
-                return normalize_terminal_result("CHAT", "PENDING", provider="orchestrator", reason="awaiting_response")
-            if not objective and direct_chat is None:
+            if not objective:
                 return _task_failure("CHAT", "missing_chat_task_objective")
             bound_lines: list[str] = []
             for binding in tuple(getattr(_request, "input_bindings", ()) or ()):
@@ -5771,26 +4623,19 @@ class AIChatCog(commands.Cog):
                 if bound_lines
                 else None
             )
-            # A CHAT task next to other tasks owns only its own objective (the final synthesis sees the whole request);
-            # a CHAT-only plan is the conversation itself.
-            chat_inputs = direct_chat if direct_chat is not None and len(capability_requests) == 1 else {
-                "user_message": objective,
-                "server_context": settings.server_context,
-                "conversation_history": [],
-                "conversation_mode": "command",
-            }
+            # A CHAT task owns only its own objective; the final answer sees the whole request.
             answer = await self.bot.llm_client.chat(
-                server_context=chat_inputs["server_context"],
-                user_message=chat_inputs["user_message"],
+                server_context=settings.server_context,
+                user_message=objective,
                 trusted_capability_context=trusted_context,
                 author_name=message.author.display_name,
                 channel_name=getattr(message.channel, "name", "unknown"),
                 channel_reference=self._channel_reference(message.channel),
                 available_channels=self._serialize_text_channels(message.guild),
                 available_emojis=self._serialize_custom_emojis(message.guild),
-                conversation_history=chat_inputs["conversation_history"],
+                conversation_history=[],
                 is_owner=self.bot.is_owner_user(message.author),
-                conversation_mode=chat_inputs["conversation_mode"],
+                conversation_mode="command",
                 reply_language=getattr(settings, "language_code", None),
                 author_permissions=self._author_permissions_text(message),
             )
@@ -5806,66 +4651,6 @@ class AIChatCog(commands.Cog):
                 satisfies_request=True,
             )
 
-        async def external_handler(_request, _context):
-            task_operands = _task_operands(_request, _context)
-            # The edit instruction belongs to the IMAGE_EDIT task that depends on this source task.
-            edit_request = next(
-                (
-                    item
-                    for item in capability_requests
-                    if getattr(item, "name", "") == "IMAGE_EDIT"
-                    and getattr(_request, "task_id", "") in tuple(getattr(item, "depends_on", ()) or ())
-                ),
-                None,
-            )
-            if native_url_edit and edit_request is not None:
-                task_prompt = _task_objective(edit_request, _task_operands(edit_request, _context))
-                if native_task_plan and not task_prompt:
-                    return _task_failure("EXTERNAL_SOURCE", "missing_url_edit_objective")
-                external_result, image_bytes, diagnostics = await self._execute_native_url_image_edit_result_only(
-                    message,
-                    task_prompt or image_operation_prompt or user_prompt,
-                    external_intent if not native_task_plan else self._validated_external_source_intent_for_message(
-                        message,
-                        _native_external_source_input(_request, task_operands),
-                        replied_message=replied_message,
-                    ),
-                    execution_plan,
-                    replied_message=replied_message,
-                )
-                if external_result.satisfies_request and isinstance(image_bytes, bytes):
-                    native_transaction.update(
-                        image_bytes=image_bytes,
-                        diagnostics=diagnostics,
-                        transaction_id=external_result.provenance.get("transaction_id"),
-                    )
-                return external_result
-            task_intent = external_intent
-            if native_task_plan:
-                task_intent = self._validated_external_source_intent_for_message(
-                    message, _native_external_source_input(_request, task_operands),
-                    replied_message=replied_message,
-                )
-            return await self._execute_external_source_result_only(
-                message, task_intent, replied_message=replied_message
-            )
-
-        async def web_handler(_request, _context):
-            task_operands = _task_operands(_request, _context)
-            task_objective = _task_objective(_request, task_operands)
-            if native_task_plan and not task_objective:
-                return _task_failure("WEB", "missing_web_task_objective")
-            task_visual_objective, task_selection_count = web_visual_for(
-                getattr(_request, "task_id", "") if native_task_plan else ""
-            )
-            return await self._execute_web_result_only(
-                message,
-                task_objective or user_prompt,
-                settings=settings,
-                visual_objective=task_visual_objective,
-                visual_selection_count=task_selection_count,
-            )
-
         async def image_handler(_request, context):
             task_operands = _task_operands(_request, context)
             request_source_refs = tuple(
@@ -5878,84 +4663,38 @@ class AIChatCog(commands.Cog):
                 for value in task_operands.get("media_urls", task_operands.get("image_urls", ())) or ()
                 if str(value).strip()
             )
-            continuation_source_kind = str(
-                task_operands.get("source_kind") or (image_source_kind if not native_task_plan else "none")
-            )
+            continuation_source_kind = str(task_operands.get("source_kind") or "none")
             continuation_source_message_id = task_operands.get("source_message_id")
             source_entries: tuple[dict[str, object], ...] = ()
-            if native_task_plan:
-                projection = self._image_source_projection(
-                    image_context
-                    or ChatImageContext(urls=[], from_replied_message=False, reaction_target=message)
+            projection = self._image_source_projection(
+                image_context
+                or ChatImageContext(urls=[], from_replied_message=False, reaction_target=message)
+            )
+            by_ref = {str(item["ref"]): item for item in projection}
+            dependency_satisfied = any(
+                getattr(context.results.get(dep), "satisfies_request", False)
+                for dep in tuple(getattr(_request, "depends_on", ()) or ())
+            )
+            if not request_source_refs and not dependency_satisfied:
+                return _task_failure("IMAGE_ANALYZE", "missing_image_task_source")
+            if request_source_refs and any(ref not in by_ref for ref in request_source_refs):
+                return _task_failure("IMAGE_ANALYZE", "invalid_image_source_ref")
+            if request_source_refs:
+                selection_limit = max(1, min(4, int(getattr(_request, "selection_count", 1) or 1)))
+                if len(request_source_refs) > selection_limit:
+                    return _task_failure("IMAGE_ANALYZE", "image_source_selection_exceeds_limit")
+                selected_entries = [by_ref[ref] for ref in request_source_refs]
+                continuation_media_urls = tuple(str(item["url"]) for item in selected_entries)
+                selected_kinds = {str(item["source_kind"]) for item in selected_entries}
+                selected_message_ids = {item["source_message_id"] for item in selected_entries}
+                continuation_source_kind = next(iter(selected_kinds)) if len(selected_kinds) == 1 else "mixed"
+                continuation_source_message_id = (
+                    next(iter(selected_message_ids)) if len(selected_message_ids) == 1 else None
                 )
-                by_ref = {str(item["ref"]): item for item in projection}
-                dependency_satisfied = any(
-                    getattr(context.results.get(dep), "satisfies_request", False)
-                    for dep in tuple(getattr(_request, "depends_on", ()) or ())
-                )
-                if not request_source_refs and not dependency_satisfied:
-                    return _task_failure("IMAGE_ANALYZE", "missing_image_task_source")
-                if request_source_refs and any(ref not in by_ref for ref in request_source_refs):
-                    return _task_failure("IMAGE_ANALYZE", "invalid_image_source_ref")
-                if request_source_refs:
-                    selection_limit = max(1, min(4, int(getattr(_request, "selection_count", 1) or 1)))
-                    if len(request_source_refs) > selection_limit:
-                        return _task_failure("IMAGE_ANALYZE", "image_source_selection_exceeds_limit")
-                    selected_entries = [by_ref[ref] for ref in request_source_refs]
-                    continuation_media_urls = tuple(str(item["url"]) for item in selected_entries)
-                    selected_kinds = {str(item["source_kind"]) for item in selected_entries}
-                    selected_message_ids = {item["source_message_id"] for item in selected_entries}
-                    continuation_source_kind = next(iter(selected_kinds)) if len(selected_kinds) == 1 else "mixed"
-                    continuation_source_message_id = (
-                        next(iter(selected_message_ids)) if len(selected_message_ids) == 1 else None
-                    )
-                    source_entries = tuple(selected_entries)
-            if continuation_source_message_id is None and not native_task_plan:
-                continuation_source_message_id = source_message_id
-            if not continuation_media_urls and not native_task_plan and prior_typed_context is not None:
-                _prior_plan, prior_bundle = prior_typed_context
-                prior_result = prior_bundle.by_capability.get("IMAGE_ANALYZE")
-                prior_payload = getattr(prior_result, "payload", None)
-                prior_urls = (
-                    tuple(str(value).strip() for value in prior_payload.get("media_urls", ()) if str(value).strip())
-                    if isinstance(prior_payload, dict)
-                    else ()
-                )
-                prior_identity = (
-                    getattr(prior_result, "scope", {}).get("context_identity")
-                    or getattr(prior_result, "provenance", {}).get("context_identity")
-                    if prior_result is not None
-                    else None
-                )
-                prior_source_message_id = (
-                    getattr(prior_result, "scope", {}).get("source_message_id")
-                    or getattr(prior_result, "provenance", {}).get("source_message_id")
-                    if prior_result is not None
-                    else None
-                )
-                if (
-                    prior_result is not None
-                    and prior_result.status == CapabilityTerminalStatus.SUCCESS
-                    and prior_result.satisfies_request
-                    and prior_result.provenance.get("authorized") is True
-                    and prior_urls
-                    and prior_identity == hash_text("|".join(prior_urls[:4]))
-                    and prior_source_message_id is not None
-                ):
-                    continuation_media_urls = prior_urls[:4]
-                    continuation_source_kind = str(
-                        prior_result.provenance.get("source_kind") or "current_message"
-                    )
-                    continuation_source_message_id = int(prior_source_message_id)
-            if native_task_plan and not continuation_media_urls and not getattr(_request, "input_bindings", ()):
-                if not any(
-                    getattr(context.results.get(dep), "satisfies_request", False)
-                    for dep in tuple(getattr(_request, "depends_on", ()) or ())
-                ):
-                    return _task_failure("IMAGE_ANALYZE", "missing_image_task_source")
+                source_entries = tuple(selected_entries)
             return await self._execute_image_analysis_result_only(
                 message,
-                _task_objective(_request, task_operands) or (user_prompt if not native_task_plan else ""),
+                _task_objective(_request, task_operands) or "",
                 context,
                 settings=settings,
                 fallback_media_urls=continuation_media_urls,
@@ -5968,64 +4707,40 @@ class AIChatCog(commands.Cog):
 
         async def football_handler(_request, _context):
             task_operands = _task_operands(_request, _context)
-            task_decision = football_decision
-            task_prompt = user_prompt
-            if native_task_plan:
-                if not task_operands:
-                    return _task_failure("FOOTBALL", "missing_football_task_operands")
-                task_prompt = _task_objective(_request, task_operands) or ""
-                family = str(task_operands.get("operation_family") or "")
-                task_action = (
-                    f"FOOTBALL_{family.upper()}"
-                    if family in FOOTBALL_MUTATING_OPERATIONS
-                    else str(getattr(_request, "owner_action", None) or "FOOTBALL_LOOKUP")
-                )
-                task_decision = RouteDecision(
-                    "RESPOND", task_action, 1.0, 1.0, "TYPED_TASK",
-                    resolved_request=task_prompt or None,
-                    capability_plan={
-                        "semantic_source": "router",
-                        "semantic_status": "SUCCESS",
-                        "primary_action": task_action,
-                        "football": dict(task_operands),
-                    },
-                )
-                task_action_upper = task_action.upper()
-                if task_action_upper in {"FOOTBALL_LIVE_WATCH_START", "FOOTBALL_LIVE_WATCH_STOP"}:
-                    return await self._execute_football_live_watch_result_only(
-                        message,
-                        task_decision,
-                        operands=task_operands,
-                        prepared_fixture=prepared_live_watch_fixtures.get(getattr(_request, "task_id", "")),
-                    )
-            if task_decision is None:
-                return normalize_terminal_result(
-                    "FOOTBALL",
-                    "VALIDATION_FAILED",
-                    provider="orchestrator",
-                    provenance={"source": "typed_capability_requirement"},
-                    reason="missing_football_route_decision",
+            if not task_operands:
+                return _task_failure("FOOTBALL", "missing_football_task_operands")
+            task_prompt = _task_objective(_request, task_operands) or ""
+            family = str(task_operands.get("operation_family") or "")
+            task_action = (
+                f"FOOTBALL_{family.upper()}"
+                if family in FOOTBALL_MUTATING_OPERATIONS
+                else str(getattr(_request, "owner_action", None) or "FOOTBALL_LOOKUP")
+            )
+            task_decision = RouteDecision(
+                "RESPOND", task_action, 1.0, 1.0, "TYPED_TASK",
+                resolved_request=task_prompt or None,
+                # Grok's catalog-validated operands go to the compiler as they are.
+                capability_plan={**task_operands, "semantic_source": "router"},
+            )
+            if task_action.upper() in {"FOOTBALL_LIVE_WATCH_START", "FOOTBALL_LIVE_WATCH_STOP"}:
+                return await self._execute_football_live_watch_result_only(
+                    message,
+                    task_decision,
+                    operands=task_operands,
+                    prepared_fixture=prepared_live_watch_fixtures.get(getattr(_request, "task_id", "")),
                 )
             return await self._execute_football_action(
                 message,
                 task_decision,
-                settings=settings,
-                lang=football_lang,
                 user_prompt=task_prompt,
                 anchor_type=football_anchor_type,
-                reply_to_trigger=football_reply_to_trigger,
-                create_lease=False,
-                result_only=True,
-                allow_web_fallback=False,
             )
 
         async def minecraft_handler(_request, _context):
             task_operands = _task_operands(_request, _context)
-            if native_task_plan and not task_operands.get("address"):
+            if not task_operands.get("address"):
                 return _task_failure("MINECRAFT", "missing_minecraft_address")
-            return await self._execute_minecraft_status_result_only(
-                task_operands if native_task_plan else (task_operands or getattr(semantic_plan, "minecraft", {})),
-            )
+            return await self._execute_minecraft_status_result_only(task_operands)
 
         async def ninjas_handler(_request, _context):
             return await self._execute_ninjas_result_only(_task_operands(_request, _context))
@@ -6048,31 +4763,14 @@ class AIChatCog(commands.Cog):
             task_operands = _task_operands(_request, _context)
             if is_memory_lifecycle(task_operands):
                 return await self._execute_memory_lifecycle_result_only(message, task_operands)
-            task_decision = memory_decision
-            if native_task_plan and not task_operands:
+            if not task_operands:
                 return _task_failure("MEMORY", "missing_memory_task_operands")
-            if isinstance(task_operands, dict) and task_operands:
-                # The task's own memory_action is the operation that preflight validated; it always wins.
-                task_action = str(
-                    task_operands.get("memory_action")
-                    or getattr(_request, "owner_action", None)
-                    or (task_decision.action if task_decision is not None else "")
-                ).upper()
-                if not task_action.startswith("SERVER_MEMORY_") and not native_task_plan:
-                    task_action = str(getattr(semantic_plan, "primary_action", "") or "").upper()
-                if task_action.startswith("SERVER_MEMORY_"):
-                    if task_decision is None or native_task_plan:
-                        task_decision = RouteDecision(
-                            "RESPOND",
-                            task_action,
-                            1.0,
-                            1.0,
-                            "SERVER_MEMORY_REQUEST",
-                            memory=dict(task_operands),
-                        )
-                    else:
-                        task_decision = replace(task_decision, action=task_action, memory=dict(task_operands))
-            if task_decision is None or task_decision.action not in {
+            # The task's own memory_action is the operation that preflight validated.
+            task_action = str(task_operands.get("memory_action") or getattr(_request, "owner_action", None) or "").upper()
+            task_decision = RouteDecision(
+                "RESPOND", task_action, 1.0, 1.0, "SERVER_MEMORY_REQUEST", memory=dict(task_operands),
+            )
+            if task_decision.action not in {
                 "SERVER_MEMORY_LOOKUP",
                 "SERVER_MEMORY_WRITE",
                 "SERVER_MEMORY_UPDATE",
@@ -6089,9 +4787,6 @@ class AIChatCog(commands.Cog):
                 message,
                 task_decision,
                 lang=memory_lang,
-                replied_message=replied_message,
-                reply_to_trigger=football_reply_to_trigger,
-                result_only=True,
             )
             if isinstance(result, CapabilityTerminalResult):
                 return result
@@ -6104,33 +4799,9 @@ class AIChatCog(commands.Cog):
 
         async def admin_handler(_request, _context):
             task_operands = _task_operands(_request, _context)
-            if native_task_plan and not task_operands:
+            if not task_operands:
                 return _task_failure("ADMIN", "missing_admin_task_operands")
-            if admin_decision is None or admin_decision.action != "ADMIN_ACTION" or native_task_plan:
-                if isinstance(task_operands, dict) and task_operands.get("admin_action"):
-                    task_decision = RouteDecision(
-                        "RESPOND",
-                        "ADMIN_ACTION",
-                        0.0,
-                        0.0,
-                        "ADMIN_ACTION_REQUEST",
-                        admin=dict(task_operands),
-                    )
-                else:
-                    return normalize_terminal_result(
-                        "ADMIN",
-                        "VALIDATION_FAILED",
-                        provider="orchestrator",
-                        provenance={"source": "typed_capability_requirement"},
-                        reason="missing_admin_stats_decision",
-                    )
-            else:
-                task_decision = admin_decision
-            if isinstance(task_operands, dict) and task_operands:
-                # Native task operands are the semantic authority for this
-                # handler; the route projection is only a legacy fallback.
-                task_decision = replace(task_decision, admin=dict(task_operands))
-            if task_decision is None:
+            if not task_operands.get("admin_action"):
                 return normalize_terminal_result(
                     "ADMIN",
                     "VALIDATION_FAILED",
@@ -6138,124 +4809,38 @@ class AIChatCog(commands.Cog):
                     provenance={"source": "typed_capability_requirement"},
                     reason="missing_admin_stats_decision",
                 )
-            result = await self._execute_admin_action(
+            task_decision = RouteDecision(
+                "RESPOND", "ADMIN_ACTION", 0.0, 0.0, "ADMIN_ACTION_REQUEST", admin=dict(task_operands),
+            )
+            return await self._execute_admin_action(
                 message,
                 task_decision,
                 lang=admin_lang,
-                replied_message=replied_message,
-                reply_to_trigger=football_reply_to_trigger,
-                result_only=True,
                 resolution_message=resolution_message,
-                native_task=native_task_plan,
-            )
-            if isinstance(result, CapabilityTerminalResult):
-                return result
-            return normalize_terminal_result(
-                "ADMIN",
-                result,
-                provider="admin_actions",
-                provenance={
-                    "source": "AdminActionService",
-                    "direct_delivery": True,
-                },
             )
 
         async def image_generate_handler(_request, _context):
             task_operands = _task_operands(_request, _context)
             prompt = _task_objective(_request, task_operands)
-            if native_task_plan and not prompt:
+            if not prompt:
                 return _task_failure("IMAGE_GENERATE", "missing_image_generation_objective")
-            return await self._execute_image_generation_result_only(prompt or image_operation_prompt)
+            return await self._execute_image_generation_result_only(prompt)
 
         async def image_edit_handler(_request, context):
-            if native_url_edit:
-                image_bytes = native_transaction.get("image_bytes")
-                if not isinstance(image_bytes, bytes):
-                    return normalize_terminal_result(
-                        "IMAGE_EDIT",
-                        "PROVIDER_FAILURE",
-                        provider="xai_responses",
-                        provenance={
-                            "source": "native_url_edit",
-                            "transaction_id": native_transaction.get("transaction_id"),
-                        },
-                        reason="native_image_artifact_unavailable",
-                    )
-                diagnostics = native_transaction.get("diagnostics")
-                diagnostic_values = dict(diagnostics) if isinstance(diagnostics, dict) else {}
-                return self._image_artifact_terminal_result(
-                    "IMAGE_EDIT",
-                    image_bytes,
-                    source="native_url_edit",
-                    filename="nitori_edited.png",
-                    provenance={
-                        "input_source_kind": "native_url_edit",
-                        "transaction_id": native_transaction.get("transaction_id"),
-                        "execution_path": "native_url_edit",
-                        **diagnostic_values,
-                    },
-                    scope={"transaction_id": native_transaction.get("transaction_id")},
-                )
             task_operands = _task_operands(_request, context)
-            bound_artifact = task_operands.get("artifact") if native_task_plan else None
-            edit_source_url = None if native_task_plan else image_edit_source_url
-            edit_source_kind = image_source_kind
-            edit_source_message_id = source_message_id
+            bound_artifact = task_operands.get("artifact")
+            edit_source_url = None
+            edit_source_kind = "none"
+            edit_source_message_id = None
             if isinstance(bound_artifact, bytes):
                 edit_source_url = "data:image/png;base64," + base64.b64encode(bound_artifact).decode("ascii")
                 edit_source_kind = "bound_artifact"
-            if not edit_source_url:
-                bound_media = task_operands.get("media")
-                selected_bound_media = next(
-                    (
-                        item
-                        for item in tuple(bound_media or ())
-                        if getattr(item, "is_authoritative", False)
-                        and str(getattr(item, "url", "") or "").strip()
-                    ),
-                    None,
-                )
-                if selected_bound_media is not None:
-                    edit_source_url = str(selected_bound_media.url).strip()
-                    edit_source_kind = "bound_external_source_media"
-                if native_task_plan and getattr(_request, "input_bindings", ()) and not edit_source_url:
-                    return _task_failure("IMAGE_EDIT", "bound_image_source_unavailable")
-            if edit_source_url is not None:
-                edit_source_url = str(edit_source_url).strip() or None
-            if not edit_source_url:
-                dependency_ids = tuple(getattr(_request, "depends_on", ()) or ())
-                external_result = next(
-                    (
-                        context.results.get(task_id)
-                        for task_id in dependency_ids
-                        if context.results.get(task_id) is not None
-                        and context.results[task_id].capability == "EXTERNAL_SOURCE"
-                    ),
-                    None,
-                )
-                if external_result is None and not native_task_plan:
-                    external_result = context.results.get("EXTERNAL_SOURCE")
-                external_bundle = (
-                    external_result.payload
-                    if external_result is not None
-                    and external_result.satisfies_request
-                    else None
-                )
-                selected_media = next(
-                    (
-                        media
-                        for media in getattr(external_bundle, "selected_media", ()) or ()
-                        if getattr(media, "is_authoritative", False)
-                        and str(getattr(media, "url", "") or "").strip()
-                    ),
-                    None,
-                )
-                if selected_media is not None:
-                    edit_source_url = str(selected_media.url).strip()
+            if getattr(_request, "input_bindings", ()) and not edit_source_url:
+                return _task_failure("IMAGE_EDIT", "bound_image_source_unavailable")
             prompt = _task_objective(_request, task_operands)
-            if native_task_plan and not prompt:
+            if not prompt:
                 return _task_failure("IMAGE_EDIT", "missing_image_edit_objective")
-            if native_task_plan and not edit_source_url:
+            if not edit_source_url:
                 selected_source, reason = self._selected_image_source(
                     _request, task_operands, image_context, message, "image_edit",
                 )
@@ -6265,7 +4850,7 @@ class AIChatCog(commands.Cog):
                 edit_source_kind = str(selected_source["source_kind"])
                 edit_source_message_id = selected_source.get("source_message_id")
             return await self._execute_image_edit_result_only(
-                prompt or image_operation_prompt,
+                prompt,
                 edit_source_url,
                 source_kind=edit_source_kind,
                 source_message_id=edit_source_message_id,
@@ -6284,29 +4869,20 @@ class AIChatCog(commands.Cog):
 
         async def reaction_handler(_request, _context):
             task_operands = _task_operands(_request, _context)
-            if native_task_plan and not task_operands:
+            if not task_operands:
                 return _task_failure("REACTION", "missing_reaction_task_operands")
-            task_decision = None if native_task_plan else reaction_decision
-            if isinstance(task_operands, dict) and task_operands:
-                emoji = task_operands.get("emoji")
-                emojis = task_operands.get("emojis")
-                if task_decision is None:
-                    task_decision = RouteDecision(
-                        "RESPOND",
-                        "ADD_REACTION",
-                        1.0,
-                        1.0,
-                        "REACTION_ACK",
-                        emoji=str(emoji) if emoji else None,
-                        emojis=tuple(str(value) for value in emojis if str(value).strip()) if isinstance(emojis, (list, tuple)) else (),
-                    )
-                else:
-                    task_decision = replace(
-                        task_decision,
-                        emoji=str(emoji) if emoji else (None if native_task_plan else task_decision.emoji),
-                        emojis=tuple(str(value) for value in emojis if str(value).strip()) if isinstance(emojis, (list, tuple)) else (() if native_task_plan else task_decision.emojis),
-                    )
-            if task_decision is None or not (task_decision.emoji or task_decision.emojis):
+            emoji = task_operands.get("emoji")
+            emojis = task_operands.get("emojis")
+            task_decision = RouteDecision(
+                "RESPOND",
+                "ADD_REACTION",
+                1.0,
+                1.0,
+                "REACTION_ACK",
+                emoji=str(emoji) if emoji else None,
+                emojis=tuple(str(value) for value in emojis if str(value).strip()) if isinstance(emojis, (list, tuple)) else (),
+            )
+            if not (task_decision.emoji or task_decision.emojis):
                 return normalize_terminal_result(
                     "REACTION",
                     "VALIDATION_FAILED",
@@ -6338,7 +4914,7 @@ class AIChatCog(commands.Cog):
             for request in tasks:
                 task_name = str(getattr(request, "name", "") or "").upper()
                 task_operands = _task_operands(request, _context)
-                if native_task_plan and not task_operands:
+                if not task_operands:
                     return f"{task_name.lower()} was called without arguments"
                 if task_name == "REACTION":
                     emoji = task_operands.get("emoji")
@@ -6381,7 +4957,6 @@ class AIChatCog(commands.Cog):
                         return False
                     if memory_type.startswith("USER_") and self._memory_subject_user_id(
                         resolution_message,
-                        replied_message,
                         task_operands,
                     ) is None:
                         return False
@@ -6463,21 +5038,11 @@ class AIChatCog(commands.Cog):
                 guild = message.guild
                 if guild is None:
                     return False
-                if admin_decision is None or admin_decision.action != "ADMIN_ACTION" or native_task_plan:
-                    if not isinstance(task_operands, dict) or not task_operands.get("admin_action"):
-                        return False
-                    task_decision = RouteDecision(
-                        "RESPOND",
-                        "ADMIN_ACTION",
-                        0.0,
-                        0.0,
-                        "ADMIN_ACTION_REQUEST",
-                        admin=dict(task_operands),
-                    )
-                else:
-                    task_decision = admin_decision
-                if isinstance(task_operands, dict) and task_operands:
-                    task_decision = replace(task_decision, admin=dict(task_operands))
+                if not task_operands.get("admin_action"):
+                    return False
+                task_decision = RouteDecision(
+                    "RESPOND", "ADMIN_ACTION", 0.0, 0.0, "ADMIN_ACTION_REQUEST", admin=dict(task_operands),
+                )
                 # A dependent channel target is not available until its create
                 # task runs; validate the binding below, not a name fallback.
                 if isinstance(task_operands, dict) and any(
@@ -6488,9 +5053,9 @@ class AIChatCog(commands.Cog):
                         task_decision,
                         admin={**dict(task_decision.admin or {}), "resource_handle": {"resource_type": "channel", "guild_id": getattr(guild, "id", None), "resource_id": 1}},
                     )
-                plan = self._coerce_admin_plan(task_decision.admin, native=native_task_plan)
+                plan = self._coerce_admin_plan(task_decision.admin)
                 if not plan.get("valid"):
-                    return False
+                    return plan.get("clarification_question") or False
                 action = str(plan.get("admin_action") or "").casefold()
                 if action in {"join_stats", "leave_stats"}:
                     authority = self._route_authority_metadata(message)
@@ -6556,20 +5121,26 @@ class AIChatCog(commands.Cog):
                             return False
                         role = None
                     else:
+                        # A refusal returns its message, so Grok can fix the arguments or tell the user why.
                         role = self._resolve_admin_target_role(resolution_message, plan, preflight_lang)
-                        if isinstance(role, str) or self._admin_actions._can_manage_role(guild, actor, role, preflight_lang) is not None:
-                            return False
+                        if isinstance(role, str):
+                            return role
+                        if refusal := self._admin_actions._can_manage_role(guild, actor, role, preflight_lang):
+                            return refusal.message
                     if action in {"add_role", "remove_role"}:
+                        # The member must exist; the role's position is the only limit, so the author may be the target.
                         target = await self._resolve_admin_target_member(resolution_message, plan, preflight_lang)
-                        if isinstance(target, str) or self._admin_actions._can_act_on_target(guild, actor, target, preflight_lang) is not None:
-                            return False
+                        if isinstance(target, str):
+                            return target
                     continue
                 if action in {"kick", "ban", "tempban", "mute", "tempmute", "unmute", "warn", "list_warnings", "remove_warning", "clear_warnings", "set_nickname"}:
                     target = await self._resolve_admin_target_member(resolution_message, plan, preflight_lang)
                     # Same rule as the service: only a nickname change may target the author.
                     self_ok = {"allow_self": True} if action == "set_nickname" else {}
-                    if isinstance(target, str) or self._admin_actions._can_act_on_target(guild, actor, target, preflight_lang, **self_ok) is not None:
-                        return False
+                    if isinstance(target, str):
+                        return target
+                    if refusal := self._admin_actions._can_act_on_target(guild, actor, target, preflight_lang, **self_ok):
+                        return refusal.message
                     permission = "manage_nicknames" if action == "set_nickname" else "moderate_members" if action in {"mute", "tempmute", "unmute", "warn", "list_warnings", "remove_warning", "clear_warnings"} else ("kick_members" if action == "kick" else "ban_members")
                     if not self._admin_actions._actor_has(actor, permission) or not self._admin_actions._has_perm(bot_member, permission):
                         return False
@@ -6640,7 +5211,7 @@ class AIChatCog(commands.Cog):
                         continue
                     channel = self._resolve_admin_target_channel(resolution_message, plan, preflight_lang)
                     if isinstance(channel, str):
-                        return False
+                        return channel
                     if action == "delete_channel" and getattr(channel, "id", None) == getattr(message.channel, "id", None):
                         return False
                     if (
@@ -6683,8 +5254,6 @@ class AIChatCog(commands.Cog):
 
         handlers = {
             "CHAT": chat_handler,
-            "EXTERNAL_SOURCE": external_handler,
-            "WEB": web_handler,
             "IMAGE_ANALYZE": image_handler,
             "FOOTBALL": football_handler,
             "MINECRAFT": minecraft_handler,
@@ -6708,18 +5277,6 @@ class AIChatCog(commands.Cog):
         if not requested_capabilities.issubset(set(handlers)):
             raise RuntimeError("stage4_result_only_handler_registry_mismatch")
         execution_context = execution_context or CapabilityExecutionContext(execution_plan)
-        if prior_typed_context is not None:
-            prior_plan, prior_bundle = prior_typed_context
-            reusable = reusable_results_for_continuation(
-                specialized_execution_plan,
-                prior_plan,
-                prior_bundle,
-                current_scope=current_scope,
-                fresh=True,
-                authorized=True,
-            )
-            for result in reusable.values():
-                execution_context.record(result)
         async def guarded_read(request, context):
             if request.task_id in context.evidence_requirements:
                 operands = _task_operands(request, context)
@@ -6755,38 +5312,20 @@ class AIChatCog(commands.Cog):
         message: discord.Message,
         decision: RouteDecision,
         *,
-        settings: object,
-        lang: str,
         user_prompt: str,
         anchor_type: str,
-        reply_to_trigger: bool,
-        create_lease: bool = True,
-        execution_context: CapabilityExecutionContext | None = None,
-        result_only: bool = False,
-        allow_web_fallback: bool = True,
-    ) -> object:
+    ) -> CapabilityTerminalResult:
         client = getattr(self.bot, "api_football_client", None)
         if client is None:
-            terminal_result = normalize_terminal_result(
+            return normalize_terminal_result(
                 "FOOTBALL",
                 "NOT_CONFIGURED",
                 provider="api-football",
                 provenance={"source": "client_configuration"},
                 reason="api_football_not_configured",
             )
-            if execution_context is not None:
-                execution_context.record(terminal_result)
-            if result_only:
-                return terminal_result
-            await self._send_long_reply(
-                message,
-                tr(lang, "API-Football is not configured.", "API-Football no esta configurada."),
-                reply_to_trigger=reply_to_trigger,
-                mention_author=True,
-            )
-            return "NOT_CONFIGURED"
         request = self._football_request_with_lease_context(message, user_prompt, anchor_type=anchor_type)
-        plan = self._football_plan_from_route_decision(decision)
+        plan = decision.capability_plan
         action = "FOOTBALL_LOOKUP"
         operation_request = request if plan is not None else ""
         lease_key = self._message_channel_key(message)
@@ -6803,8 +5342,6 @@ class AIChatCog(commands.Cog):
                 action, operation_request, plan, prior_context=prior_context,
             )
         except InvalidFootballApiRequest as exc:
-            if not result_only:
-                raise
             return normalize_terminal_result(
                 "FOOTBALL", "VALIDATION_FAILED", provider="football_compiler", reason=str(exc),
                 payload=FootballRetrievalResult(outcome=FootballOutcome.RESOLUTION_FAILED, notes=[str(exc)],
@@ -6828,71 +5365,26 @@ class AIChatCog(commands.Cog):
             [getattr(slot, "authority", None) for slot in operation.league_slots],
         )
         action = operation.route_action
-        league_key = None
-        league_id = None
-        season = None
-        entity_context = bool(
-            operation.league_slots
-            or operation.team_slots
-            or operation.player_slots
-            or operation.fixture_focus
-        )
         try:
-            fixtures: list[dict[str, Any]] = []
-            events: list[dict[str, Any]] = []
-            stats: list[dict[str, Any]] = []
-            lineups: list[dict[str, Any]] = []
-            endpoints = ["/leagues"] if league_id is not None else []
-            football_notes: list[str] = []
-            player_context_row: dict[str, Any] | None = None
-            player_stat_focus: str | None = None
-            team_context_row: dict[str, Any] | None = None
-            standing_row: dict[str, Any] | None = None
-            standings_table: list[dict[str, Any]] = []
-            generic_rows: list[dict[str, Any]] = []
-            generic_label: str | None = None
-            match_data = None
-            match_stat_key: str | None = None
-            football_entity_context: dict[str, object] | None = None
             data_focus = operation.data_focus
             logging.info(
-                "AI football plan action=%s operation=%s data_focus=%s league_candidates=%s team_candidates=%s player_candidates=%s selected_league=%s capability=%s",
+                "AI football plan action=%s operation=%s data_focus=%s league_candidates=%s team_candidates=%s player_candidates=%s capability=%s",
                 action,
                 operation.operation_type,
                 data_focus,
                 list(operation.league_candidates)[:4],
                 list(operation.team_candidates)[:4],
                 list(operation.player_candidates)[:4],
-                league_key,
                 getattr(operation.capability_intent, "operation_family", None),
             )
 
-            football_request_text = str(user_prompt or getattr(decision, "resolved_request", None) or "")
-            football_history = self._build_conversation_history(
-                self._conversation_key(getattr(message.guild, "id", 0), getattr(message.channel, "id", 0))
-            )[-8:]
-            football_service = FootballOperationService(
-                client,
-                player_canonicalizer=self._football_player_canonicalizer(),
-                player_alias_cache=self._football_player_alias_cache(),
-                player_selector=self._football_player_selector(
-                    request_text=football_request_text, history=football_history,
-                ),
-                identity_selector=self._football_identity_selector(
-                    request_text=football_request_text, history=football_history,
-                ),
-            )
+            # No nested Grok call picks a name here: on AMBIGUOUS or NOT_FOUND Grok sees the candidates and retries.
+            football_service = FootballOperationService(client, player_alias_cache=self._football_player_alias_cache())
             result = await football_service.execute(
                 operation,
-                league_id=league_id,
-                season=season,
+                league_id=None,
+                season=None,
                 data_focus=data_focus,
-            )
-            result = await self._apply_bounded_football_identity_repairs(
-                football_service, operation, result,
-                replan_method=getattr(getattr(self.bot, "llm_client", None), "replan_football_identity", None),
-                league_id=league_id, season=season, data_focus=data_focus,
-                request_text=football_request_text, history=football_history,
             )
             row_count, sample_digest, sample_length, compact_sample = self._football_standings_diagnostic(
                 result.standings_table
@@ -6906,114 +5398,15 @@ class AIChatCog(commands.Cog):
                 sample_length,
                 compact_sample,
             )
-            web_result: WebResearchResult | None = None
-            api_outcome = result.outcome
-            fallback_used = False
-            fallback_eligible = allow_web_fallback and football_web_fallback_eligible(result)
-            logging.info(
-                "AI football retrieval web fallback decision operation=%s outcome=%s eligible=%s "
-                "missing_inputs=%s ambiguity_count=%s resolved_entities=%s",
-                operation.operation_type,
-                api_outcome,
-                fallback_eligible,
-                list(result.missing_inputs),
-                len(result.ambiguity_candidates),
-                sorted(result.resolved_entities),
-            )
-            if fallback_eligible:
-                fallback_query = str(getattr(decision, "resolved_request", None) or user_prompt or "").strip()[:900]
-                if fallback_query:
-                    try:
-                        candidate_web_result = await self._web_research.research(
-                            WebResearchRequest(
-                                query=fallback_query,
-                                lookup_type="sports",
-                                max_sources=int(getattr(getattr(self.bot, "settings", None), "xai_web_search_max_sources", 3) or 3),
-                                request_date=self._football_request_temporal_context(message)[0],
-                            ),
-                            guild_id=getattr(message.guild, "id", None),
-                            user_id=getattr(message.author, "id", None),
-                        )
-                        if (
-                            not candidate_web_result.failure_reason
-                            and str(getattr(candidate_web_result, "answer", "") or "").strip()
-                            and (getattr(candidate_web_result, "sources", ()) or getattr(candidate_web_result, "citations", ()))
-                        ):
-                            web_result = candidate_web_result
-                            result.fallback_evidence = {
-                                "query": fallback_query,
-                                "answer": str(candidate_web_result.answer),
-                                "sources": [
-                                    {
-                                        "title": source.title,
-                                        "url": source.url,
-                                        "domain": source.domain,
-                                        "published_at": source.published_at,
-                                        "snippet": source.snippet,
-                                    }
-                                    for source in tuple(candidate_web_result.sources)[:3]
-                                ],
-                                "citations": list(tuple(candidate_web_result.citations)[:3]),
-                            }
-                            fallback_used = True
-                            logging.info(
-                                "AI football retrieval web fallback selected operation=%s api_outcome=%s source_count=%s resolved_entities=%s",
-                                operation.operation_type,
-                                api_outcome,
-                                len(result.fallback_evidence["sources"] or result.fallback_evidence["citations"]),
-                                list(result.resolved_entities),
-                            )
-                        else:
-                            logging.info(
-                                "AI football retrieval web fallback rejected operation=%s api_outcome=%s reason=missing_answer_or_source",
-                                operation.operation_type,
-                                api_outcome,
-                            )
-                    except Exception:
-                        logging.exception(
-                            "AI football retrieval web fallback failed operation=%s api_outcome=%s",
-                            operation.operation_type,
-                            api_outcome,
-                        )
             football_terminal_result = normalize_terminal_result(
                 "FOOTBALL",
-                "SUCCESS" if fallback_used else result.outcome,
-                provider="web-fallback" if fallback_used else "api-football",
+                result.outcome,
+                provider="api-football",
                 payload=result,
-                provenance={
-                    "source": "FootballRetrievalResult",
-                    "operation": operation.operation_type,
-                    "retrieval_mode": "web_fallback" if fallback_used else "api_football",
-                    "api_outcome": str(api_outcome),
-                },
+                provenance={"source": "FootballRetrievalResult", "operation": operation.operation_type},
                 scope=result.requested_scope,
-                reason=(
-                    "web_fallback_selected"
-                    if fallback_used
-                    else ";".join(result.notes[:2]) if result.outcome != FootballOutcome.SELECTED and result.notes else None
-                ),
+                reason=";".join(result.notes[:2]) if result.outcome != FootballOutcome.SELECTED and result.notes else None,
             )
-            if execution_context is not None:
-                execution_context.record(football_terminal_result)
-            fixtures = result.fixtures
-            events = result.events
-            stats = result.statistics
-            lineups = result.lineups
-            player_context_row = result.player_context_row
-            player_stat_focus = result.player_stat_focus
-            team_context_row = result.team_context_row
-            standing_row = result.standing_row
-            standings_table = result.standings_table
-            generic_rows = result.generic_rows
-            generic_label = result.generic_label
-            match_data = result.match_data
-            endpoints.extend(endpoint for endpoint in result.endpoints if endpoint not in endpoints)
-            football_notes.extend(result.notes)
-            football_entity_context = result.football_entity_context
-            if match_data is not None and operation.operation_type == "fixture_statistics":
-                match_stat_key = match_requested_stat(match_data.stats, operation.stat_focus or request)
-                if match_stat_key is None:
-                    football_notes.append("requested_stat_missing")
             logging.info(
                 "AI football retrieval action=%s operation=%s outcome=%s endpoints=%s notes=%s",
                 action,
@@ -7022,367 +5415,16 @@ class AIChatCog(commands.Cog):
                 result.endpoints,
                 result.notes[:5],
             )
-            if result_only:
-                return football_terminal_result
-            if result.outcome != FootballOutcome.SELECTED and not fallback_used:
-                terminal_payload = self._football_turn_payload_from_retrieval(
-                    football_entity_context=football_entity_context,
-                    match_data=match_data,
-                    fixtures=fixtures,
-                    requested_scope=result.requested_scope,
-                    outcome=str(result.outcome),
-                )
-                sent_message_id = await self._send_long_reply(
-                    message,
-                    self._football_terminal_outcome_message(result, operation, lang),
-                    reply_to_trigger=reply_to_trigger,
-                    mention_author=True,
-                )
-                if create_lease and terminal_payload:
-                    if execution_context is not None:
-                        self._publish_typed_continuation_context(
-                            message,
-                            last_bot_response_id=sent_message_id,
-                            action=action,
-                            resolved_request=request[:900],
-                            execution_context=execution_context,
-                        )
-                    else:
-                        self._create_or_renew_lease(message, last_bot_response_id=sent_message_id, action=action, resolved_request=request[:900])
-                    self._store_football_turn_context(message, last_bot_response_id=sent_message_id, action=action, payload=terminal_payload)
-                return str(result.outcome)
-
-            fixture_id = self._first_fixture_id(fixtures)
-
-            if match_data is not None:
-                context = json.dumps(
-                    {
-                        "label": action,
-                        "match": compact_match_data(match_data, stat_key=match_stat_key),
-                        "requested_stat": operation.stat_focus,
-                        "matched_stat_key": match_stat_key,
-                        "notes": football_notes,
-                    },
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )[:6000]
-            elif operation.operation_type in {"player_profile", "player_recent_stats", "player_current_team", "player_previous_team", "player_career_history"}:
-                context = build_player_context(
-                    label=action,
-                    player_row=player_context_row,
-                    stat_focus=player_stat_focus,
-                    fixtures=fixtures,
-                    extra_label=generic_label,
-                    extra_rows=generic_rows,
-                    notes=football_notes,
-                    source_endpoints=endpoints,
-                )
-            elif operation.operation_type == "standings":
-                context = build_standings_context(
-                    label=action,
-                    standings=standings_table,
-                    source_endpoints=endpoints,
-                )
-            elif operation.operation_type == "team_profile" and team_context_row is not None:
-                context = build_team_context(
-                    team=team_context_row,
-                    standings_row=standing_row,
-                    fixtures=fixtures,
-                    source_endpoints=endpoints,
-                )
-            elif generic_label is not None:
-                context = self._football_generic_context(
-                    label=generic_label,
-                    rows=generic_rows,
-                    team=team_context_row,
-                    notes=football_notes,
-                    source_endpoints=endpoints,
-                )
-            else:
-                context = build_fixture_context(
-                    label=action,
-                    fixtures=fixtures,
-                    events=events,
-                    statistics=stats,
-                    lineups=lineups,
-                    source_endpoints=endpoints,
-                )
-                if football_notes:
-                    context = f"{context}\nnotes={'; '.join(football_notes)[:800]}"
-            web_context = format_web_research_context(web_result) if web_result is not None else ""
-            grounded_prompt = (
-                football_web_grounding_prompt(request, context, web_context, language=lang)
-                if web_context
-                else football_grounding_prompt(request, context, language=lang)
-            )
-            enhanced_server_context = getattr(settings, "server_context", "")
-            reply = await self.bot.llm_client.chat(
-                server_context=enhanced_server_context,
-                user_message=grounded_prompt,
-                author_name=message.author.display_name,
-                channel_name=getattr(message.channel, "name", "unknown"),
-                channel_reference=self._channel_reference(message.channel),
-                available_channels=self._serialize_text_channels(message.guild),
-                available_emojis=self._serialize_custom_emojis(message.guild),
-                conversation_history=[],
-                mention_hints=[],
-                relay_instruction="",
-                is_owner=self.bot.is_owner_user(message.author),
-                conversation_mode="mention",
-                image_urls=[],
-                reply_language=lang,
-            )
+            return football_terminal_result
         except Exception:
             logging.exception("AI football action failed")
-            if result_only:
-                return normalize_terminal_result(
-                    "FOOTBALL",
-                    "PROVIDER_FAILURE",
-                    provider="api-football",
-                    provenance={"source": "football_handler"},
-                    reason="football_handler_exception",
-                )
-            if execution_context is not None and "FOOTBALL" not in execution_context.results:
-                execution_context.record(
-                    normalize_terminal_result(
-                        "FOOTBALL",
-                        "PROVIDER_FAILURE",
-                        provider="api-football",
-                        provenance={"source": "football_handler"},
-                        reason="football_handler_exception",
-                    )
-                )
-            await self._send_long_reply(
-                message,
-                tr(lang, "I cannot see that football detail right now.", "No me sale ese dato de futbol ahora mismo."),
-                reply_to_trigger=reply_to_trigger,
-                mention_author=True,
+            return normalize_terminal_result(
+                "FOOTBALL",
+                "PROVIDER_FAILURE",
+                provider="api-football",
+                provenance={"source": "football_handler"},
+                reason="football_handler_exception",
             )
-            return "PROVIDER_FAILURE"
-
-        guard_context = football_entity_context or self._football_guard_context_from_operation(operation)
-        reply = self._guard_football_entity_reply(reply, guard_context, self._football_prior_lease_context(message), lang)
-        sent_message_id = await self._send_long_reply(
-            message,
-            reply,
-            reply_to_trigger=reply_to_trigger,
-            mention_author=True,
-        )
-        if create_lease:
-            if execution_context is not None:
-                self._publish_typed_continuation_context(
-                    message,
-                    last_bot_response_id=sent_message_id,
-                    action=action,
-                    resolved_request=request[:900],
-                    execution_context=execution_context,
-                )
-            else:
-                self._create_or_renew_lease(message, last_bot_response_id=sent_message_id, action=action, resolved_request=request[:900])
-            self._store_football_turn_context(
-                message,
-                last_bot_response_id=sent_message_id,
-                action=action,
-                payload=self._football_turn_payload_from_retrieval(
-                    football_entity_context=football_entity_context,
-                    match_data=match_data,
-                    fixtures=fixtures,
-                ),
-            )
-        return "SUCCESS"
-
-    def _football_plan_from_route_decision(self, decision: RouteDecision) -> dict[str, Any] | None:
-        payload = decision.capability_plan if isinstance(decision.capability_plan, dict) else None
-        if not payload:
-            return None
-        return football_plan_from_route_payload(payload)
-
-    @staticmethod
-    def _football_turn_payload_from_retrieval(
-        *,
-        football_entity_context: dict[str, object] | None,
-        match_data: object | None,
-        fixtures: list[dict[str, Any]],
-        requested_scope: dict[str, Any] | None = None,
-        outcome: str | None = None,
-    ) -> dict[str, object] | None:
-        payload: dict[str, object] = dict(football_entity_context or {})
-        if requested_scope:
-            payload.setdefault("requested_scope", dict(requested_scope))
-        if outcome:
-            payload.setdefault("last_outcome", outcome)
-        if match_data is not None:
-            for attr, key in (
-                ("fixture_id", "fixture_id"),
-                ("status", "fixture_status"),
-                ("status_short", "fixture_status"),
-                ("selected_team_id", "team_id"),
-                ("selected_opponent_id", "opponent_id"),
-                ("fixture_date", "date_hint"),
-            ):
-                value = getattr(match_data, attr, None)
-                if value not in (None, "", [], {}):
-                    payload.setdefault(key, value)
-            selected_team_id = payload.get("team_id")
-            if selected_team_id == getattr(match_data, "home_team_id", None):
-                payload.setdefault("team_name", getattr(match_data, "home_team_name", ""))
-                payload.setdefault("opponent_name", getattr(match_data, "away_team_name", ""))
-            elif selected_team_id == getattr(match_data, "away_team_id", None):
-                payload.setdefault("team_name", getattr(match_data, "away_team_name", ""))
-                payload.setdefault("opponent_name", getattr(match_data, "home_team_name", ""))
-            else:
-                payload.setdefault("team_name", getattr(match_data, "home_team_name", ""))
-                payload.setdefault("opponent_name", getattr(match_data, "away_team_name", ""))
-        if fixtures:
-            fixture = fixtures[0] if isinstance(fixtures[0], dict) else {}
-            fixture_info = fixture.get("fixture") if isinstance(fixture, dict) else {}
-            league = fixture.get("league") if isinstance(fixture, dict) else {}
-            teams = fixture.get("teams") if isinstance(fixture, dict) else {}
-            if isinstance(fixture_info, dict):
-                payload.setdefault("fixture_id", fixture_info.get("id"))
-                status = fixture_info.get("status")
-                if isinstance(status, dict):
-                    payload.setdefault("fixture_status", status.get("short"))
-                payload.setdefault("date_hint", fixture_info.get("date"))
-            if isinstance(league, dict):
-                payload.setdefault("league_id", league.get("id"))
-                payload.setdefault("league_name", league.get("name"))
-            if isinstance(teams, dict):
-                home = teams.get("home") if isinstance(teams.get("home"), dict) else {}
-                away = teams.get("away") if isinstance(teams.get("away"), dict) else {}
-                if isinstance(home, dict):
-                    payload.setdefault("team_id", home.get("id"))
-                    payload.setdefault("team_name", home.get("name"))
-                if isinstance(away, dict):
-                    payload.setdefault("opponent_id", away.get("id"))
-                    payload.setdefault("opponent_name", away.get("name"))
-        return payload or None
-
-    def _guard_football_entity_reply(
-        self,
-        reply: str,
-        football_context: dict[str, object] | None,
-        prior_context: str | None,
-        lang: str,
-    ) -> str:
-        if not football_context:
-            return reply
-        active_name = str(football_context.get("player_name") or "").strip()
-        if not active_name:
-            return reply
-        prior_name = self._football_prior_player_name_from_context(prior_context)
-        if prior_name and football_resolver.normalize_key(prior_name) != football_resolver.normalize_key(active_name):
-            if self._football_reply_mentions_prior_player(reply, prior_name, active_name):
-                return tr(
-                    lang,
-                    f"I found validated API-Football context for {active_name}, but I will not mix it with an older player context.",
-                    f"Encontre contexto validado de API-Football para {active_name}, pero no lo voy a mezclar con otro jugador anterior.",
-                )
-        return reply
-
-    def _football_terminal_outcome_message(
-        self,
-        result: object,
-        operation: FootballQueryOperation,
-        lang: str,
-    ) -> str:
-        outcome = getattr(result, "outcome", None)
-        if outcome == FootballOutcome.AMBIGUOUS:
-            options = self._football_ambiguity_options(getattr(result, "ambiguity_candidates", []) or getattr(result, "generic_rows", []))
-            suffix = f" {options}" if options else ""
-            return tr(
-                lang,
-                f"I found more than one possible football match for that request.{suffix} Please be more specific.",
-                f"Encontre mas de una opcion posible para esa consulta de futbol.{suffix} Dime cual es.",
-            )
-        if outcome == FootballOutcome.NO_DATA_FOR_SCOPE:
-            return tr(
-                lang,
-                "I found the football entity, but API-Football does not have that data for the requested scope right now.",
-                "Encontre la entidad de futbol, pero API-Football no tiene ese dato para el alcance pedido ahora mismo.",
-            )
-        if outcome == FootballOutcome.NOT_FOUND:
-            missing = ", ".join(getattr(result, "missing_inputs", []) or [])
-            suffix = f" ({missing})" if missing else ""
-            return tr(
-                lang,
-                f"I could not find that football entity or fixture in API-Football.{suffix}",
-                f"No encontre esa entidad o partido en API-Football.{suffix}",
-            )
-        if outcome == FootballOutcome.UNSUPPORTED:
-            return tr(
-                lang,
-                "That football operation is not supported yet.",
-                "Esa operacion de futbol todavia no esta soportada.",
-            )
-        if outcome == FootballOutcome.UNSUPPORTED_BY_COVERAGE:
-            return tr(
-                lang,
-                "API-Football does not report this detail for the resolved competition scope.",
-                "API-Football no reporta este dato para el alcance de la competicion resuelta.",
-            )
-        if outcome == FootballOutcome.PROVIDER_FAILURE:
-            return tr(
-                lang,
-                "I could not retrieve that football detail right now.",
-                "No pude recuperar ese dato de futbol ahora mismo.",
-            )
-        missing = ", ".join(getattr(result, "missing_inputs", []) or [])
-        if not missing:
-            missing = operation.operation_type
-        return tr(
-            lang,
-            f"I need a clearer football input before I can look that up: {missing}.",
-            f"Necesito un dato de futbol mas claro antes de buscar eso: {missing}.",
-        )
-
-    @staticmethod
-    def _football_ambiguity_options(candidates: object) -> str:
-        if not isinstance(candidates, list):
-            return ""
-        labels: list[str] = []
-        for candidate in candidates[:5]:
-            if isinstance(candidate, dict) and "display_name" in candidate:
-                label = str(candidate.get("display_name") or "").strip()
-                extras = [str(candidate.get(key) or "").strip() for key in ("country", "nationality", "team", "league") if candidate.get(key)]
-                if extras:
-                    label = f"{label} ({', '.join(extras[:2])})"
-            elif isinstance(candidate, dict):
-                entity = candidate.get("player") or candidate.get("team") or candidate.get("league") or {}
-                label = str(entity.get("name") if isinstance(entity, dict) else "").strip()
-            else:
-                label = ""
-            if label:
-                labels.append(label)
-        return "Options: " + "; ".join(labels) if labels else ""
-
-    @staticmethod
-    def _football_guard_context_from_operation(operation: FootballQueryOperation) -> dict[str, object] | None:
-        if operation.player_slots:
-            return {"player_name": operation.player_slots[0].full_name}
-        return None
-
-    @staticmethod
-    def _football_reply_mentions_prior_player(reply: str, prior_name: str, active_name: str) -> bool:
-        reply_key = football_resolver.normalize_key(reply)
-        prior_key = football_resolver.normalize_key(prior_name)
-        if prior_key and prior_key in reply_key:
-            return True
-        active_tokens = set(AIChatCog._football_name_tokens(active_name))
-        return any(token not in active_tokens and token in AIChatCog._football_name_tokens(reply) for token in AIChatCog._football_name_tokens(prior_name))
-
-    @staticmethod
-    def _football_name_tokens(value: str) -> list[str]:
-        text = unicodedata.normalize("NFKD", str(value or ""))
-        text = "".join(ch for ch in text if not unicodedata.combining(ch))
-        return [token for token in re.findall(r"[a-z0-9]+", text.casefold()) if len(token) >= 4]
-
-    @staticmethod
-    def _football_prior_player_name_from_context(prior_context: str | None) -> str | None:
-        if not prior_context:
-            return None
-        match = re.search(r'"player_name"\s*:\s*"([^"]+)"', prior_context)
-        return match.group(1) if match else None
 
     def _football_prior_lease_context(self, message: discord.Message) -> str | None:
         turn_context = self._valid_football_turn_context(message)
@@ -7427,318 +5469,6 @@ class AIChatCog(commands.Cog):
             request_date = self._web_request_date(message)
         timezone_name = getattr(client, "timezone_name", None)
         return request_date[:32], str(timezone_name)[:80] if timezone_name else None
-
-    @staticmethod
-    def _football_identity_replan_candidate(
-        operation: FootballQueryOperation,
-        result: FootballRetrievalResult,
-        *,
-        raw: object | None = None,
-        repair_feedback: object | None = None,
-    ) -> FootballIdentityReplan | None:
-        if raw is None:
-            if result.outcome not in {FootballOutcome.NOT_FOUND, FootballOutcome.AMBIGUOUS}:
-                return None
-            feedback_slot = repair_feedback.get("failed_slot") if isinstance(repair_feedback, dict) else None
-            missing = set(result.missing_inputs)
-            if isinstance(feedback_slot, dict):
-                slot_kind, slot_index = feedback_slot.get("kind"), feedback_slot.get("index")
-                if (slot_kind not in {"team", "league"} or type(slot_index) is not int
-                        or slot_kind not in missing or result.outcome not in {FootballOutcome.NOT_FOUND, FootballOutcome.AMBIGUOUS}):
-                    return None
-            else:
-                if len(missing.intersection({"team", "league"})) != 1:
-                    return None
-                slot_kind = next(iter(missing.intersection({"team", "league"})))
-                slot_index = 0
-            slots = operation.team_slots if slot_kind == "team" else operation.league_slots
-            if not 0 <= slot_index < len(slots) or (not isinstance(feedback_slot, dict) and len(slots) != 1):
-                return None
-            if (
-                result.outcome == FootballOutcome.AMBIGUOUS
-                and not (
-                    slot_kind == "team"
-                    and not any(
-                        getattr(slot, "authority", None) != "PLANNER_INFERENCE"
-                        for slot in operation.league_slots
-                    )
-                )
-            ):
-                return None
-            return FootballIdentityReplan(
-                slot_kind=slot_kind,
-                slot_index=slot_index,
-                candidate_names=(slots[slot_index].name,),
-            )
-        if not isinstance(raw, dict):
-            return None
-        slot_kind = str(raw.get("slot_kind") or "").strip().casefold()
-        if slot_kind not in {"team", "league"}:
-            return None
-        if type(raw.get("slot_index")) is not int:
-            return None
-        slot_index = raw["slot_index"]
-        slots = operation.team_slots if slot_kind == "team" else operation.league_slots
-        if slot_index < 0 or slot_index >= len(slots):
-            return None
-        values = raw.get("candidate_names")
-        if not isinstance(values, list) or not 1 <= len(values) <= 3:
-            return None
-        names: list[str] = []
-        seen: set[str] = set()
-        for value in values:
-            name = " ".join(str(value or "").split())[:120]
-            if not name or re.search(r"\b(?:id|team_id|league_id|country_id)\s*[:=]?\s*\d+\b", name, re.IGNORECASE):
-                return None
-            key = football_resolver.normalize_key(name)
-            if key and key not in seen:
-                names.append(name)
-                seen.add(key)
-        if not names:
-            return None
-        if repair_feedback is not None:
-            failed = repair_feedback.get("failed_slot") if isinstance(repair_feedback, dict) else None
-            if (not isinstance(failed, dict) or failed.get("kind") != slot_kind
-                    or type(failed.get("index")) is not int or failed["index"] != slot_index):
-                return None
-            refs = raw.get("evidence_refs")
-            observed = repair_feedback.get("observed_candidates")
-            current_scope = repair_feedback.get("scope")
-            if not isinstance(refs, list) or len(refs) > 5 or not isinstance(observed, list) or not isinstance(current_scope, dict):
-                return None
-            if current_scope and (
-                set(current_scope) != {"league_id", "season"}
-                or type(current_scope.get("league_id")) is not int or current_scope["league_id"] <= 0
-                or type(current_scope.get("season")) is not int or current_scope["season"] <= 0
-            ):
-                return None
-            if any(
-                not isinstance(item, dict)
-                or item.get("entity_type") not in {"team", "league"}
-                or type(item.get("provider_id")) is not int or item["provider_id"] <= 0
-                or not isinstance(item.get("ref"), str)
-                or not item["ref"].startswith("fbref:")
-                or not isinstance(item.get("scope"), dict)
-                or (item["scope"] and (
-                    set(item["scope"]) != {"league_id", "season"}
-                    or type(item["scope"].get("league_id")) is not int or item["scope"]["league_id"] <= 0
-                    or type(item["scope"].get("season")) is not int or item["scope"]["season"] <= 0
-                ))
-                for item in observed
-            ):
-                return None
-            allowed = {
-                item.get("ref") for item in observed
-                if isinstance(item, dict) and item.get("entity_type") == slot_kind
-                and isinstance(item.get("ref"), str)
-                and (slot_kind != "team" or not current_scope or not item.get("scope") or item.get("scope") == current_scope)
-            }
-            if any(not isinstance(ref, str) or ref not in allowed for ref in refs) or len(set(refs)) != len(refs):
-                return None
-        scopes: list[FootballIdentityScopeCandidate] = []
-        scope_eligible = slot_kind == "team" and not any(
-            getattr(slot, "authority", None) != "PLANNER_INFERENCE"
-            for slot in operation.league_slots
-        )
-        if scope_eligible:
-            raw_scopes = raw.get("scope_candidates")
-            if raw_scopes is not None and not isinstance(raw_scopes, list):
-                return None
-            try:
-                for item in (raw_scopes or ())[:3]:
-                    if not isinstance(item, dict):
-                        return None
-                    if not item.get("league_name"):
-                        return None
-                    scopes.append(
-                        FootballIdentityScopeCandidate(
-                            league_name=item.get("league_name"),
-                            country_name=item.get("country_name"),
-                        )
-                    )
-            except (TypeError, ValueError):
-                return None
-        if not scopes and all(
-            football_resolver.normalize_key(name) == football_resolver.normalize_key(slots[slot_index].name)
-            for name in names
-        ):
-            logging.info("AI football identity repair skipped slot_kind=%s slot_index=%s reason=no_new_candidates", slot_kind, slot_index)
-            return None
-        return FootballIdentityReplan(
-            slot_kind=slot_kind,
-            slot_index=slot_index,
-            candidate_names=tuple(names),
-            scope_candidates=tuple(scopes),
-        )
-
-    async def _apply_bounded_football_identity_repairs(
-        self, service, operation, result, *, replan_method, league_id, season, data_focus,
-        request_text=None, history=None,
-    ):
-        if not callable(replan_method):
-            return result
-        first_feedback = result.repair_feedback
-        first = self._football_identity_replan_candidate(
-            operation, result, repair_feedback=first_feedback,
-        )
-        if first is None:
-            return result
-        raw = await self._request_football_identity_replan(
-            replan_method, operation, first, first_feedback,
-            provider_progress=self._football_repair_progress({}, {}),
-            request_text=request_text, history=history,
-        )
-        if raw is None:
-            return result
-        first = self._football_identity_replan_candidate(
-            operation, result, raw=raw, repair_feedback=first_feedback,
-        )
-        if first is None:
-            return result
-        candidate_result = await service.execute(
-            operation, league_id=league_id, season=season,
-            data_focus=data_focus, identity_replan=(first,),
-        )
-        if not self._football_repair_refs_match_result(first_feedback, raw, candidate_result, first.slot_kind):
-            return result
-
-        result = candidate_result
-        second_feedback = result.repair_feedback
-        second = self._football_identity_replan_candidate(
-            operation, result, repair_feedback=second_feedback,
-        )
-        progress = self._football_repair_progress(
-            first_feedback.get("resolved_entities", {}) if isinstance(first_feedback, dict) else {},
-            result.resolved_entities,
-            first_feedback.get("scope", {}) if isinstance(first_feedback, dict) else {},
-            second_feedback.get("scope", {}) if isinstance(second_feedback, dict) else {},
-        )
-        if (
-            second is None
-            or (second.slot_kind, second.slot_index) == (first.slot_kind, first.slot_index)
-            or not (progress["newly_resolved_entities"] or progress["newly_validated_scope"])
-        ):
-            return result
-        raw_second = await self._request_football_identity_replan(
-            replan_method, operation, second, second_feedback,
-            provider_progress=progress,
-            request_text=request_text, history=history,
-        )
-        if raw_second is None:
-            return result
-        second = self._football_identity_replan_candidate(
-            operation, result, raw=raw_second, repair_feedback=second_feedback,
-        )
-        if second is None or (second.slot_kind, second.slot_index) == (first.slot_kind, first.slot_index):
-            return result
-        final_result = await service.execute(
-            operation, league_id=league_id, season=season,
-            data_focus=data_focus, identity_replan=(first, second),
-        )
-        if (
-            self._football_repair_refs_match_result(first_feedback, raw, final_result, first.slot_kind)
-            and self._football_repair_refs_match_result(second_feedback, raw_second, final_result, second.slot_kind)
-        ):
-            return final_result
-        return result
-
-    @staticmethod
-    def _football_repair_refs_match_result(feedback, raw, result, slot_kind):
-        refs = raw.get("evidence_refs") if isinstance(raw, dict) else None
-        if not isinstance(refs, list):
-            return False
-        if not refs:
-            return True
-        observed = feedback.get("observed_candidates") if isinstance(feedback, dict) else None
-        if not isinstance(observed, list):
-            return False
-        resolved = result.resolved_entities if isinstance(getattr(result, "resolved_entities", None), dict) else {}
-        entity = resolved.get(slot_kind)
-        validated_feedback = result.repair_feedback if isinstance(getattr(result, "repair_feedback", None), dict) else {}
-        validated_scope = validated_feedback.get("scope") if isinstance(validated_feedback.get("scope"), dict) else {}
-        entity_id = entity.get("id") if isinstance(entity, dict) else None
-        if slot_kind == "league" and type(entity_id) is not int:
-            entity_id = validated_scope.get("league_id")
-        if type(entity_id) is not int:
-            return False
-        requested = result.requested_scope if isinstance(getattr(result, "requested_scope", None), dict) else {}
-        context = result.football_entity_context if isinstance(getattr(result, "football_entity_context", None), dict) else {}
-        league = resolved.get("league")
-        actual_league_id = league.get("id") if isinstance(league, dict) else requested.get("league_id")
-        if type(actual_league_id) is not int:
-            actual_league_id = context.get("league_id")
-        if type(actual_league_id) is not int:
-            actual_league_id = validated_scope.get("league_id")
-        actual_season = requested.get("season")
-        if type(actual_season) is not int:
-            actual_season = context.get("season")
-        if type(actual_season) is not int:
-            actual_season = validated_scope.get("season")
-        for item in observed:
-            if not isinstance(item, dict) or item.get("ref") not in refs or item.get("entity_type") != slot_kind:
-                continue
-            if type(item.get("provider_id")) is not int or item["provider_id"] != entity_id:
-                continue
-            scope = item.get("scope")
-            if not isinstance(scope, dict):
-                continue
-            if scope and (
-                set(scope) != {"league_id", "season"}
-                or type(scope.get("league_id")) is not int
-                or type(scope.get("season")) is not int
-                or type(actual_league_id) is not int
-                or type(actual_season) is not int
-                or actual_league_id != scope["league_id"]
-                or actual_season != scope["season"]
-            ):
-                continue
-            return True
-        return False
-
-    async def _request_football_identity_replan(
-        self, method, operation, replan, feedback, *, provider_progress,
-        request_text=None, history=None,
-    ):
-        return await method(
-            operation=operation.operation_type,
-            focus=operation.data_focus,
-            slot_kind=replan.slot_kind,
-            slot_index=replan.slot_index,
-            original_candidate=(operation.team_slots[replan.slot_index].name if replan.slot_kind == "team"
-                                else operation.league_slots[replan.slot_index].name),
-            other_participants=[slot.name for index, slot in enumerate(operation.team_slots)
-                                if replan.slot_kind == "team" and index != replan.slot_index],
-            league_candidates=list(operation.league_candidates),
-            country_candidates=list(operation.country_candidates),
-            date_hint=operation.date_hint,
-            season_hint=operation.season_hint,
-            repair_feedback=feedback,
-            provider_progress=provider_progress,
-            **({"request_text": request_text, "conversation_history": history} if request_text is not None else {}),
-        )
-
-    @staticmethod
-    def _football_repair_progress(
-        previous: object, current: object, previous_scope: object = None, current_scope: object = None,
-    ) -> dict[str, dict[str, object]]:
-        before = previous if isinstance(previous, dict) else {}
-        after = current if isinstance(current, dict) else {}
-        added = {
-            kind: {"id": value.get("id"), "display_name": str(value.get("display_name") or "")[:120]}
-            for kind, value in after.items()
-            if kind in {"team", "league"} and isinstance(value, dict)
-            and type(value.get("id")) is int
-            and (not isinstance(before.get(kind), dict) or type(before[kind].get("id")) is not int)
-        }
-        before_scope = previous_scope if isinstance(previous_scope, dict) else {}
-        after_scope = current_scope if isinstance(current_scope, dict) else {}
-        new_scope = {}
-        if (
-            not (type(before_scope.get("league_id")) is int and type(before_scope.get("season")) is int)
-            and type(after_scope.get("league_id")) is int and type(after_scope.get("season")) is int
-        ):
-            new_scope = {"league_id": after_scope["league_id"], "season": after_scope["season"]}
-        return {"newly_resolved_entities": added, "newly_validated_scope": new_scope}
 
     async def _execute_football_live_watch_result_only(
         self,
@@ -7967,57 +5697,6 @@ class AIChatCog(commands.Cog):
             cache = {}
             setattr(self.bot, "football_player_alias_cache", cache)
         return cache
-
-    def _football_player_canonicalizer(self):
-        method = getattr(getattr(self.bot, "llm_client", None), "canonicalize_football_player_query", None)
-        if method is None:
-            return None
-
-        async def _canonicalize(query: football_resolver.PlayerQuery) -> dict[str, Any] | None:
-            clean_query = query.candidates[0] if query.candidates else query.raw
-            return await method(
-                original_query=query.raw,
-                clean_query=clean_query,
-                stat_focus=query.stat_focus,
-            )
-
-        return _canonicalize
-
-    def _football_identity_selector(self, *, request_text: str, history: list[dict[str, str]]):
-        return football_resolver.make_identity_selector(
-            getattr(self.bot, "llm_client", None), request_text=request_text, history=history,
-        )
-
-    def _football_player_selector(self, *, request_text: str, history: list[dict[str, str]]):
-        return football_resolver.make_player_selector(
-            getattr(self.bot, "llm_client", None), request_text=request_text, history=history,
-        )
-
-    @staticmethod
-    def _football_generic_context(
-        *,
-        label: str,
-        rows: list[dict[str, Any]],
-        team: dict[str, Any] | None = None,
-        notes: list[str] | None = None,
-        source_endpoints: list[str] | None = None,
-    ) -> str:
-        payload = {
-            "label": label,
-            "team": team or {},
-            "rows": rows[:12],
-            "notes": notes or [],
-            "source_endpoints": source_endpoints or [],
-        }
-        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))[:6000]
-
-    @staticmethod
-    def _first_fixture_id(fixtures: list[dict[str, Any]]) -> int | None:
-        if not fixtures:
-            return None
-        fixture = fixtures[0].get("fixture") if isinstance(fixtures[0], dict) else {}
-        fixture_id = fixture.get("id") if isinstance(fixture, dict) else None
-        return fixture_id if isinstance(fixture_id, int) else None
 
     def _reaction_target_for_decision(
         self,
@@ -8497,50 +6176,7 @@ class AIChatCog(commands.Cog):
         )
 
 
-    async def _maybe_add_ai_reaction(
-        self,
-        *,
-        target: object,
-        reaction_key: tuple[int, int],
-        user_prompt: str,
-        assistant_reply: str,
-        channel_name: str,
-        available_emojis: list[str],
-        conversation_mode: str,
-    ) -> None:
-        if not hasattr(target, "add_reaction"):
-            return
-        if not self._consume_reaction_cooldown(reaction_key):
-            return
-        suggest_reaction = getattr(self.bot.llm_client, "suggest_reaction", None)
-        if suggest_reaction is None:
-            return
-        try:
-            reaction = await suggest_reaction(
-                user_message=user_prompt,
-                assistant_reply=assistant_reply,
-                channel_name=channel_name,
-                available_emojis=available_emojis,
-                conversation_mode=conversation_mode,
-            )
-            if not reaction:
-                return
-            emoji: str | discord.PartialEmoji = reaction
-            if reaction.startswith("<") and reaction.endswith(">"):
-                emoji = discord.PartialEmoji.from_str(reaction)
-            await target.add_reaction(emoji)
-        except (discord.Forbidden, discord.HTTPException):
-            logging.exception("Failed to add AI reaction")
-        except Exception:
-            logging.exception("AI reaction suggestion failed")
 
-    def _consume_reaction_cooldown(self, key: tuple[int, int]) -> bool:
-        now = time.monotonic()
-        next_allowed = self._reaction_cooldowns.get(key, 0.0)
-        if next_allowed > now:
-            return False
-        self._reaction_cooldowns[key] = now + self._reaction_cooldown_seconds
-        return True
 
     @staticmethod
     def _message_channel_key(message: discord.Message) -> tuple[int, int]:
@@ -8587,13 +6223,6 @@ class AIChatCog(commands.Cog):
             if same_user_history:
                 base = same_user_history
 
-        repair_candidate = self._valid_missed_response_candidate(message)
-        if repair_candidate is not None:
-            candidate_turn = {
-                "role": "user",
-                "content": f"{repair_candidate.author_name}: {repair_candidate.snippet}",
-            }
-            return [candidate_turn, *base[-27:]]
         return base[-28:]
 
     async def _persisted_parent_chain(
@@ -8754,146 +6383,6 @@ class AIChatCog(commands.Cog):
         if not normalized_evidence or normalized_evidence not in normalized_current:
             return VoiceResponseDecision(ResponseModality.TEXT, False, source="semantic_router", reason="voice_delivery_evidence_not_in_current_message")
         return VoiceResponseDecision(ResponseModality.VOICE, True, source="current_message", reason=semantic_reason or "explicit_voice_output_request")
-
-    def _validated_external_source_intent_for_message(
-        self,
-        message: discord.Message,
-        external_source: object,
-        *,
-        replied_message: discord.Message | None = None,
-        evidence_source: str | None = None,
-    ) -> ExternalSourceIntent:
-        if not isinstance(external_source, dict):
-            return ExternalSourceIntent(required=False, failure_reason="missing_external_source")
-        required = bool(external_source.get("required", False))
-        if not required:
-            return ExternalSourceIntent(required=False, semantic_reason=str(external_source.get("semantic_reason", "") or "not_required")[:240])
-        operation = self._external_enum(
-            ExternalSourceOperation,
-            external_source.get("operation"),
-            ExternalSourceOperation.UNSPECIFIED,
-        )
-        source_scope = self._external_enum(
-            ExternalSourceScope,
-            external_source.get("source_scope"),
-            ExternalSourceScope.UNSPECIFIED,
-        )
-        if evidence_source is not None:
-            expected_evidence_source = {
-                ExternalSourceScope.CURRENT_MESSAGE: "CURRENT_MESSAGE",
-                ExternalSourceScope.REPLY_TARGET: "EXPLICIT_REPLY_TARGET",
-                ExternalSourceScope.BOTH: "CURRENT_MESSAGE_AND_REPLY",
-            }.get(source_scope)
-            if expected_evidence_source != str(evidence_source).strip().upper():
-                return ExternalSourceIntent(
-                    required=False,
-                    failure_reason="external_source_evidence_scope_mismatch",
-                )
-        expected_content = self._external_enum(
-            ExternalExpectedContent,
-            external_source.get("expected_content"),
-            ExternalExpectedContent.UNKNOWN,
-        )
-        explicit = bool(external_source.get("explicit", False))
-        evidence = " ".join(str(external_source.get("evidence_span", "") or "").split())
-        semantic_reason = " ".join(str(external_source.get("semantic_reason", "") or "").split())[:240]
-        failure_reason = " ".join(str(external_source.get("failure_reason", "") or "").split())[:180]
-        ambiguous_reason = " ".join(str(external_source.get("ambiguous_reason", "") or "").split())[:180]
-        if not explicit:
-            return ExternalSourceIntent(required=False, failure_reason=failure_reason or "external_source_not_explicit")
-        if source_scope == ExternalSourceScope.UNSPECIFIED:
-            return ExternalSourceIntent(required=False, failure_reason="external_source_scope_unspecified")
-        if not evidence:
-            return ExternalSourceIntent(required=False, failure_reason="external_source_missing_evidence")
-        if failure_reason or ambiguous_reason:
-            return ExternalSourceIntent(required=False, failure_reason=failure_reason, ambiguous_reason=ambiguous_reason)
-        current_text = self._delivery_evidence_text_for_message(message)
-        current_urls = extract_urls(current_text, limit=getattr(self._external_sources, "max_sources", 3))
-        reply_authorized, reply_text = self._authorized_reply_source(message, replied_message)
-        reply_urls = extract_urls(reply_text, limit=getattr(self._external_sources, "max_sources", 3))
-        evidence_urls = extract_urls(evidence, limit=getattr(self._external_sources, "max_sources", 3))
-        authorized_urls = current_urls + reply_urls
-        evidence_failure_reason = (
-            "external_source_evidence_not_in_current_message"
-            if source_scope == ExternalSourceScope.CURRENT_MESSAGE
-            else "external_source_evidence_not_in_authorized_source"
-        )
-        normalized_evidence = self._normalize_delivery_evidence(evidence)
-        normalized_current = self._normalize_delivery_evidence(current_text)
-        normalized_reply = self._normalize_delivery_evidence(reply_text)
-        evidence_url_match = bool(set(evidence_urls).intersection(authorized_urls))
-        current_text_match = bool(normalized_evidence and normalized_evidence in normalized_current)
-        reply_text_match = bool(reply_authorized and normalized_evidence and normalized_evidence in normalized_reply)
-        validation_predicate = "accepted"
-        if evidence_urls and not evidence_url_match:
-            validation_predicate = "evidence_url_not_in_authorized_scope"
-        elif not evidence_urls and not (current_text_match or reply_text_match):
-            validation_predicate = "evidence_text_not_in_authorized_scope"
-        elif source_scope == ExternalSourceScope.CURRENT_MESSAGE and not current_urls:
-            validation_predicate = "current_message_url_missing"
-        elif source_scope == ExternalSourceScope.REPLY_TARGET and not reply_authorized:
-            validation_predicate = "reply_target_not_authorized"
-        elif source_scope == ExternalSourceScope.REPLY_TARGET and not reply_urls:
-            validation_predicate = "reply_target_url_missing"
-        elif source_scope == ExternalSourceScope.BOTH and not (current_urls or reply_urls):
-            validation_predicate = "authorized_scope_urls_missing"
-        logging.info(
-            "AI external source evidence guild=%s channel=%s message=%s reference_message_id=%s reply_resolved=%s reply_authorized=%s source_scope=%s current_url_count=%s reply_url_count=%s evidence_url_count=%s current_url_hashes=%s reply_url_hashes=%s evidence_url_hashes=%s evidence_url_match=%s current_text_match=%s reply_text_match=%s validation_predicate=%s",
-            getattr(message.guild, "id", None),
-            getattr(message.channel, "id", None),
-            getattr(message, "id", None),
-            getattr(getattr(message, "reference", None), "message_id", None),
-            replied_message is not None,
-            reply_authorized,
-            source_scope.value,
-            len(current_urls),
-            len(reply_urls),
-            len(evidence_urls),
-            tuple(hash_text(url) for url in current_urls),
-            tuple(hash_text(url) for url in reply_urls),
-            tuple(hash_text(url) for url in evidence_urls),
-            evidence_url_match,
-            current_text_match,
-            reply_text_match,
-            validation_predicate,
-        )
-        if evidence_urls:
-            if not evidence_url_match:
-                return ExternalSourceIntent(required=False, failure_reason=evidence_failure_reason)
-        else:
-            if not normalized_evidence or not (
-                current_text_match
-                or reply_text_match
-            ):
-                return ExternalSourceIntent(required=False, failure_reason=evidence_failure_reason)
-        has_current = bool(current_urls)
-        has_reply = bool(reply_urls)
-        if source_scope == ExternalSourceScope.CURRENT_MESSAGE and not has_current:
-            return ExternalSourceIntent(required=False, failure_reason="external_source_no_current_urls")
-        if source_scope == ExternalSourceScope.REPLY_TARGET and not reply_authorized:
-            return ExternalSourceIntent(required=False, failure_reason="external_source_no_reply_target")
-        if source_scope == ExternalSourceScope.REPLY_TARGET and not has_reply:
-            return ExternalSourceIntent(required=False, failure_reason="external_source_no_reply_urls")
-        if source_scope == ExternalSourceScope.BOTH and not (has_current or has_reply):
-            return ExternalSourceIntent(required=False, failure_reason="external_source_no_grounded_sources")
-        return ExternalSourceIntent(
-            required=True,
-            operation=operation,
-            source_scope=source_scope,
-            explicit=True,
-            evidence_span=evidence,
-            expected_content=expected_content,
-            semantic_reason=semantic_reason,
-            selected_urls=tuple(url for url in evidence_urls if url in authorized_urls),
-        )
-
-    @staticmethod
-    def _external_enum(enum_type: object, value: object, default: object) -> object:
-        try:
-            return enum_type(str(value or "").strip().upper())
-        except Exception:
-            return default
-
 
     def _remember_response_delivery_decision(self, message: discord.Message, route_decision: RouteDecision) -> None:
         message_id = getattr(message, "id", None)
@@ -9069,19 +6558,14 @@ class AIChatCog(commands.Cog):
                 or source_message_id is None
             ):
                 continue
-            selected = self._external_sources.select_vision_media(
-                self._external_sources.authorized_direct_media(media_urls, limit=len(media_urls)),
-                limit=len(media_urls),
-            )
-            selected_urls = tuple(str(item.url or "").strip() for item in selected if item.url)
-            if len(selected_urls) != len(media_urls) or identity != hash_text("|".join(selected_urls)):
+            if identity != hash_text("|".join(media_urls)):
                 continue
             try:
                 normalized_source_message_id = int(source_message_id)
             except (TypeError, ValueError):
                 continue
             return (
-                selected_urls,
+                media_urls,
                 str(result.provenance.get("source_kind") or "typed_media_artifact"),
                 normalized_source_message_id,
             )
@@ -9254,7 +6738,8 @@ class AIChatCog(commands.Cog):
             return None
         if len(cleaned) > self._history_entry_max_chars:
             cleaned = cleaned[: self._history_entry_max_chars - 15] + " [text omitted]"
-        prefixed = f"{speaker}: {cleaned}"
+        # The assistant role already names the bot; a name label in its text gets copied into new replies.
+        prefixed = cleaned if role == "assistant" else f"{speaker}: {cleaned}"
         history = self._conversation_history[key]
         if history:
             last = history[-1]
@@ -9344,6 +6829,7 @@ class AIChatCog(commands.Cog):
             len(parts),
         )
         allowed_mentions = discord.AllowedMentions(users=True, roles=True, everyone=False)
+        # Cited links stay clickable without Discord preview cards, so a sourced answer stays compact.
         if send_mode is None:
             send_mode = "reply_to_trigger" if (True if reply_to_trigger is None else reply_to_trigger) else "normal"
         should_reply = send_mode in {"reply_to_trigger", "force_reply"}
@@ -9356,6 +6842,7 @@ class AIChatCog(commands.Cog):
                     **({"files": files} if files else {"file": attachment} if attachment is not None else {}),
                     mention_author=mention_author,
                     allowed_mentions=allowed_mentions,
+                    suppress_embeds=True,
                     delete_after=delete_after,
                 )
             except Exception:
@@ -9369,6 +6856,7 @@ class AIChatCog(commands.Cog):
                     parts[0],
                     **({"files": files} if files else {"file": attachment} if attachment is not None else {}),
                     allowed_mentions=allowed_mentions,
+                    suppress_embeds=True,
                     delete_after=delete_after,
                 )
         else:
@@ -9376,6 +6864,7 @@ class AIChatCog(commands.Cog):
                 parts[0],
                 **({"files": files} if files else {"file": attachment} if attachment is not None else {}),
                 allowed_mentions=allowed_mentions,
+                suppress_embeds=True,
                 delete_after=delete_after,
             )
         if on_first_delivery is not None:
@@ -9386,6 +6875,7 @@ class AIChatCog(commands.Cog):
             extra = await trigger_message.channel.send(
                 part,
                 allowed_mentions=allowed_mentions,
+                suppress_embeds=True,
             )
             self._remember_chat_response_message(extra.id)
         return first if attachment is not None or files else int(first.id)
@@ -9574,77 +7064,12 @@ class AIChatCog(commands.Cog):
                 break
         return serialized
 
-    @staticmethod
-    def _normalize_target_language(raw_language: str) -> str | None:
-        normalized = raw_language.strip().lower()
-        normalized = normalized.replace("_", " ").replace("-", " ")
-        normalized = " ".join(normalized.split())
-        return TRANSLATE_LANGUAGE_ALIASES.get(normalized)
 
     @staticmethod
     def _translate_usage_message(lang: str) -> str:
-        choices = ", ".join(SUPPORTED_TRANSLATE_LANGUAGES)
-        return tr(
-            lang,
-            (
-                "**Supported translation languages**\n"
-                f"`{choices}`\n"
-                "Use:\n"
-                "- `/translate <language> [text]`"
-            ),
-            (
-                "**Idiomas soportados para traduccion**\n"
-                f"`{choices}`\n"
-                "Usa:\n"
-                "- `/translate <idioma> [texto]`"
-            ),
-        )
+        return tr(lang, "Use: `/translate <language> [text]`", "Usa: `/translate <idioma> [texto]`")
 
-    def _is_same_language(self, text: str, target_language: str) -> bool:
-        detected = self._detect_text_language(text)
-        return detected == target_language
 
-    @staticmethod
-    def _detect_text_language(text: str) -> str | None:
-        raw = text.strip()
-        if not raw:
-            return None
-
-        if re.search(r"[\u3040-\u30ff\u31f0-\u31ff\u4e00-\u9fff]", raw):
-            return "japanese"
-        if re.search(r"[\u0400-\u04FF]", raw):
-            return "russian"
-
-        lowered = raw.lower()
-        tokens = re.findall(r"[a-zA-Z']+", lowered)
-        if len(tokens) < 2:
-            return None
-
-        stopwords: dict[str, set[str]] = {
-            "english": {"the", "and", "you", "are", "is", "this", "that", "with", "for", "what", "how"},
-            "spanish": {"el", "la", "los", "las", "que", "como", "con", "para", "por", "estoy", "estas"},
-            "german": {"der", "die", "das", "und", "ist", "ich", "nicht", "mit", "du", "wie", "was"},
-            "french": {"le", "la", "les", "et", "est", "que", "avec", "pour", "pas", "comment", "quoi"},
-            "italian": {"il", "lo", "la", "gli", "le", "e", "che", "con", "per", "come", "sono"},
-            "portuguese": {"o", "a", "os", "as", "e", "que", "com", "para", "como", "voce"},
-        }
-
-        scores = {lang: 0.0 for lang in stopwords.keys()}
-        for token in tokens:
-            for lang, words in stopwords.items():
-                if token in words:
-                    scores[lang] += 1.0
-
-        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-        if not ranked:
-            return None
-        best_lang, best_score = ranked[0]
-        second_score = ranked[1][1] if len(ranked) > 1 else 0.0
-        if best_score < 2.0:
-            return None
-        if best_score - second_score < 1.0:
-            return None
-        return best_lang
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(AIChatCog(bot))

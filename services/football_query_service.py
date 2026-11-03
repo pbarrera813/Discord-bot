@@ -515,7 +515,6 @@ def compile_football_operation(
         allow_static_alias=not typed_plan,
     ))
     capability_intent = _capability_intent_from_request(
-        request,
         operation_type=operation_type,
         data_focus=data_focus,
         time_scope=time_scope,
@@ -905,7 +904,8 @@ def clean_entity_candidates(
         key = football_resolver.normalize_key(cleaned)
         if not cleaned or not key or key in seen:
             continue
-        if looks_like_raw_sentence(cleaned, original_request):
+        # Typed names from Grok or validated context are taken as given; only text-parsed candidates are screened.
+        if not allow_contextual and looks_like_raw_sentence(cleaned, original_request):
             logging.info(
                 "AI football raw sentence candidate rejected kind=%s candidate_hash=%s",
                 kind,
@@ -1697,7 +1697,6 @@ def _time_scope(
 
 
 def _capability_intent_from_request(
-    request: str,
     *,
     operation_type: str,
     data_focus: str | None,
@@ -1711,46 +1710,22 @@ def _capability_intent_from_request(
         temporal = temporal or "past_or_date"
     elif operation_type == "fixture_live":
         temporal = "live"
-    evidence = _capability_evidence(request, data_focus, operation_type)
     planner_operation = _text(plan, "operation") or _text(plan, "intent")
     planner_data_focus = _text(plan, "data_focus")
     return FootballCapabilityIntent(
         operation_family=operation_type,
         data_focus=data_focus,
         temporal_semantics=temporal,
-        requested_subscope=_requested_subscope_for_focus(data_focus, request),
-        evidence=evidence,
         planner_operation=planner_operation,
         planner_data_focus=planner_data_focus,
         planner_accepted=bool(planner_data_focus and str(planner_data_focus).casefold() == str(data_focus or "").casefold()),
     )
 
 
-def _capability_evidence(request: str, data_focus: str | None, operation_type: str) -> str | None:
-    lowered = _normalize_words_text(request)
-    focus = str(data_focus or "").casefold()
-    for key, markers in _CAPABILITY_MARKERS.items():
-        if focus == key or operation_type.startswith(key):
-            for marker in markers:
-                if marker in lowered:
-                    return marker
-    return None
-
 
 def _capability_marker_present(normalized_text: str, focus: str) -> bool:
     return _has_any(normalized_text, _CAPABILITY_MARKERS.get(focus, ()))
 
-
-def _requested_subscope_for_focus(data_focus: str | None, request: str) -> str | None:
-    lowered = _normalize_words_text(request)
-    focus = str(data_focus or "").casefold()
-    if focus == "shootout" and _has_any(lowered, ("tirador", "cobrador", "attempt", "intento")):
-        return "shootout_attempts"
-    if focus == "shootout":
-        return "shootout_aggregate"
-    if focus in {"odds", "live_odds"}:
-        return focus
-    return None
 
 
 def _stat_focus_from_text(text: str) -> str | None:
@@ -1843,10 +1818,7 @@ def _text(plan: dict[str, Any] | None, key: str) -> str | None:
     value = plan.get(key)
     if not isinstance(value, str):
         return None
-    cleaned = " ".join(value.split())[:160]
-    if not cleaned or looks_like_raw_sentence(cleaned, None):
-        return None
-    return cleaned
+    return " ".join(value.split())[:160] or None
 
 
 def _int(plan: dict[str, Any] | None, key: str) -> int | None:

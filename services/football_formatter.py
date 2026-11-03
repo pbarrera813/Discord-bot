@@ -36,17 +36,6 @@ def fixture_teams(item: dict[str, Any]) -> tuple[str, str]:
     return str(home_name or "Unknown"), str(away_name or "Unknown")
 
 
-def fixture_team_logos(item: dict[str, Any]) -> tuple[str | None, str | None]:
-    teams = item.get("teams")
-    if not isinstance(teams, dict):
-        return None, None
-    home = teams.get("home")
-    away = teams.get("away")
-    home_logo = home.get("logo") if isinstance(home, dict) else None
-    away_logo = away.get("logo") if isinstance(away, dict) else None
-    return _clean_url(home_logo), _clean_url(away_logo)
-
-
 def fixture_score(item: dict[str, Any]) -> str:
     goals = item.get("goals")
     if not isinstance(goals, dict):
@@ -85,23 +74,3 @@ def _timezone_label(value: datetime) -> str:
     name = value.tzname()
     return name or ""
 
-
-def format_fixture_line(item: dict[str, Any]) -> tuple[str, str]:
-    fixture = item.get("fixture")
-    if not isinstance(fixture, dict):
-        fixture = {}
-    home, away = fixture_teams(item)
-    score = fixture_score(item)
-    status = fixture_status(fixture)
-    round_name = fixture_round(item)
-    title = f"{home} vs {away}"
-    details = f"**{score}**\n{status}"
-    if round_name:
-        details = f"{details}\n{round_name}"
-    return title, details
-
-
-def _clean_url(value: object) -> str | None:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
