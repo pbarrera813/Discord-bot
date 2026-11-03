@@ -937,6 +937,7 @@ def pick_player_identity(
     requested_first = normalize_key(requested.first_name)
     requested_last = normalize_key(requested.last_name)
     has_explicit_first = bool(requested_first)
+    requested_first_words = _ascii_words(requested.first_name)
     scored: list[tuple[int, dict[str, Any]]] = []
     plausible: list[dict[str, Any]] = []
     for row in players:
@@ -951,6 +952,11 @@ def pick_player_identity(
         display_first_key = normalize_key(name_words[0] if len(name_words) >= 2 else None)
         display_last_key = normalize_key(name_words[-1] if name_words else None)
         first_key = profile_first_key or display_first_key
+        # The provider's firstname can hold every given name ("Cristiano Ronaldo"): the typed first name is its leading words.
+        first_match = bool(requested_first) and (
+            first_key == requested_first
+            or _ascii_words(player.get("firstname"))[:len(requested_first_words)] == requested_first_words
+        )
         last_key = profile_last_key or display_last_key
         initial_match = bool(
             has_explicit_first
@@ -958,7 +964,7 @@ def pick_player_identity(
             and len(display_first_key) == 1
             and requested_first.startswith(display_first_key)
         )
-        if has_explicit_first and first_key and first_key != requested_first and not initial_match:
+        if has_explicit_first and first_key and not first_match and not initial_match:
             continue
         score = 0
         profile_full_key = normalize_key(f"{player.get('firstname') or ''} {player.get('lastname') or ''}".strip())
@@ -966,7 +972,7 @@ def pick_player_identity(
             score += 70
         elif requested_full and (requested_full in name_key or requested_full in profile_full_key):
             score += 45
-        if requested_first and first_key == requested_first:
+        if first_match:
             score += 20
         elif initial_match:
             score += 20

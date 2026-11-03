@@ -287,12 +287,11 @@ class AdminActionService:
         reason: str | None = None,
         lang: str = "en",
     ) -> AdminActionResult:
+        # Like Discord, a role change is limited by the role's position (checked here), not by who receives it,
+        # so the author may change their own roles; moderation actions still refuse a self target.
         role_error = self._can_manage_role(guild, actor, role, lang)
         if role_error is not None:
             return role_error
-        target_error = self._can_act_on_target(guild, actor, target, lang)
-        if target_error is not None:
-            return target_error
         if role in getattr(target, "roles", ()):
             return AdminActionResult(False, tr(lang, f"{target.mention} already has {role.mention}.", f"{target.mention} ya tiene {role.mention}."), "role_already_assigned")
         reason_text = reason or tr(lang, "No reason provided.", "Sin razon proporcionada.")
@@ -315,12 +314,10 @@ class AdminActionService:
         reason: str | None = None,
         lang: str = "en",
     ) -> AdminActionResult:
+        # The role's position is the limit, as in add_role.
         role_error = self._can_manage_role(guild, actor, role, lang)
         if role_error is not None:
             return role_error
-        target_error = self._can_act_on_target(guild, actor, target, lang)
-        if target_error is not None:
-            return target_error
         if role not in getattr(target, "roles", ()):
             return AdminActionResult(False, tr(lang, f"{target.mention} does not have {role.mention}.", f"{target.mention} no tiene {role.mention}."), "role_not_assigned")
         reason_text = reason or tr(lang, "No reason provided.", "Sin razon proporcionada.")

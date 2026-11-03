@@ -3127,10 +3127,7 @@ class ModerationCog(commands.Cog):
         if not can_role:
             await self._safe_send(ctx, role_msg)
             return
-        can_member, member_msg = self._can_moderate(ctx.guild, actor, member, lang)
-        if not can_member:
-            await self._safe_send(ctx, member_msg)
-            return
+        # The role's position is the only limit, so a member may change their own roles.
         if role_obj in member.roles:
             await self._safe_send(
                 ctx,
@@ -3212,10 +3209,7 @@ class ModerationCog(commands.Cog):
         if not can_role:
             await self._safe_send(ctx, role_msg)
             return
-        can_member, member_msg = self._can_moderate(ctx.guild, actor, member, lang)
-        if not can_member:
-            await self._safe_send(ctx, member_msg)
-            return
+        # The role's position is the only limit, so a member may change their own roles.
         if role_obj not in member.roles:
             await self._safe_send(
                 ctx,

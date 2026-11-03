@@ -5,7 +5,6 @@ from datetime import date, timedelta
 from enum import StrEnum
 import logging
 import re
-import secrets
 from typing import Any, Awaitable, Callable
 import unicodedata
 
@@ -31,8 +30,6 @@ from services.football_api_request_compiler import (
     build_trophy_request,
     build_transfer_request,
     build_venue_search_request,
-    _make_country_slot,
-    _make_league_slot,
     make_validated_date,
 )
 from services.football_live_match_service import FootballLiveMatchService, MatchData, build_match_data, compact_match_data, filter_fixtures, fixture_team_ids, normalize_match_statistics
@@ -90,52 +87,9 @@ class FootballRetrievalResult:
     missing_inputs: list[str] = field(default_factory=list)
     requested_scope: dict[str, Any] = field(default_factory=dict)
     resolved_entities: dict[str, Any] = field(default_factory=dict)
-    fallback_evidence: dict[str, Any] | None = None
-    repair_observations: list[dict[str, Any]] = field(default_factory=list)
-    repair_scope_observations: list[dict[str, Any]] = field(default_factory=list)
-    repair_failed_slots: list[dict[str, Any]] = field(default_factory=list)
-    repair_feedback: dict[str, Any] = field(default_factory=dict)
 
 
 FootballPlayerCanonicalizer = Callable[[football_resolver.PlayerQuery], Awaitable[dict[str, Any] | None]]
-
-
-@dataclass(frozen=True)
-class FootballIdentityScopeCandidate:
-    league_name: str | None = None
-    country_name: str | None = None
-
-    def __post_init__(self) -> None:
-        for field_name in ("league_name", "country_name"):
-            value = getattr(self, field_name)
-            if value is None:
-                continue
-            cleaned = " ".join(str(value).split())
-            if not cleaned or len(cleaned) > 120 or any(ord(ch) < 32 for ch in cleaned):
-                raise ValueError("invalid football identity scope candidate")
-            if re.search(r"\b(?:id|team_id|league_id|country_id)\s*[:=]?\s*\d+\b", cleaned, re.IGNORECASE):
-                raise ValueError("football identity scope candidate cannot contain IDs")
-            object.__setattr__(self, field_name, cleaned)
-        if self.league_name is None and self.country_name is None:
-            raise ValueError("football identity scope candidate is empty")
-
-
-@dataclass(frozen=True)
-class FootballIdentityReplan:
-    slot_kind: str
-    slot_index: int
-    candidate_names: tuple[str, ...]
-    scope_candidates: tuple[FootballIdentityScopeCandidate, ...] = ()
-
-    def __post_init__(self) -> None:
-        if self.slot_kind not in {"team", "league"}:
-            raise ValueError("unsupported football identity replan slot")
-        if self.slot_index < 0 or not self.candidate_names or len(self.candidate_names) > 3:
-            raise ValueError("invalid football identity replan")
-        if len(self.scope_candidates) > 3:
-            raise ValueError("invalid football identity replan scopes")
-        if any(not isinstance(item, FootballIdentityScopeCandidate) for item in self.scope_candidates):
-            raise ValueError("invalid football identity replan scope type")
 
 
 @dataclass(frozen=True)
@@ -183,36 +137,8 @@ class FootballTeamLeagueResolution:
     season: int | None = None
     outcome: FootballOutcome = FootballOutcome.NOT_FOUND
     candidates: tuple[dict[str, Any], ...] = ()
-    observed_candidates: tuple[dict[str, Any], ...] = ()
-    observed_scopes: tuple[dict[str, int], ...] = ()
-    failed_slot_indices: tuple[int, ...] = ()
     note: str = "current_league_not_found"
 
-
-def football_web_fallback_eligible(result: FootballRetrievalResult) -> bool:
-    """Decide fallback from typed provider state only; request text is irrelevant."""
-
-    if result.outcome not in {
-        FootballOutcome.NOT_FOUND,
-        FootballOutcome.NO_DATA_FOR_SCOPE,
-        FootballOutcome.UNSUPPORTED_BY_COVERAGE,
-        FootballOutcome.PROVIDER_FAILURE,
-    }:
-        return False
-    if result.missing_inputs or result.ambiguity_candidates:
-        return False
-    plan = result.requested_scope.get("request_plan")
-    if not isinstance(plan, dict):
-        return False
-    required_slots = plan.get("fallback_required_slots", plan.get("required_slots", []))
-    if not isinstance(required_slots, (list, tuple)):
-        return False
-    return all(
-        isinstance(result.resolved_entities.get(slot), dict)
-        and isinstance(result.resolved_entities[slot].get("id"), int)
-        for slot in required_slots
-        if isinstance(slot, str)
-    )
 
 
 class FootballOperationService:
@@ -424,16 +350,6 @@ class FootballOperationService:
         self.player_selector = player_selector
         self.identity_selector = identity_selector
         self._active_result: FootballRetrievalResult | None = None
-        self._identity_replans: tuple[FootballIdentityReplan, ...] = ()
-
-    @staticmethod
-    def _retain_repair_resolution(result: FootballRetrievalResult, relation: FootballTeamLeagueResolution) -> None:
-        result.repair_observations.extend(relation.observed_candidates)
-        result.repair_scope_observations.extend(relation.observed_scopes)
-        result.repair_failed_slots.extend(
-            {"kind": "team", "index": index}
-            for index in relation.failed_slot_indices
-        )
 
     @classmethod
     def canonical_operation_key(cls, operation: FootballQueryOperation) -> str | None:
@@ -527,12 +443,7 @@ class FootballOperationService:
         saw_candidate = False
         for use_search_fallback in (False, True):
             for slot_index, slot in enumerate(operation.team_slots):
-                slot_variants = _identity_slot_variants(
-                    operation.team_slots,
-                    slot_index,
-                    self._identity_replans,
-                    "team",
-                )
+                slot_variants = (operation.team_slots[slot_index],)
                 for variant in slot_variants:
                     lookup_slot_operation = replace(
                         operation,
@@ -595,12 +506,7 @@ class FootballOperationService:
         seen_ids: set[int] = set()
         saw_ambiguous = False
         for use_search_fallback in ((True,) if self.identity_selector is not None else (False, True)):
-            for variant in _identity_slot_variants(
-                operation.team_slots,
-                slot_index,
-                self._identity_replans,
-                "team",
-            ):
+            for variant in (operation.team_slots[slot_index],):
                 lookup = await football_resolver.resolve_team_candidate(
                     self.client,
                     variant,
@@ -646,12 +552,7 @@ class FootballOperationService:
             for slot_index, slot in enumerate(operation.league_slots):
                 if getattr(slot, "authority", None) == "PLANNER_INFERENCE":
                     continue
-                for variant in _identity_slot_variants(
-                    operation.league_slots,
-                    slot_index,
-                    self._identity_replans,
-                    "league",
-                ):
+                for variant in (operation.league_slots[slot_index],):
                     lookup = await football_resolver.resolve_league_candidate(
                         self.client,
                         variant,
@@ -662,8 +563,6 @@ class FootballOperationService:
                     candidate_rows.extend(lookup.matches or ((lookup.row,) if lookup.row is not None else ()))
 
         ranked_pairs: dict[tuple[int, int], tuple[int, dict[str, Any], dict[str, Any], int]] = {}
-        rejected_roster_rows: list[dict[str, Any]] = []
-        observed_scopes: list[dict[str, int]] = []
         for league_row in _unique_league_rows(candidate_rows)[:5]:
             league = league_row.get("league") if isinstance(league_row, dict) else {}
             league_id = league.get("id") if isinstance(league, dict) else None
@@ -672,8 +571,6 @@ class FootballOperationService:
             resolved_season = season or _season_from_league_row(league_row)
             if resolved_season is None:
                 resolved_season = await self.client.get_current_season(league_id)
-            if type(league_id) is int and type(resolved_season) is int:
-                observed_scopes.append({"league_id": league_id, "season": resolved_season})
             roster_rows = await self.client.search_teams(
                 build_league_teams_request(league_id=league_id, season=resolved_season)
             )
@@ -684,11 +581,6 @@ class FootballOperationService:
                 )
                 if picked.selected is not None:
                     ranked_pairs[(_team_row_id(picked.selected), league_id)] = (1, picked.selected, league_row, resolved_season)
-                else:
-                    rejected_roster_rows.extend(
-                        {"row": row, "league_id": league_id, "season": resolved_season}
-                        for row in picked.matches
-                    )
                 continue
             for roster_index, team_row in enumerate(roster_rows):
                 team = team_row.get("team") if isinstance(team_row, dict) else {}
@@ -722,11 +614,6 @@ class FootballOperationService:
                     "none" if accepted else ("non_integer_id" if type(team_id) is not int else "identity_score_zero"),
                 )
                 if not accepted:
-                    rejected_roster_rows.append({
-                        "row": team_row,
-                        "league_id": league_id,
-                        "season": resolved_season,
-                    })
                     continue
                 pair_key = (team_id, league_id)
                 prior = ranked_pairs.get(pair_key)
@@ -736,9 +623,6 @@ class FootballOperationService:
         if not ranked_pairs:
             return FootballTeamLeagueResolution(
                 outcome=FootballOutcome.NOT_FOUND,
-                observed_candidates=tuple(rejected_roster_rows[:5]),
-                observed_scopes=tuple(observed_scopes[:5]),
-                failed_slot_indices=tuple(range(len(operation.team_slots))),
                 note="team_not_found",
             )
         if len(ranked_pairs) != 1:
@@ -746,13 +630,6 @@ class FootballOperationService:
             return FootballTeamLeagueResolution(
                 outcome=FootballOutcome.AMBIGUOUS,
                 candidates=tuple(item[1] for item in ambiguous_rows),
-                observed_candidates=tuple(
-                    {"row": team_row, "league_id": league.get("id"), "season": resolved_season}
-                    for _score, team_row, league_row, resolved_season in ambiguous_rows
-                    for league in (league_row.get("league") if isinstance(league_row, dict) else {},)
-                    if isinstance(league, dict)
-                ),
-                observed_scopes=tuple(observed_scopes),
                 note="team_ambiguous",
             )
         _score, team_row, league_row, resolved_season = next(iter(ranked_pairs.values()))
@@ -764,207 +641,6 @@ class FootballOperationService:
                 candidates=(team_row,),
                 note="league_id_missing",
             )
-        return FootballTeamLeagueResolution(
-            team_row=team_row,
-            league_row=league_row,
-            league_id=league_id,
-            season=resolved_season,
-            outcome=FootballOutcome.SELECTED,
-            candidates=(team_row,),
-            note="",
-        )
-
-    async def resolve_team_with_replanned_scope(
-        self,
-        operation: FootballQueryOperation,
-        *,
-        season: int | None = None,
-    ) -> FootballTeamLeagueResolution | None:
-        replan = next((item for item in self._identity_replans if item.slot_kind == "team" and item.slot_index == 0), None)
-        if (
-            replan is None
-            or replan.slot_kind != "team"
-            or replan.slot_index != 0
-            or len(operation.team_slots) != 1
-            or _authoritative_league_slots(operation.league_slots)
-            or not replan.scope_candidates
-        ):
-            return None
-
-        pairs: dict[tuple[int, int], tuple[dict[str, Any], dict[str, Any], int]] = {}
-        attempted_scopes: list[dict[str, int]] = []
-        team_slot = operation.team_slots[0]
-        unique_team_variants: list[Any] = []
-        seen_variant_names: set[str] = set()
-        for variant in (team_slot, *_identity_slot_variants(operation.team_slots, 0, replan, "team")):
-            variant_name = football_resolver.normalize_key(getattr(variant, "name", None))
-            if variant_name and variant_name not in seen_variant_names:
-                seen_variant_names.add(variant_name)
-                unique_team_variants.append(variant)
-        for scope in replan.scope_candidates:
-            if not scope.league_name:
-                logging.info(
-                    "AI football identity scope candidate evaluated slot_kind=team slot_index=0 "
-                    "league_name=%r country_name=%r league_id=%r season=%r roster_match_count=%s "
-                    "decision=rejected rejection=league_name_missing",
-                    scope.league_name,
-                    scope.country_name,
-                    None,
-                    season,
-                    0,
-                )
-                continue
-            try:
-                scope_league = _make_league_slot(
-                    scope.league_name,
-                    source="planner",
-                    authority="PLANNER_INFERENCE",
-                    country_hint=scope.country_name,
-                )
-                scope_country = (
-                    _make_country_slot(
-                        scope.country_name,
-                        source="planner",
-                        authority="PLANNER_INFERENCE",
-                    )
-                    if scope.country_name
-                    else None
-                )
-                lookup = await football_resolver.resolve_league_candidate(
-                    self.client,
-                    scope_league,
-                    country=scope_country,
-                    season=season,
-                    selector=self.identity_selector,
-                )
-            except (AttributeError, TypeError, FootballApiError, InvalidFootballApiRequest) as exc:
-                logging.info(
-                    "AI football identity scope candidate evaluated slot_kind=team slot_index=0 "
-                    "league_name=%r country_name=%r league_id=%r season=%r roster_match_count=%s "
-                    "decision=rejected rejection=league_resolution_error error=%s",
-                    scope.league_name,
-                    scope.country_name,
-                    None,
-                    season,
-                    0,
-                    str(exc)[:120],
-                )
-                continue
-            league_rows = list(lookup.matches or ((lookup.row,) if lookup.row is not None else ()))
-            unique_leagues = _unique_league_rows(league_rows)
-            if lookup.ambiguous or len(unique_leagues) != 1:
-                logging.info(
-                    "AI football identity scope candidate evaluated slot_kind=team slot_index=0 "
-                    "league_name=%r country_name=%r league_id=%r season=%r roster_match_count=%s "
-                    "decision=rejected rejection=league_ambiguous",
-                    scope.league_name,
-                    scope.country_name,
-                    None,
-                    season,
-                    0,
-                )
-                continue
-            league_row = unique_leagues[0]
-            league = league_row.get("league") if isinstance(league_row, dict) else {}
-            league_id = league.get("id") if isinstance(league, dict) else None
-            if type(league_id) is not int:
-                continue
-            resolved_season = season or lookup.season or _season_from_league_row(league_row)
-            if resolved_season is None:
-                try:
-                    resolved_season = await self.client.get_current_season(league_id)
-                except (AttributeError, TypeError, FootballApiError, InvalidFootballApiRequest) as exc:
-                    logging.info(
-                        "AI football identity scope candidate evaluated slot_kind=team slot_index=0 "
-                        "league_name=%r country_name=%r league_id=%r season=%r roster_match_count=%s "
-                        "decision=rejected rejection=season_resolution_error error=%s",
-                        scope.league_name,
-                        scope.country_name,
-                        league_id,
-                        None,
-                        0,
-                        str(exc)[:120],
-                    )
-                    continue
-            if type(resolved_season) is not int:
-                logging.info(
-                    "AI football identity scope candidate evaluated slot_kind=team slot_index=0 "
-                    "league_name=%r country_name=%r league_id=%r season=%r roster_match_count=%s "
-                    "decision=rejected rejection=season_missing",
-                    scope.league_name,
-                    scope.country_name,
-                    league_id,
-                    resolved_season,
-                    0,
-                )
-                continue
-            try:
-                attempted_scopes.append({"league_id": league_id, "season": resolved_season})
-                roster_rows = await self.client.search_teams(
-                    build_league_teams_request(league_id=league_id, season=resolved_season)
-                )
-            except (AttributeError, TypeError, FootballApiError, InvalidFootballApiRequest) as exc:
-                logging.info(
-                    "AI football identity scope candidate evaluated slot_kind=team slot_index=0 "
-                    "league_name=%r country_name=%r league_id=%r season=%r roster_match_count=%s "
-                    "decision=rejected rejection=roster_resolution_error error=%s",
-                    scope.league_name,
-                    scope.country_name,
-                    league_id,
-                    resolved_season,
-                    0,
-                    str(exc)[:120],
-                )
-                continue
-            matches: dict[int, tuple[int, dict[str, Any]]] = {}
-            if self.identity_selector is not None:
-                picked = await football_resolver.select_football_identity(
-                    roster_rows, team_slot, entity_type="team", selector=self.identity_selector,
-                )
-                roster_rows = [picked.selected] if picked.selected is not None else []
-            for roster_row in roster_rows:
-                score = 1 if self.identity_selector is not None else max(
-                    (_team_roster_identity_score(roster_row, variant) for variant in unique_team_variants),
-                    default=0,
-                )
-                roster_team_id = _team_row_id(roster_row)
-                if type(roster_team_id) is int and score > 0:
-                    prior = matches.get(roster_team_id)
-                    if prior is None or score > prior[0]:
-                        matches[roster_team_id] = (score, roster_row)
-            logging.info(
-                "AI football identity scope candidate evaluated slot_kind=team slot_index=0 "
-                "league_name=%r country_name=%r league_id=%r season=%r roster_match_count=%s "
-                "decision=%s rejection=%s",
-                scope.league_name,
-                scope.country_name,
-                league_id,
-                resolved_season,
-                len(matches),
-                "accepted" if len(matches) == 1 else "rejected",
-                "none" if len(matches) == 1 else ("team_ambiguous" if len(matches) > 1 else "team_not_found"),
-            )
-            for team_id, (score, roster_row) in matches.items():
-                pairs[(team_id, league_id)] = (roster_row, league_row, resolved_season)
-        if len(pairs) != 1:
-            ambiguous_rows = list(pairs.values())[:5]
-            return FootballTeamLeagueResolution(
-                outcome=FootballOutcome.AMBIGUOUS if len(pairs) > 1 else FootballOutcome.NOT_FOUND,
-                candidates=tuple(item[0] for item in ambiguous_rows),
-                observed_candidates=tuple(
-                    {"row": team_row, "league_id": league.get("id"), "season": resolved_season}
-                    for team_row, league_row, resolved_season in ambiguous_rows
-                    for league in (league_row.get("league") if isinstance(league_row, dict) else {},)
-                    if isinstance(league, dict)
-                ),
-                observed_scopes=tuple(attempted_scopes),
-                note="team_ambiguous" if len(pairs) > 1 else "team_not_found",
-            )
-        team_row, league_row, resolved_season = next(iter(pairs.values()))
-        league = league_row.get("league") if isinstance(league_row, dict) else {}
-        league_id = league.get("id") if isinstance(league, dict) else None
-        if not isinstance(league_id, int):
-            return FootballTeamLeagueResolution(outcome=FootballOutcome.RESOLUTION_FAILED, note="league_id_missing")
         return FootballTeamLeagueResolution(
             team_row=team_row,
             league_row=league_row,
@@ -987,12 +663,7 @@ class FootballOperationService:
         league_id: int | None,
         season: int | None,
         data_focus: str | None = None,
-        identity_replan: FootballIdentityReplan | tuple[FootballIdentityReplan, ...] | None = None,
     ) -> FootballRetrievalResult:
-        self._identity_replans = (
-            (identity_replan,) if isinstance(identity_replan, FootballIdentityReplan)
-            else tuple(identity_replan or ())
-        )
         recipe = self.recipe_for(operation)
         if recipe is None:
             return FootballRetrievalResult(
@@ -1028,6 +699,8 @@ class FootballOperationService:
             result.outcome = FootballOutcome.PROVIDER_FAILURE
             result.notes.extend(
                 [
+                    # The provider's own message comes first so Grok can see what to fix.
+                    f"provider_error={str(exc)[:200]}",
                     f"provider_error_status={getattr(exc, 'status', None)}",
                     f"provider_retryable={getattr(exc, 'retryable', False)}",
                 ]
@@ -1036,9 +709,7 @@ class FootballOperationService:
             result.requested_scope.setdefault(key, value)
         result.requested_scope.setdefault("request_plan", _request_plan_payload(request_plan))
         _filter_unpermitted_endpoints(result, recipe)
-        result.repair_feedback = _repair_feedback(operation, result)
         self._active_result = None
-        self._identity_replans = ()
         return result
 
 
@@ -1066,7 +737,6 @@ class FootballOperationService:
                         team_row, league_row, league_id, season = relation.team_row, relation.league_row, relation.league_id, relation.season
                         result.league_context_row = league_row
                     else:
-                        self._retain_repair_resolution(result, relation)
                         result.outcome = relation.outcome
                         result.notes.append(relation.note)
                         result.generic_rows = list(relation.candidates)
@@ -1132,6 +802,14 @@ class FootballOperationService:
         if operation.operation_type == "fixture_next" and str(data_focus or "").casefold() in {"next_match", "single_next_match"}:
             result.fixtures = _nearest_fixture(result.fixtures)
         result.endpoints.append("/fixtures")
+        result.requested_scope["fixture_selection"] = {
+            "league_id": league_id, "season": season, "team_id": team_id,
+            "date": calendar_date, "round": operation.fixture_round,
+            "direction": "last" if operation.operation_type == "fixture_last" else "next",
+            "requested_count": fixture_count if calendar_date is None and operation.fixture_round is None else None,
+            "returned_count": len(result.fixtures),
+            "completeness": "calendar_slice" if calendar_date is not None or operation.fixture_round is not None else "bounded_sample",
+        }
         if not result.fixtures and (team_id is not None or league_id is not None):
             result.outcome = FootballOutcome.NO_DATA_FOR_SCOPE
             result.notes.append("fixture_list_missing_for_scope")
@@ -1194,7 +872,6 @@ class FootballOperationService:
                         team_row, league_row, league_id, season = relation.team_row, relation.league_row, relation.league_id, relation.season
                         result.league_context_row = league_row
                     else:
-                        self._retain_repair_resolution(result, relation)
                         result.outcome = relation.outcome
                         result.notes.append(relation.note)
                         result.generic_rows = list(relation.candidates)
@@ -1211,36 +888,18 @@ class FootballOperationService:
                         result.missing_inputs.append("league")
                     return result
         if team_row is None:
-            scoped_relation = await self.resolve_team_with_replanned_scope(operation, season=season)
-            if scoped_relation is not None:
-                result.endpoints.extend(("/leagues", "/teams"))
-                if scoped_relation.outcome != FootballOutcome.SELECTED or scoped_relation.team_row is None:
-                    self._retain_repair_resolution(result, scoped_relation)
-                    result.outcome = scoped_relation.outcome
-                    result.notes.append(scoped_relation.note)
-                    result.generic_rows = list(scoped_relation.candidates)
-                    if scoped_relation.outcome == FootballOutcome.AMBIGUOUS:
-                        result.ambiguity_candidates = _ambiguity_from_rows("team", result.generic_rows)
-                    else:
-                        result.missing_inputs.append("team")
-                    return result
-                team_row = scoped_relation.team_row
-                league_id = scoped_relation.league_id
-                season = scoped_relation.season
-                result.league_context_row = scoped_relation.league_row
-            else:
-                team_rows, outcome = await self.resolve_team_rows(operation, league_id=league_id, season=season, max_teams=1)
-                team_row = team_rows[0] if outcome == FootballOutcome.SELECTED and team_rows else None
-                result.endpoints.append("/teams")
-                if outcome != FootballOutcome.SELECTED or team_row is None:
-                    result.outcome = outcome
-                    result.notes.append("team_ambiguous" if outcome == FootballOutcome.AMBIGUOUS else "team_not_found")
-                    result.generic_rows = team_rows
-                    if outcome == FootballOutcome.AMBIGUOUS:
-                        result.ambiguity_candidates = _ambiguity_from_rows("team", result.generic_rows)
-                    else:
-                        result.missing_inputs.append("team")
-                    return result
+            team_rows, outcome = await self.resolve_team_rows(operation, league_id=league_id, season=season, max_teams=1)
+            team_row = team_rows[0] if outcome == FootballOutcome.SELECTED and team_rows else None
+            result.endpoints.append("/teams")
+            if outcome != FootballOutcome.SELECTED or team_row is None:
+                result.outcome = outcome
+                result.notes.append("team_ambiguous" if outcome == FootballOutcome.AMBIGUOUS else "team_not_found")
+                result.generic_rows = team_rows
+                if outcome == FootballOutcome.AMBIGUOUS:
+                    result.ambiguity_candidates = _ambiguity_from_rows("team", result.generic_rows)
+                else:
+                    result.missing_inputs.append("team")
+                return result
         result.team_context_row = team_row
         team = team_row.get("team") if isinstance(team_row, dict) else {}
         team_id = team.get("id") if isinstance(team, dict) else None
@@ -1369,12 +1028,7 @@ class FootballOperationService:
             if not league_slots:
                 continue
             for slot_index, slot in enumerate(league_slots):
-                slot_variants = _identity_slot_variants(
-                    league_slots,
-                    slot_index,
-                    self._identity_replans,
-                    "league",
-                )
+                slot_variants = (league_slots[slot_index],)
                 for variant in slot_variants:
                     league_key = football_resolver.normalize_league_key(variant.name) if football_resolver.slot_allows_static_alias(variant) else None
                     if league_key:
@@ -1385,12 +1039,7 @@ class FootballOperationService:
             lookup_slots = tuple(
                 variant
                 for slot_index, slot in enumerate(league_slots)
-                for variant in _identity_slot_variants(
-                    league_slots,
-                    slot_index,
-                    self._identity_replans,
-                    "league",
-                )
+                for variant in (league_slots[slot_index],)
             )
             for slot in lookup_slots:
                 lookup = await football_resolver.resolve_league_candidate(
@@ -1572,7 +1221,6 @@ class FootballOperationService:
                         result.outcome = relation.outcome
                         result.notes.append(relation.note)
                         result.missing_inputs.append("team")
-                        self._retain_repair_resolution(result, relation)
                         if relation.outcome == FootballOutcome.AMBIGUOUS:
                             result.ambiguity_candidates = _ambiguity_from_rows("team", list(relation.candidates))
                         return result
@@ -1589,68 +1237,50 @@ class FootballOperationService:
                         result.ambiguity_candidates = _ambiguity_from_rows("league", [league_row])
                     return result
         else:
-            scoped_relation = await self.resolve_team_with_replanned_scope(operation, season=season)
-            if scoped_relation is not None:
-                result.endpoints.extend(("/leagues", "/teams"))
-                if scoped_relation.outcome != FootballOutcome.SELECTED or scoped_relation.team_row is None:
-                    self._retain_repair_resolution(result, scoped_relation)
-                    result.outcome = scoped_relation.outcome
-                    result.notes.append(scoped_relation.note)
-                    result.generic_rows = list(scoped_relation.candidates)
-                    if scoped_relation.outcome == FootballOutcome.AMBIGUOUS:
-                        result.ambiguity_candidates = _ambiguity_from_rows("team", list(scoped_relation.candidates))
-                    else:
-                        result.missing_inputs.append("team")
-                    return result
-                team_row = scoped_relation.team_row
-                league_row = scoped_relation.league_row
-                league_id = scoped_relation.league_id
-                season = scoped_relation.season
-            else:
-                team_rows, team_outcome = await self.resolve_team_rows(operation, league_id=None, season=None, max_teams=1)
-                team_row = team_rows[0] if team_outcome == FootballOutcome.SELECTED and team_rows else None
-                result.endpoints.append("/teams")
-                if team_outcome != FootballOutcome.SELECTED or team_row is None:
-                    result.outcome = team_outcome
-                    result.notes.append("team_ambiguous" if team_outcome == FootballOutcome.AMBIGUOUS else "team_not_found")
-                    result.missing_inputs.append("team")
-                    if team_outcome == FootballOutcome.AMBIGUOUS:
-                        result.ambiguity_candidates = _ambiguity_from_rows("team", team_rows)
-                    return result
-                team = team_row.get("team") if isinstance(team_row, dict) else {}
-                team_id = team.get("id") if isinstance(team, dict) else None
-                if not isinstance(team_id, int):
-                    result.outcome = FootballOutcome.RESOLUTION_FAILED
-                    result.notes.append("team_id_missing")
-                    return result
-                current_rows = await self.client.search_leagues(
-                    build_league_search_request(team_id=team_id, current=True)
+            team_rows, team_outcome = await self.resolve_team_rows(operation, league_id=None, season=None, max_teams=1)
+            team_row = team_rows[0] if team_outcome == FootballOutcome.SELECTED and team_rows else None
+            result.endpoints.append("/teams")
+            if team_outcome != FootballOutcome.SELECTED or team_row is None:
+                result.outcome = team_outcome
+                result.notes.append("team_ambiguous" if team_outcome == FootballOutcome.AMBIGUOUS else "team_not_found")
+                result.missing_inputs.append("team")
+                if team_outcome == FootballOutcome.AMBIGUOUS:
+                    result.ambiguity_candidates = _ambiguity_from_rows("team", team_rows)
+                return result
+            team = team_row.get("team") if isinstance(team_row, dict) else {}
+            team_id = team.get("id") if isinstance(team, dict) else None
+            if not isinstance(team_id, int):
+                result.outcome = FootballOutcome.RESOLUTION_FAILED
+                result.notes.append("team_id_missing")
+                return result
+            current_rows = await self.client.search_leagues(
+                build_league_search_request(team_id=team_id, current=True)
+            )
+            result.endpoints.append("/leagues")
+            current_leagues = _unique_current_league_rows(current_rows)
+            if len(current_leagues) > 1 and self.identity_selector is not None:
+                picked = await football_resolver.select_football_identity(
+                    current_leagues, operation.team_slots[0], entity_type="league", selector=self.identity_selector,
                 )
-                result.endpoints.append("/leagues")
-                current_leagues = _unique_current_league_rows(current_rows)
-                if len(current_leagues) > 1 and self.identity_selector is not None:
-                    picked = await football_resolver.select_football_identity(
-                        current_leagues, operation.team_slots[0], entity_type="league", selector=self.identity_selector,
-                    )
-                    if picked.selected is not None:
-                        current_leagues = [picked.selected]
-                if len(current_leagues) != 1:
-                    result.outcome = FootballOutcome.AMBIGUOUS if len(current_leagues) > 1 else FootballOutcome.NOT_FOUND
-                    result.notes.append("current_league_ambiguous" if len(current_leagues) > 1 else "current_league_not_found")
-                    result.missing_inputs.append("league")
-                    if len(current_leagues) > 1:
-                        result.ambiguity_candidates = _ambiguity_from_rows("league", current_leagues)
-                    return result
-                league_row = current_leagues[0]
-                league = league_row.get("league") if isinstance(league_row, dict) else {}
-                league_id = league.get("id") if isinstance(league, dict) else None
-                if not isinstance(league_id, int):
-                    result.outcome = FootballOutcome.RESOLUTION_FAILED
-                    result.notes.append("league_id_missing")
-                    return result
-                season = season or _season_from_league_row(league_row)
-                if season is None:
-                    season = await self.client.get_current_season(league_id)
+                if picked.selected is not None:
+                    current_leagues = [picked.selected]
+            if len(current_leagues) != 1:
+                result.outcome = FootballOutcome.AMBIGUOUS if len(current_leagues) > 1 else FootballOutcome.NOT_FOUND
+                result.notes.append("current_league_ambiguous" if len(current_leagues) > 1 else "current_league_not_found")
+                result.missing_inputs.append("league")
+                if len(current_leagues) > 1:
+                    result.ambiguity_candidates = _ambiguity_from_rows("league", current_leagues)
+                return result
+            league_row = current_leagues[0]
+            league = league_row.get("league") if isinstance(league_row, dict) else {}
+            league_id = league.get("id") if isinstance(league, dict) else None
+            if not isinstance(league_id, int):
+                result.outcome = FootballOutcome.RESOLUTION_FAILED
+                result.notes.append("league_id_missing")
+                return result
+            season = season or _season_from_league_row(league_row)
+            if season is None:
+                season = await self.client.get_current_season(league_id)
         if season is None and league_id is not None:
             season = await self.client.get_current_season(league_id)
         if league_id is None or season is None:
@@ -1695,7 +1325,6 @@ class FootballOperationService:
                         result.outcome = relation.outcome
                         result.notes.append(relation.note)
                         result.missing_inputs.append("team")
-                        self._retain_repair_resolution(result, relation)
                         if relation.outcome == FootballOutcome.AMBIGUOUS:
                             result.ambiguity_candidates = _ambiguity_from_rows("team", list(relation.candidates))
                         return result
@@ -1879,7 +1508,6 @@ class FootballOperationService:
                     result.league_context_row = league_row
                     team_row = relation.team_row
                 else:
-                    self._retain_repair_resolution(result, relation)
                     result.outcome = relation.outcome
                     result.notes.append(relation.note)
                     result.generic_rows = list(relation.candidates)
@@ -2783,7 +2411,6 @@ class FootballOperationService:
                         season = relation.season
                         result.league_context_row = league_row
                     else:
-                        self._retain_repair_resolution(result, relation)
                         result.outcome = relation.outcome
                         result.notes.append(relation.note)
                         result.generic_rows = list(relation.candidates)
@@ -3057,7 +2684,8 @@ class FootballOperationService:
             explicit_context=league_id is not None or team_id is not None,
             canonicalizer=self.player_canonicalizer,
             alias_cache=self.player_alias_cache,
-            candidate_names=list(operation.player_slots[:1]),
+            # Player operations name one player, so every slot is another name for that same player (nickname, full name).
+            candidate_names=list(operation.player_slots),
             stat_focus=operation.stat_focus,
             team_hint=player_slot.team_hint,
             league_hint=player_slot.league_hint,
@@ -3076,8 +2704,7 @@ class FootballOperationService:
             result.outcome = FootballOutcome.AMBIGUOUS
             result.generic_rows = list(picked.matches)
             result.ambiguity_candidates = _ambiguity_from_rows("player", result.generic_rows)
-            names = _player_candidate_names(list(picked.matches))
-            result.notes.append(f"player_ambiguous={', '.join(names)}")
+            result.notes.append("player_ambiguous")
             return result
         if picked.selected is None:
             result.outcome = FootballOutcome.NOT_FOUND
@@ -3116,19 +2743,7 @@ class FootballOperationService:
             "player_previous_team",
         } or (operation.operation_type in {"player_current_team", "player_career_history"} and not result.generic_rows)
         if needs_stats:
-            result.player_context_row = {**player_row, "statistics": []}
-            stats_rows = await self._fetch_player_stats_for_locked_identity(
-                player_id, league_id=league_id, season=season, team_id=team_id, result=result,
-            )
-            if stats_rows:
-                result.player_context_row = {
-                    **player_row,
-                    "player": {**(stats_rows[0].get("player") or {}), **player},
-                    "statistics": [stat for row in stats_rows for stat in row.get("statistics", [])],
-                }
-            elif result.outcome == FootballOutcome.SELECTED:
-                result.outcome = FootballOutcome.NO_DATA_FOR_SCOPE
-                result.notes.append("player_stats_missing_for_requested_scope")
+            await self.load_player_statistics(result, player_row, league_id=league_id, season=season, team_id=team_id)
 
         stats_for_context = result.player_context_row.get("statistics") if isinstance(result.player_context_row, dict) else []
         teams = [stat.get("team") or {} for stat in stats_for_context or [] if isinstance(stat, dict)]
@@ -3163,6 +2778,26 @@ class FootballOperationService:
             return []
         return await method(build_player_squads_request(player_id=player_id))
 
+    async def load_player_statistics(
+        self, result: FootballRetrievalResult, player_row: dict[str, Any], *,
+        league_id: int | None = None, season: int | None = None, team_id: int | None = None,
+    ) -> None:
+        """Statistics of a player whose identity is settled; with no season, the latest registered one."""
+        player = player_row.get("player") or {}
+        result.player_context_row = {**player_row, "statistics": []}
+        stats_rows = await self._fetch_player_stats_for_locked_identity(
+            player["id"], league_id=league_id, season=season, team_id=team_id, result=result,
+        )
+        if stats_rows:
+            result.player_context_row = {
+                **player_row,
+                "player": {**(stats_rows[0].get("player") or {}), **player},
+                "statistics": [stat for row in stats_rows for stat in row.get("statistics", [])],
+            }
+        elif result.outcome == FootballOutcome.SELECTED:
+            result.outcome = FootballOutcome.NO_DATA_FOR_SCOPE
+            result.notes.append("player_stats_missing_for_requested_scope")
+
     async def _fetch_player_stats_for_locked_identity(
         self,
         player_id: int,
@@ -3183,7 +2818,8 @@ class FootballOperationService:
             result.notes.append("player_stats_season_unresolved")
             return []
         selected_season = stat_seasons[0]
-        result.requested_scope["season"] = selected_season
+        # Nobody named a season: this is the player's latest registered season, which need not be the current one.
+        result.requested_scope["season" if season is not None else "latest_registered_season"] = selected_season
         if league_id is not None:
             unsupported = await self.check_coverage(result, "players", league_id=league_id, season=selected_season)
             if unsupported:
@@ -3216,106 +2852,6 @@ class FootballOperationService:
         seasons = sorted({row["season"] for row in rows
                           if isinstance(row, dict) and type(row.get("season")) is int}, reverse=True)
         return seasons[:1]
-
-
-def _repair_feedback(operation: FootballQueryOperation, result: FootballRetrievalResult) -> dict[str, Any]:
-    """Repair-only provider evidence; never an executable identity."""
-    missing_identity_kinds = [slot for slot in ("team", "league") if slot in result.missing_inputs]
-    failed_kind = missing_identity_kinds[0] if len(missing_identity_kinds) == 1 else None
-    slots = getattr(operation, f"{failed_kind}_slots", ()) if failed_kind else ()
-    failed_slots = list(result.repair_failed_slots[:5])
-    if not failed_slots and failed_kind and len(slots) == 1:
-        failed_slots = [{"kind": failed_kind, "index": 0}]
-    failed_slot = failed_slots[0] if len(failed_slots) == 1 else None
-    observations = result.repair_observations[:5]
-    scope_observations = result.repair_scope_observations
-    valid_scope_observations = [
-        item for item in scope_observations
-        if isinstance(item, dict) and type(item.get("league_id")) is int and type(item.get("season")) is int
-    ]
-    scoped_values = {
-        (item.get("league_id"), item.get("season"))
-        for item in valid_scope_observations
-        if isinstance(item, dict) and type(item.get("league_id")) is int and type(item.get("season")) is int
-    }
-    scope = {}
-    if scope_observations and len(valid_scope_observations) == len(scope_observations) and len(scoped_values) == 1:
-        league_id, season = next(iter(scoped_values))
-        scope = {"league_id": league_id, "season": season}
-    candidates: list[dict[str, Any]] = []
-    observed_identity_ids: set[tuple[str, int]] = set()
-    for observation in observations:
-        row = observation.get("row") if isinstance(observation, dict) else None
-        team = row.get("team") if isinstance(row, dict) else None
-        provider_id = team.get("id") if isinstance(team, dict) else None
-        name = str(team.get("name") or "").strip() if isinstance(team, dict) else ""
-        league_id = observation.get("league_id") if isinstance(observation, dict) else None
-        season = observation.get("season") if isinstance(observation, dict) else None
-        if not name or type(provider_id) is not int or type(league_id) is not int or type(season) is not int:
-            continue
-        candidates.append({
-            "ref": "fbref:" + secrets.token_urlsafe(9),
-            "entity_type": "team",
-            "display_name": name[:120],
-            "provider_id": provider_id,
-            "scope": {"league_id": league_id, "season": season},
-        })
-        observed_identity_ids.add(("team", provider_id))
-    for item in result.ambiguity_candidates[: max(0, 5 - len(candidates))]:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("display_name") or item.get("name") or "").strip()
-        entity_type = str(item.get("entity_type") or "").strip()
-        provider_id = item.get("id")
-        if not name or entity_type not in {"team", "league"} or type(provider_id) is not int:
-            continue
-        if (entity_type, provider_id) in observed_identity_ids:
-            continue
-        candidates.append({
-            "ref": "fbref:" + secrets.token_urlsafe(9),
-            "entity_type": entity_type,
-            "display_name": name[:120],
-            "provider_id": provider_id,
-            "scope": {},
-        })
-        observed_identity_ids.add((entity_type, provider_id))
-    omissions = []
-    if not failed_slots and len(missing_identity_kinds) > 1:
-        omissions.append("failed_identity_slot_not_unique")
-    elif not failed_slots:
-        omissions.append("failed_identity_slot")
-    elif failed_slot is None:
-        omissions.append("failed_identity_slot_not_unique")
-    if not candidates:
-        omissions.append("observed_provider_candidates")
-    if not scope:
-        omissions.append("unique_provider_scope")
-    resolved = {
-        kind: {
-            "id": value.get("id"),
-            "display_name": str(value.get("display_name") or "")[:120],
-        }
-        for kind, value in result.resolved_entities.items()
-        if kind in {"team", "league"} and isinstance(value, dict) and type(value.get("id")) is int
-    }
-    return {
-        "failed_slot": failed_slot,
-        "failed_slots": failed_slots,
-        "outcome": result.outcome.value,
-        "scope": scope,
-        "resolved_entities": resolved,
-        "observed_candidates": candidates,
-        "omissions": omissions,
-    }
-
-
-def _player_candidate_names(rows: list[dict[str, Any]]) -> list[str]:
-    names: list[str] = []
-    for item in rows[:5]:
-        player = item.get("player") if isinstance(item, dict) else {}
-        if isinstance(player, dict):
-            names.append(f"{player.get('name')}#{player.get('id')}"[:120])
-    return names
 
 
 def _validate_recipe_slots(operation: FootballQueryOperation, recipe: FootballRecipe) -> FootballRetrievalResult | None:
@@ -3446,7 +2982,6 @@ def _build_request_plan(
         capability_evidence={
             "operation_family": getattr(intent, "operation_family", operation.operation_type),
             "data_focus": getattr(intent, "data_focus", operation.data_focus),
-            "evidence": getattr(intent, "evidence", None),
             "planner_operation": getattr(intent, "planner_operation", None),
             "planner_data_focus": getattr(intent, "planner_data_focus", None),
             "planner_accepted": getattr(intent, "planner_accepted", False),
@@ -3550,33 +3085,6 @@ def _fixture_id_from_operation(operation: FootballQueryOperation) -> int | None:
     except ValueError:
         return None
     return value if value > 0 else None
-
-
-def _identity_slot_variants(
-    slots: tuple[Any, ...],
-    slot_index: int,
-    replan: FootballIdentityReplan | tuple[FootballIdentityReplan, ...] | None,
-    slot_kind: str,
-) -> tuple[Any, ...]:
-    if isinstance(replan, tuple):
-        replan = next((item for item in replan if item.slot_kind == slot_kind and item.slot_index == slot_index), None)
-    if (
-        replan is None
-        or replan.slot_kind != slot_kind
-        or replan.slot_index != slot_index
-        or slot_index >= len(slots)
-    ):
-        return (slots[slot_index],)
-    original = slots[slot_index]
-    variants: list[Any] = []
-    seen: set[str] = set()
-    for candidate in replan.candidate_names:
-        key = football_resolver.normalize_key(candidate)
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        variants.append(replace(original, name=candidate, authority="PLANNER_INFERENCE"))
-    return tuple(variants) or (original,)
 
 
 def _season_from_operation_hint(operation: FootballQueryOperation, current_season: int | None) -> int | None:
@@ -3824,7 +3332,11 @@ def _team_row_score(row: dict[str, Any], slot: Any) -> int:
     name_key = football_resolver.normalize_key(team.get("name"))
     slot_name = str(getattr(slot, "name", "") or "")
     slot_key = football_resolver.normalize_key(slot_name)
-    canonical_key = football_resolver.normalize_key(football_resolver.canonical_team_query(slot_name))
+    # A name Grok typed is never swapped for a static alias here; the same rule as resolve_team_candidate.
+    canonical_key = (
+        football_resolver.normalize_key(football_resolver.canonical_team_query(slot_name))
+        if football_resolver.slot_allows_static_alias(slot) else slot_key
+    )
     score = 0
     if name_key and name_key in {slot_key, canonical_key}:
         score += 100

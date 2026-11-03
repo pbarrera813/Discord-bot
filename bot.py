@@ -21,17 +21,13 @@ from utils.i18n import tr
 
 
 async def dynamic_prefix(bot: "DiscordModBot", message: discord.Message) -> Any:
-    default_prefix = bot.settings.default_prefix
+    # A mention is always for Nitori; commands use slash or the text prefix.
     if message.guild is None:
-        return commands.when_mentioned_or(default_prefix)(bot, message)
-
-    prefix = default_prefix
+        return bot.settings.default_prefix
     try:
-        settings = await bot.db.get_guild_settings(message.guild.id)
-        prefix = settings.prefix
+        return (await bot.db.get_guild_settings(message.guild.id)).prefix
     except Exception:
-        pass
-    return commands.when_mentioned_or(prefix)(bot, message)
+        return bot.settings.default_prefix
 
 
 class DiscordModBot(commands.Bot):
@@ -52,11 +48,9 @@ class DiscordModBot(commands.Bot):
         self.llm_client = XAIClient(
             settings.xai_api_key,
             settings.xai_model,
-            vision_model=settings.xai_vision_model,
             image_model=settings.xai_image_model,
             tts_voice=settings.xai_tts_voice,
             tts_language=settings.xai_tts_language,
-            router_output_token_ceiling=getattr(settings, "xai_router_output_token_ceiling", None),
         )
         self.mc_client = McSrvStatClient()
         self.ninjas_client = (
@@ -170,8 +164,6 @@ class DiscordModBot(commands.Bot):
         }
         if command_name.startswith("football "):
             labels["query"] = ("Search", "Búsqueda")
-        if command_name == "football schedule":
-            labels["count"] = ("Match position", "Posición del partido")
         parts: list[str] = []
 
         def walk(options: list[dict[str, Any]]) -> None:

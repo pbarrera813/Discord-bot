@@ -360,10 +360,8 @@ class FootballCapabilityIntent:
     operation_family: str
     data_focus: str | None = None
     temporal_semantics: str | None = None
-    requested_subscope: str | None = None
     authority: CandidateAuthority = "EXPLICIT_CURRENT_MESSAGE"
     source_component: str = "football_query_service"
-    evidence: str | None = None
     planner_operation: str | None = None
     planner_data_focus: str | None = None
     planner_accepted: bool = False
@@ -374,12 +372,8 @@ class FootballCapabilityIntent:
             object.__setattr__(self, "data_focus", _clean_slot_label(self.data_focus, label="capability data focus"))
         if self.temporal_semantics is not None:
             object.__setattr__(self, "temporal_semantics", _clean_slot_label(self.temporal_semantics, label="capability temporal semantics"))
-        if self.requested_subscope is not None:
-            object.__setattr__(self, "requested_subscope", _clean_slot_label(self.requested_subscope, label="capability subscope"))
         if self.source_component is not None:
             object.__setattr__(self, "source_component", _clean_slot_label(self.source_component, label="capability source component"))
-        if self.evidence is not None:
-            object.__setattr__(self, "evidence", _clean_slot_label(self.evidence, label="capability evidence"))
         if self.planner_operation is not None:
             object.__setattr__(self, "planner_operation", _clean_slot_label(self.planner_operation, label="planner operation"))
         if self.planner_data_focus is not None:

@@ -226,17 +226,6 @@ def stat_category(normalized_label: str) -> str:
     return "unknown"
 
 
-def requested_stat_key(value: str | None) -> str | None:
-    normalized = normalize_stat_label(value)
-    if not normalized:
-        return None
-    if normalized in STAT_SYNONYMS:
-        return STAT_SYNONYMS[normalized]
-    for phrase, key in STAT_SYNONYMS.items():
-        if phrase and (phrase in normalized or normalized in phrase):
-            return key
-    return API_STAT_ALIASES.get(normalized, normalized)
-
 
 def normalize_match_statistics(rows: list[dict[str, Any]]) -> dict[int | str, dict[str, MatchStat]]:
     parsed: dict[int | str, dict[str, MatchStat]] = {}
@@ -317,26 +306,6 @@ def normalize_half_statistics(
         "second_half": normalize_match_statistics(second_half_rows) if second_half_rows else derive_second_half_statistics(full_match_rows, first_half_rows),
     }
 
-
-def match_requested_stat(
-    stats: dict[int | str, dict[str, MatchStat]],
-    requested: str | None,
-) -> str | None:
-    requested_key = requested_stat_key(requested)
-    if not requested_key:
-        return None
-    available = {key for team_stats in stats.values() for key in team_stats}
-    if requested_key in available:
-        return requested_key
-    requested_tokens = set(filter(None, requested_key.split("_")))
-    if not requested_tokens:
-        return None
-    matches: list[str] = []
-    for key in available:
-        key_tokens = set(filter(None, key.split("_")))
-        if requested_tokens == key_tokens or requested_tokens.issubset(key_tokens) or key_tokens.issubset(requested_tokens):
-            matches.append(key)
-    return matches[0] if len(matches) == 1 else None
 
 
 def canonical_api_stat_key(label: str) -> str:

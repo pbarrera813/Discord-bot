@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import logging
@@ -154,25 +153,15 @@ HELP_COMMANDS: tuple[HelpCommandSpec, ...] = (
     HelpCommandSpec("meme custom", "fun", "/meme custom <image_url|attachment> <top> [bottom]", "/meme custom <url|adjunto> <arriba> [abajo]", "Create a meme from URL or attachment.", "Crea un meme desde URL o adjunto."),
     HelpCommandSpec("meme fonts", "fun", "/meme fonts [query]", "/meme fonts [búsqueda]", "List meme fonts.", "Lista fuentes de meme."),
     HelpCommandSpec("speech", "fun", "/speech <user>", "/speech <usuario>", "Speech bubble avatar meme.", "Meme de burbuja de diálogo."),
-    HelpCommandSpec("football", "sports", "/football <league>", "/football <liga>", "Live football fallback for a selected league.", "Atajo de partidos en vivo para una liga."),
-    HelpCommandSpec("football live", "sports", "/football live <league>", "/football live <liga>", "Live matches now.", "Partidos en vivo ahora."),
-    HelpCommandSpec("football today", "sports", "/football today <league>", "/football today <liga>", "Today's fixtures.", "Partidos de hoy."),
-    HelpCommandSpec("football next", "sports", "/football next <league> [count|team] [season]", "/football next <liga> [cantidad|equipo] [season]", "Browse upcoming fixtures; counts from 1 to 50.", "Consulta próximos partidos; cantidades de 1 a 50."),
-    HelpCommandSpec("football last", "sports", "/football last <league> [team] [count] [season]", "/football last <liga> [equipo] [count] [season]", "Browse recent fixtures for a league or team.", "Consulta partidos recientes de una liga o equipo."),
+    HelpCommandSpec("football", "sports", "/football", "/football", "Lists the football commands.", "Lista los comandos de fútbol."),
+    HelpCommandSpec("football match", "sports", "/football match [team] [when:auto|live|next|last]", "/football match [equipo] [when:auto|live|next|last]", "A team's live, next or last match with lineups, events, statistics and odds; no team uses your saved team.", "Partido en vivo, próximo o último de un equipo con alineaciones, eventos, estadísticas y cuotas; sin equipo usa tu equipo guardado."),
+    HelpCommandSpec("football fixtures", "sports", "/football fixtures <league> [when:auto|live|today|next|last]", "/football fixtures <liga> [when:auto|live|today|next|last]", "A league's live, today's, upcoming or finished matches.", "Partidos en vivo, de hoy, próximos o terminados de una liga."),
+    HelpCommandSpec("football team", "sports", "/football team [team]", "/football team [equipo]", "Team card with table position, season stats, squad, coach, venue, injuries and transfers; no team uses your saved team.", "Ficha del equipo con posición, estadísticas, plantilla, entrenador, estadio, lesiones y transferencias; sin equipo usa tu equipo guardado."),
     HelpCommandSpec("football table", "sports", "/football table <league>", "/football table <liga>", "League standings.", "Tabla de posiciones."),
-    HelpCommandSpec("football team", "sports", "/football team <league> <team>", "/football team <liga> <equipo>", "Team card with season stats, current squad, registered seasons, coach and venue sections.", "Ficha del equipo con estadísticas, plantilla actual, temporadas registradas, entrenador y estadio."),
-    HelpCommandSpec("football match", "sports", "/football match team:<name> [when:auto|live|next|last] [league]", "/football match team:<nombre> [when:auto|live|next|last] [league]", "Scoreboard, preview, lineups, statistics, events and odds in one match menu.", "Marcador, previa, alineaciones, estadísticas, eventos y cuotas en el menú del partido."),
-    HelpCommandSpec("football schedule", "sports", "/football schedule team:<name> date:<next|last> [league] [count]", "/football schedule team:<nombre> date:<next|last> [league] [count]", "Find a team's next/last match; count selects its position (default 1). Uses its domestic league unless league is supplied.", "Consulta el próximo/último partido de un equipo; count indica su posición (por defecto 1). Usa su liga nacional salvo que indiques league."),
-    HelpCommandSpec("football player", "sports", "/football player <player> [league] [season] [team]", "/football player <jugador> [league] [season] [team]", "Player profile, season stats, career teams, transfers, trophies and absence history; optional team filter.", "Perfil, estadísticas, trayectoria, transferencias, palmarés y ausencias; filtro opcional por equipo."),
-    HelpCommandSpec("football injuries", "sports", "/football injuries <team>", "/football injuries <equipo>", "Injuries/unavailable players.", "Lesiones/jugadores no disponibles."),
-    HelpCommandSpec("football transfers", "sports", "/football transfers <team>", "/football transfers <equipo>", "Recent transfers.", "Transferencias recientes."),
-    HelpCommandSpec("football h2h", "sports", "/football h2h team:<name> opponent:<name> [league] [matches]", "/football h2h team:<nombre> opponent:<nombre> [league] [matches]", "Recent meetings and sample comparison; matches defaults to 10 (1-50). League helps identify teams.", "Historial y comparación de la muestra; matches usa 10 por defecto (1-50). League ayuda a identificar equipos."),
+    HelpCommandSpec("football player", "sports", "/football player <player> [team]", "/football player <jugador> [equipo]", "Player profile, stats by competition, previous season, career teams, transfers, trophies and absences; team only separates players with the same name.", "Perfil, estadísticas por competición, temporada anterior, trayectoria, transferencias, palmarés y ausencias; el equipo solo distingue jugadores con el mismo nombre."),
+    HelpCommandSpec("football h2h", "sports", "/football h2h <team> <opponent>", "/football h2h <equipo> <rival>", "The last 10 meetings between two teams.", "Los últimos 10 enfrentamientos entre dos equipos."),
     HelpCommandSpec("football top", "sports", "/football top <scorers|assists|yellowcards|redcards>", "/football top <scorers|assists|yellowcards|redcards>", "Top scorers, assists, yellow cards, or red cards.", "Líderes de goles, asistencias, amarillas o rojas.", material_choices=("scorers", "assists", "yellowcards", "redcards")),
-    HelpCommandSpec("football odds-reference", "sports", "/football odds-reference <scope> [query]", "/football odds-reference <alcance> [busqueda]", "Bookmaker and odds-market reference IDs.", "IDs de bookmakers y mercados."),
-    HelpCommandSpec("football odds-mapping", "sports", "/football odds-mapping [page]", "/football odds-mapping [pagina]", "Fixtures available for pre-match odds.", "Partidos disponibles para cuotas previas."),
-    HelpCommandSpec("football timezones", "sports", "/football timezones", "/football timezones", "API-Football timezone catalog.", "Catalogo de zonas horarias."),
-    HelpCommandSpec("football countries", "sports", "/football countries [filter] [query]", "/football countries [filtro] [busqueda]", "API-Football country catalog.", "Catalogo de paises."),
-    HelpCommandSpec("football seasons", "sports", "/football seasons", "/football seasons", "API-Football season catalog.", "Catalogo de temporadas."),
+    HelpCommandSpec("football myteam", "sports", "/football myteam [team]", "/football myteam [equipo]", "Save your team for match and team, or show the saved one.", "Guarda tu equipo para match y team, o muestra el guardado."),
     HelpCommandSpec("birthday", "birthday", "/birthday", "/birthday", "Birthday command prompt.", "Ayuda rápida de cumpleaños."),
     HelpCommandSpec("birthday set", "birthday", "/birthday set <MM-DD|DD/MM> [year]", "/birthday set <MM-DD|DD/MM> [año]", "Save your birthday.", "Guarda tu cumpleaños."),
     HelpCommandSpec("birthday remove", "birthday", "/birthday remove", "/birthday remove", "Remove your birthday data.", "Elimina tus datos de cumpleaños."),
@@ -274,30 +263,6 @@ HELP_CAPABILITIES: tuple[HelpCapabilitySpec, ...] = (
     HelpCapabilitySpec("voice_conversation", "voice", "Conversational Voice", "Voz conversacional", "Nitori can also send voice messages when prompted; just ask her to do it.", "Nitori también puede enviar mensajes de voz cuando se lo pidas; solo tienes que pedírselo."),
     HelpCapabilitySpec("voice_tags", "voice", "Expressive Tags", "Etiquetas expresivas", "In voice delivery, supported xAI expressive tags may be used when semantically appropriate: " + ", ".join(f"`[{tag}]`" for tag in sorted(ALLOWED_TTS_TAGS)), "En respuestas de voz, se pueden usar etiquetas expresivas de xAI cuando tengan sentido: " + ", ".join(f"`[{tag}]`" for tag in sorted(ALLOWED_TTS_TAGS))),
 )
-
-
-SERVER_CONTEXT_TOPIC_TERMS: dict[str, tuple[str, ...]] = {
-    "football": (
-        "football",
-        "futbol",
-        "fútbol",
-        "soccer",
-        "partido",
-        "liga",
-        "goles",
-        "gol",
-        "fixture",
-        "api-football",
-    ),
-    "gaming": ("game", "gaming", "juego", "videojuego", "minecraft", "steam", "xbox", "playstation"),
-    "technology": ("code", "codigo", "código", "programacion", "programación", "deploy", "api", "bot", "server"),
-}
-
-SERVER_CONTEXT_STYLE_TERMS: dict[str, tuple[str, ...]] = {
-    "informal and conversational": ("wey", "we", "bro", "jaja", "lol", "no manches", "cabron", "cabrón"),
-    "polite and direct": ("please", "por favor", "gracias", "thanks"),
-    "concise replies": ("resume", "resumen", "short", "corto", "breve", "rapido", "rápido"),
-}
 
 
 class HelpPaginatorView(discord.ui.View):
@@ -420,8 +385,6 @@ class AdminCog(commands.Cog):
                     continue
 
             content = " ".join(content.split())
-            if self._is_context_line_suspicious(content):
-                continue
             if len(content) > 260:
                 content = f"{content[:257]}..."
 
@@ -440,31 +403,10 @@ class AdminCog(commands.Cog):
         lines = await self._collect_channel_messages(channel, lang)
         if not lines:
             return None
-
-        pseudo_rows = [
-            {
-                "role": "user",
-                "speaker": line.split(":", 1)[0].strip() if ":" in line else "User",
-                "content": line.split(":", 1)[1].strip() if ":" in line else line,
-                "message_id": str(index),
-                "author_user_id": line.split(":", 1)[0].strip() if ":" in line else "User",
-                "parent_message_id": str(index // 4),
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-            for index, line in enumerate(lines)
-        ]
-        if not self._has_enough_interaction_context(pseudo_rows):
-            return None
-
-        transcript = self._interaction_rows_to_transcript(pseudo_rows)
-        if not transcript:
-            return None
-        if len(transcript) > 22000:
-            transcript = transcript[:22000]
-
+        # Grok reads the members' own messages and decides what the server's tone, topics and jokes are.
         return await self.bot.llm_client.summarize_server_context(
             channel_name=channel.name,
-            messages_transcript=transcript,
+            messages_transcript="\n".join(lines)[:22000],
             language=lang,
         )
 
@@ -481,149 +423,9 @@ class AdminCog(commands.Cog):
             updated_at = updated_at.replace(tzinfo=timezone.utc)
         return datetime.now(timezone.utc) - updated_at >= timedelta(days=7)
 
-    @staticmethod
-    def _has_enough_interaction_context(rows: list[dict[str, object]]) -> bool:
-        eligible = AdminCog._eligible_server_context_rows(rows)
-        if len(eligible) < 12:
-            return False
-        branches = AdminCog._distinct_context_branches(eligible)
-        users = AdminCog._distinct_context_users(eligible)
-        days = AdminCog._distinct_context_days(eligible)
-        if len(branches) < 3:
-            return False
-        if len(users) < 2 and len(days) < 2:
-            return False
-        total_chars = sum(len(str(row.get("content", "")).strip()) for row in eligible)
-        return total_chars >= 240
 
-    @staticmethod
-    def _interaction_rows_to_transcript(rows: list[dict[str, object]]) -> str:
-        eligible = AdminCog._eligible_server_context_rows(rows)
-        stable = AdminCog._stable_server_context_patterns(eligible)
-        if not any(stable.values()):
-            return ""
-        lines = [
-            "Eligible stable server patterns only. Summarize only these pre-qualified patterns.",
-            "Do not add names, matches, clubs, players, files, images, events, commands, or one-off details.",
-        ]
-        for label, key in (
-            ("Tone", "tone"),
-            ("Inside jokes/memes", "inside_jokes"),
-            ("Common topics", "common_topics"),
-            ("Personality style", "personality_style"),
-            ("How the bot should reply", "reply_style"),
-        ):
-            values = stable.get(key, [])
-            if values:
-                lines.append(f"{label}: {' | '.join(values[:6])}")
-        return "\n".join(lines)
 
-    @staticmethod
-    def _eligible_server_context_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
-        eligible: list[dict[str, object]] = []
-        for row in rows:
-            if str(row.get("role", "")).strip().lower() != "user":
-                continue
-            content = " ".join(str(row.get("content", "")).strip().split())
-            if len(content) < 8:
-                continue
-            if AdminCog._is_context_line_suspicious(content):
-                continue
-            copy = dict(row)
-            copy["content"] = content
-            eligible.append(copy)
-        return eligible
 
-    @staticmethod
-    def _distinct_context_users(rows: list[dict[str, object]]) -> set[str]:
-        return {
-            str(row.get("author_user_id") or row.get("speaker") or "").strip().casefold()
-            for row in rows
-            if str(row.get("author_user_id") or row.get("speaker") or "").strip()
-        }
-
-    @staticmethod
-    def _context_branch_key(row: dict[str, object], index: int) -> str:
-        parent = str(row.get("parent_message_id") or "").strip()
-        if parent:
-            return parent
-        message_id = str(row.get("message_id") or "").strip()
-        channel_id = str(row.get("channel_id") or "").strip()
-        return f"{channel_id}:{message_id or index}"
-
-    @staticmethod
-    def _distinct_context_branches(rows: list[dict[str, object]]) -> set[str]:
-        return {AdminCog._context_branch_key(row, index) for index, row in enumerate(rows)}
-
-    @staticmethod
-    def _distinct_context_days(rows: list[dict[str, object]]) -> set[str]:
-        days: set[str] = set()
-        for row in rows:
-            raw = str(row.get("created_at") or "").strip()
-            if len(raw) >= 10:
-                days.add(raw[:10])
-        return days
-
-    @staticmethod
-    def _candidate_passes_context_threshold(rows: list[dict[str, object]]) -> bool:
-        if len(rows) < 3:
-            return False
-        if len(AdminCog._distinct_context_branches(rows)) < 2:
-            return False
-        if len(AdminCog._distinct_context_users(rows)) < 2 and len(AdminCog._distinct_context_days(rows)) < 2:
-            return False
-        return True
-
-    @staticmethod
-    def _stable_server_context_patterns(rows: list[dict[str, object]]) -> dict[str, list[str]]:
-        buckets: dict[str, dict[str, list[dict[str, object]]]] = {
-            "tone": defaultdict(list),
-            "inside_jokes": defaultdict(list),
-            "common_topics": defaultdict(list),
-            "personality_style": defaultdict(list),
-            "reply_style": defaultdict(list),
-        }
-        for row in rows:
-            text = str(row.get("content") or "")
-            normalized = text.casefold()
-            for topic, terms in SERVER_CONTEXT_TOPIC_TERMS.items():
-                if any(term in normalized for term in terms):
-                    buckets["common_topics"][topic].append(row)
-            for style, terms in SERVER_CONTEXT_STYLE_TERMS.items():
-                if any(term in normalized for term in terms):
-                    if style == "concise replies":
-                        buckets["reply_style"][style].append(row)
-                    elif style == "informal and conversational":
-                        buckets["tone"][style].append(row)
-                        buckets["personality_style"]["playful conversational energy"].append(row)
-                    else:
-                        buckets["tone"][style].append(row)
-            joke = AdminCog._inside_joke_candidate(text)
-            if joke:
-                buckets["inside_jokes"][joke].append(row)
-
-        stable: dict[str, list[str]] = {key: [] for key in buckets}
-        for field, candidates in buckets.items():
-            for label, evidence in candidates.items():
-                if AdminCog._candidate_passes_context_threshold(evidence):
-                    stable[field].append(label)
-        return stable
-
-    @staticmethod
-    def _inside_joke_candidate(text: str) -> str | None:
-        normalized = " ".join(text.strip().split())
-        if not normalized:
-            return None
-        lowered = normalized.casefold()
-        if any(term in lowered for terms in SERVER_CONTEXT_TOPIC_TERMS.values() for term in terms):
-            return None
-        if len(normalized) > 80:
-            return None
-        if re.search(r"\b[A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ]+)+", normalized):
-            return None
-        if any(marker in lowered for marker in ("jaja", "lol", "meme", "chiste")):
-            return normalized
-        return None
 
     @tasks.loop(hours=24)
     async def server_context_refresh_worker(self) -> None:
@@ -643,86 +445,34 @@ class AdminCog(commands.Cog):
             entry for entry in entries if int(entry.get("channel_id", 0)) > 0
         ]
         lang = await self._lang(guild)
-
-        if real_entries:
-            for entry in real_entries:
-                if not self._is_context_entry_stale(entry):
-                    continue
-                channel_id = int(entry["channel_id"])
-                channel = guild.get_channel(channel_id)
-                if not isinstance(channel, discord.TextChannel):
-                    continue
-                try:
-                    summary = await self._summarize_channel_context(
-                        channel=channel,
-                        lang=lang,
-                    )
-                except (discord.Forbidden, discord.HTTPException):
-                    logging.exception(
-                        "Failed to refresh AI channel context guild=%s channel=%s",
-                        guild.id,
-                        channel_id,
-                    )
-                    continue
-                if not summary:
-                    continue
-                await self.bot.db.upsert_server_context_entry(
-                    guild_id=guild.id,
-                    channel_id=channel.id,
-                    channel_name=channel.name,
-                    summary=summary,
-                    max_entries=2,
+        for entry in real_entries:
+            if not self._is_context_entry_stale(entry):
+                continue
+            channel_id = int(entry["channel_id"])
+            channel = guild.get_channel(channel_id)
+            if not isinstance(channel, discord.TextChannel):
+                continue
+            try:
+                summary = await self._summarize_channel_context(
+                    channel=channel,
+                    lang=lang,
                 )
-            return
-
-        sentinel_entry = next(
-            (
-                entry
-                for entry in entries
-                if int(entry.get("channel_id", 0)) == AI_INTERACTIONS_CONTEXT_CHANNEL_ID
-            ),
-            None,
-        )
-        if sentinel_entry is not None and not self._is_context_entry_stale(sentinel_entry):
-            return
-
-        since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-        rows = await self.bot.db.get_recent_ai_conversation_turns(guild.id, since)
-        if not self._has_enough_interaction_context(rows):
-            return
-
-        transcript = self._interaction_rows_to_transcript(rows)
-        if not transcript:
-            return
-        summary = await self.bot.llm_client.summarize_server_context(
-            channel_name="ai-interactions",
-            messages_transcript=transcript,
-            language=lang,
-        )
-        await self.bot.db.upsert_server_context_entry(
-            guild_id=guild.id,
-            channel_id=AI_INTERACTIONS_CONTEXT_CHANNEL_ID,
-            channel_name="ai-interactions",
-            summary=summary,
-            max_entries=2,
-        )
-
-    @staticmethod
-    def _is_context_line_suspicious(content: str) -> bool:
-        lowered = content.casefold()
-        markers = (
-            "ignore previous instructions",
-            "ignore all instructions",
-            "disregard previous instructions",
-            "you are now system",
-            "act as system",
-            "developer prompt",
-            "system prompt",
-            "reveal prompt",
-            "jailbreak",
-            "prompt injection",
-        )
-        return any(marker in lowered for marker in markers)
+            except (discord.Forbidden, discord.HTTPException):
+                logging.exception(
+                    "Failed to refresh AI channel context guild=%s channel=%s",
+                    guild.id,
+                    channel_id,
+                )
+                continue
+            if not summary:
+                continue
+            await self.bot.db.upsert_server_context_entry(
+                guild_id=guild.id,
+                channel_id=channel.id,
+                channel_name=channel.name,
+                summary=summary,
+                max_entries=2,
+            )
 
     @commands.hybrid_command(name="setmodlog", description="Set the moderation log channel.")
     @owner_or_has_permissions(manage_guild=True)
@@ -1424,16 +1174,18 @@ class AdminCog(commands.Cog):
             or perms.manage_nicknames
         )
 
+
     @staticmethod
     def documented_help_command_paths() -> set[str]:
-        return {item.path for item in HELP_COMMANDS}
+        return {spec.path for spec in HELP_COMMANDS}
 
     @staticmethod
     def documented_help_aliases() -> set[str]:
-        aliases: set[str] = set()
-        for item in HELP_COMMANDS:
-            aliases.update(item.aliases)
-        return aliases
+        return {
+            alias
+            for spec in HELP_COMMANDS
+            for alias in spec.aliases
+        }
 
     @staticmethod
     def _help_access_allowed(spec: HelpCommandSpec | HelpCapabilitySpec, *, is_admin: bool, is_mod: bool) -> bool:
@@ -1541,7 +1293,7 @@ class AdminCog(commands.Cog):
             "`/help`",
             "`/setup`",
             "`@Nitori <message>`",
-            "`/football live ligamx`",
+            "`/football match <team>`",
             "`/say mensaje:<text> modo:<text|voice>`",
             "`/meme create <template> <top> [bottom]`",
         ]

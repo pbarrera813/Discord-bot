@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -86,8 +87,16 @@ class _CompiledApiFootballRequest:
                 raise InvalidFootballApiRequest(f"{key} has an invalid compiled value.")
 
 
+def _search_text(value: object) -> str:
+    # API-Football refuses a search with anything but letters, digits and spaces ("Hernández", "O'Brien").
+    plain = "".join(ch for ch in unicodedata.normalize("NFKD", str(value)) if not unicodedata.combining(ch))
+    return " ".join(re.sub(r"[^0-9A-Za-z]+", " ", plain).split())
+
+
 def _envelope(endpoint: str, params: dict[str, object | None] | None = None, *, cache_ttl_seconds: int = 0) -> _CompiledApiFootballRequest:
-    clean = tuple((key, value) for key, value in (params or {}).items() if value is not None)
+    clean = tuple(
+        (key, _search_text(value) if key == "search" else value) for key, value in (params or {}).items() if value is not None
+    )
     return _CompiledApiFootballRequest(endpoint=endpoint, params=clean, cache_ttl_seconds=cache_ttl_seconds)
 
 

@@ -630,7 +630,7 @@ def player_pages(row: dict[str, Any], *, season: int | None, lang: str,
 
 
 def team_pages(team_row: dict[str, Any], standing: dict[str, Any] | None,
-               fixtures: list[dict[str, Any]], *, league: str, season: int, lang: str) -> list[dict[str, Any]]:
+               fixtures: list[dict[str, Any]], *, league: str, season: int | None, lang: str) -> list[dict[str, Any]]:
     from services.football_formatter import fixture_datetime, fixture_teams, fixture_score
     from services.football_live_match_service import build_lifecycle
 
@@ -653,7 +653,7 @@ def team_pages(team_row: dict[str, Any], standing: dict[str, Any] | None,
         rows.append((tr(lang, "Founded", "Fundado"), team["founded"]))
     if _value(team_row, "venue", "name"):
         rows.append((tr(lang, "Venue", "Estadio"), _value(team_row, "venue", "name")))
-    return _pages(team.get("name") or tr(lang, "Team", "Equipo"), f"{league} / {season}", rows,
+    return _pages(team.get("name") or tr(lang, "Team", "Equipo"), f"{league} / {season}" if season is not None else league, rows,
                   [team.get("logo")], standing.get("form"))
 
 

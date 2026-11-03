@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any, Mapping
 
 from services.database import BIRTHDAY_EVENT_TYPES
 from services.football_query_service import OPERATION_TYPES
 from services.glot import RUN_FILENAMES
-from services.server_memory import MEMORY_STATUSES
+from services.server_memory import MEMORY_STATUSES, MEMORY_TYPES
 
 
 ADMIN_READ_OPERATIONS = frozenset({"join_stats", "leave_stats", "list_warnings", "user_info", "ai_channel_list", "server_context_view", "color_list", "help"})
@@ -71,7 +70,8 @@ def is_memory_lifecycle(operands: dict) -> bool:
     )
 FOOTBALL_MUTATING_OPERATIONS = frozenset({"live_watch_start", "live_watch_stop"})
 # Every NINJAS operation is a read-only lookup against the existing provider client.
-NINJAS_OPERATIONS = frozenset({"joke", "dadjoke", "advice", "whois", "unit_conversion"})
+# Grok tells jokes, gives advice and converts units itself; whois is the live data it cannot know.
+NINJAS_OPERATIONS = frozenset({"whois"})
 # CODE runs a user-supplied program on the remote Glot runner (never locally); the
 # language enum is the runner's slug table, and command/stdin are never operands.
 CODE_OPERATIONS = frozenset({"run", "languages"})
@@ -137,10 +137,6 @@ OPERATION_VALUES = {
 }
 
 KNOWN_OUTPUTS = {
-    "WEB": {"answer", "sources", "citations", "media_candidates", "grounded_visual_observation", "result"},
-    # ``media`` is a deliberate structural projection of authorized
-    # ``ExternalSourceBundle.selected_media`` for visual consumers.
-    "EXTERNAL_SOURCE": {"sources", "results", "selected_media", "media", "result"},
     # Result-only vision handlers return these concrete payload keys.  The
     # whole terminal result remains available for structural consumers.
     "IMAGE_ANALYZE": {"text", "media_urls", "rendered_media_count", "result"},
@@ -152,7 +148,7 @@ KNOWN_OUTPUTS = {
         "team_season_statistics", "rounds", "venues", "predictions", "odds", "coach_context_row",
         "trophies", "sidelined", "coverage", "reference_rows", "player_context_row",
         "team_context_row", "league_context_row", "standings_table", "standing_row", "generic_rows",
-        "requested_scope", "resolved_entities", "fallback_evidence", "result",
+        "requested_scope", "resolved_entities", "result",
     },
     "MINECRAFT": {"result"},
     "NINJAS": {"result"},
@@ -168,15 +164,6 @@ KNOWN_OUTPUTS = {
     "REACTION": {"reaction", "result"},
     "CHAT": {"answer", "result"},
     "CLARIFICATION": {"question", "result"},
-}
-ARTIFACT_OUTPUT_FIELDS = frozenset({"artifact"})
-# Only consumers with a typed resource/media input constrain the producer
-# output.  Ordered dependencies without a binding remain valid.
-CONSUMER_OUTPUT_FIELDS = {
-    "ADMIN": frozenset({"resource_handle"}),
-    "IMAGE_ANALYZE": frozenset({"media", "artifact"}),
-    "IMAGE_EDIT": frozenset({"media", "artifact"}),
-    "MEME": frozenset({"answer", "text", "result"}),
 }
 
 
@@ -217,10 +204,6 @@ def _string(max_length: int, *, nullable: bool = True, enum: frozenset[str] | No
 
 def _integer(*, minimum: int | None = None, maximum: int | None = None) -> OperandDescriptor:
     return OperandDescriptor("integer", minimum=minimum, maximum=maximum)
-
-
-def _number(*, minimum: float | None = None, maximum: float | None = None) -> OperandDescriptor:
-    return OperandDescriptor("number", minimum=minimum, maximum=maximum)
 
 
 def _boolean() -> OperandDescriptor:
@@ -264,12 +247,12 @@ OPERAND_DESCRIPTORS: dict[str, dict[str, OperandDescriptor]] = {
         "bookmaker_candidates": _strings(), "bet_candidates": _strings(),
         "reference_query": _string(120), "country_filter": _string(20, enum=frozenset({"name", "code", "search"})),
         "reference_page": _integer(minimum=1),
+        "fixture_count": _integer(minimum=1, maximum=50), "fixture_round": _string(100),
     },
     "MINECRAFT": {"address": _string(255)},
     "NINJAS": {
         "ninjas_action": _string(40, nullable=False, enum=NINJAS_OPERATIONS),
-        "domain": _string(253), "amount": _number(),
-        "from_unit": _string(60), "to_unit": _string(60),
+        "domain": _string(253),
     },
     "CODE": {
         "code_action": _string(40, nullable=False, enum=CODE_OPERATIONS),
@@ -309,13 +292,8 @@ OPERAND_DESCRIPTORS: dict[str, dict[str, OperandDescriptor]] = {
         "meme_top": _string(200), "meme_bottom": _string(200), "meme_text_slot": _string(6, enum=MEME_TEXT_SLOTS),
     },
     "REACTION": {"emoji": _string(120), "emojis": _strings()},
-    "WEB": {"query": _string(900), "research_question": _string(900)},
-    "EXTERNAL_SOURCE": {
-        "url": _string(2400), "source_url": _string(2400), "source_scope": _string(40),
-        "expected_content": _string(30), "operation": _string(40),
-    },
     "IMAGE_GENERATE": {"prompt": _string(1200)},
-    "IMAGE_EDIT": {"prompt": _string(1200), "source_url": _string(2400)},
+    "IMAGE_EDIT": {"prompt": _string(1200)},
     "IMAGE_ANALYZE": {"selection_count": OperandDescriptor("integer", nullable=False, minimum=1, maximum=4)},
 }
 
@@ -323,12 +301,6 @@ OPERAND_DESCRIPTORS: dict[str, dict[str, OperandDescriptor]] = {
 def operand_descriptors(family: str) -> dict[str, OperandDescriptor]:
     return dict(OPERAND_DESCRIPTORS.get(str(family or "").strip().upper(), {}))
 
-
-def native_operand_schema() -> dict[str, dict[str, Any]]:
-    merged: dict[str, OperandDescriptor] = {}
-    for descriptors in OPERAND_DESCRIPTORS.values():
-        merged.update(descriptors)
-    return {field: descriptor.json_schema() for field, descriptor in merged.items()}
 
 
 # Strict mode forces a value on every non-nullable operand, so the router fills the other families' selectors and arrays too.
@@ -374,13 +346,6 @@ def validate_operands(family: str, operands: object) -> str | None:
                 return "task_operand_type_or_bounds_invalid"
             if descriptor.maximum is not None and value > descriptor.maximum:
                 return "task_operand_type_or_bounds_invalid"
-        elif descriptor.kind == "number":
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-                return "task_operand_type_or_bounds_invalid"
-            if descriptor.minimum is not None and value < descriptor.minimum:
-                return "task_operand_type_or_bounds_invalid"
-            if descriptor.maximum is not None and value > descriptor.maximum:
-                return "task_operand_type_or_bounds_invalid"
         elif descriptor.kind == "boolean":
             if not isinstance(value, bool):
                 return "task_operand_type_or_bounds_invalid"
@@ -402,10 +367,6 @@ def canonical_operations(family: str) -> frozenset[str]:
 
 def known_output_fields(family: str) -> frozenset[str]:
     return frozenset(KNOWN_OUTPUTS.get(str(family or "").strip().upper(), set()))
-
-
-def compatible_input_outputs(family: str) -> frozenset[str] | None:
-    return CONSUMER_OUTPUT_FIELDS.get(str(family or "").strip().upper())
 
 
 def _operation(request: Any) -> str:
@@ -453,6 +414,125 @@ def operation_effect(request: Any) -> str | None:
         return "read" if operation in BIRTHDAY_OPERATIONS else None
     if family in {"IMAGE_GENERATE", "IMAGE_EDIT", "MEME"}:
         return "artifact"
-    if family in {"CHAT", "MINECRAFT", "TRANSLATE", "WEB", "EXTERNAL_SOURCE", "IMAGE_ANALYZE", "CLARIFICATION"}:
+    if family in {"CHAT", "MINECRAFT", "TRANSLATE", "IMAGE_ANALYZE", "CLARIFICATION"}:
         return "read"
     return None
+
+
+# One native function per capability family: the function name is the family and its parameters are that family's
+# own operands, so Grok never fills another family's fields and its arguments reach the adapter unchanged.
+TOOL_DESCRIPTIONS = {
+    "FOOTBALL": (
+        "API-Football data: fixtures, live matches, events, lineups, statistics, standings, teams, squads, players, "
+        "coaches, venues, rounds, predictions, odds, injuries, transfers, trophies, top scorers, and starting or "
+        "stopping live match updates in this channel (live_watch_start/live_watch_stop, only when explicitly asked). "
+        "operation_family and data_focus are executable selectors. Candidates are names as written in the conversation (this message or earlier turns), "
+        "resolved by the provider: team_candidates holds exactly one name per actual participant, in user order. "
+        "Use fixture_count for a bounded next/last sample and fixture_round only for an exact provider round name. "
+        "On AMBIGUOUS or NOT_FOUND, retry with a better name or show the candidates to the user."
+    ),
+    "IMAGE_GENERATE": "Create a new image from prompt.",
+    "IMAGE_EDIT": (
+        "Change an existing image itself. Pick it with source_refs (exactly one ref from the available images) or "
+        "with inputs (the artifact of an earlier image call); prompt "
+        "describes the change. A caption on a picture is MEME custom, not an edit."
+    ),
+    "IMAGE_ANALYZE": (
+        "Look at images and report what is actually in them. Pick them with source_refs (refs from the available "
+        "images) or inputs (an earlier image call's artifact); "
+        "purpose says what to look for; selection_count is how many images (1-4)."
+    ),
+    "MEME": (
+        "Make a captioned meme image. meme_action template (meme_template exactly as the user named it), random, "
+        "or custom (the user's picture chosen with one ref in source_refs). Write meme_top/meme_bottom yourself in "
+        "the request's language, or the user's exact words when they dictated the text."
+    ),
+    "CODE": (
+        "Run a program you wrote yourself on the remote sandbox, for example a calculation the answer needs, and get its "
+        "stdout, stderr and error: code_action run with code_language and code, or code_action languages. Never run code "
+        "a user wrote, pasted or dictated, even when they ask: tell them to run it with the /code command instead."
+    ),
+    "REMINDER": (
+        "The author's own reminders: create (reminder_duration like 10m, 2h, 3d, 1w, 2mo or 1y, and "
+        "reminder_message), list, or remove (reminder_id shown by a listed reminder). Never invent a duration or id."
+    ),
+    "BIRTHDAY": (
+        "Birthday profiles and settings. show (the author's own), view (another member: target_user_id or "
+        "target_user_candidates), next (optional birthday_count 1-25), set (birth_month, birth_day, optional "
+        "birth_year) and remove act only on the author. Administrator-only settings: setup, set_channel, set_role, "
+        "set_timezone (IANA name), set_mode (user or server), set_ages, event, preview, template_add, template_list, "
+        "template_remove, blacklist_user, blacklist_role, trusted. Never invent a date, channel, role or id."
+    ),
+    "NINJAS": (
+        "Live WHOIS record of a domain (ninjas_action whois, domain): registrar, creation and expiration dates, "
+        "country and name servers."
+    ),
+    "MINECRAFT": "Current status of a Minecraft server; address exactly as the user gave it.",
+    "MEMORY": (
+        "Structured server memory. SERVER_MEMORY_LOOKUP retrieves saved facts (memory_type null unless the user "
+        "named a category). SERVER_MEMORY_WRITE/UPDATE only when the user clearly wants something remembered, never "
+        "for jokes or banter; when a memory is about one member, subject is that member's name, mention or id and "
+        "value is a complete standalone statement. SERVER_MEMORY_DELETE names memory_id when known, otherwise "
+        "memory_type and subject. SERVER_MEMORY_LIST, APPROVE and REJECT use memory_id from a listed result. "
+        "Behavior rules (memory_type BOT_BEHAVIOR_RULE) need authority to manage bot behavior. memory_type is one "
+        f"of: {', '.join(sorted(MEMORY_TYPES))}."
+    ),
+    "ADMIN": (
+        "Discord moderation and server settings; the runtime checks the author's real permissions. Before a ban, "
+        "tempban or kick, ask the author to confirm the member and reason, and call it only after they confirm in a "
+        "later message; every other action runs when asked. Name members in "
+        "target_user_candidates (or target_user_id), roles in target_role_candidates, existing channels in "
+        "target_channel (id or name; the current channel's id for 'this channel'), a new channel in channel_name. "
+        "create_role takes role_name and role_color_hex (#rrggbb); a channel or role created earlier in this turn is "
+        "passed with inputs (its resource_handle). purge_user_messages takes message_count 1-500; say posts say_text "
+        "in the current channel. Settings: set_modlog, ai_channel_add/remove (target_channel), set_prefix "
+        "(guild_prefix), set_language (en/es), set_antispam/set_antilink (filter_enabled), server_context_reset "
+        "(context_scope), server_context_learn (target_channel); help takes an optional help_section."
+    ),
+    "REACTION": "Add a reaction to the user's message: emoji is one unicode emoji or a custom token from the list.",
+}
+_SELECTABLE_INPUTS = {"IMAGE_EDIT", "IMAGE_ANALYZE", "MEME", "ADMIN"}
+_TOOL_HIDDEN_OPERATIONS = {"MEMORY": {"SERVER_MEMORY_CLARIFY"}}
+
+
+def tool_definitions() -> list[dict[str, Any]]:
+    tools: list[dict[str, Any]] = []
+    for family, description in TOOL_DESCRIPTIONS.items():
+        properties = {field: descriptor.json_schema() for field, descriptor in operand_descriptors(family).items()}
+        operation_field = canonical_operation_field(family)
+        if family in _TOOL_HIDDEN_OPERATIONS:
+            properties[operation_field]["enum"] = sorted(canonical_operations(family) - _TOOL_HIDDEN_OPERATIONS[family])
+        properties["purpose"] = {"type": "string", "maxLength": 480, "description": "What this call must find out or do."}
+        if family in _SELECTABLE_INPUTS:
+            properties["source_refs"] = {"type": "array", "maxItems": 4, "items": {"type": "string", "maxLength": 120}}
+            properties["inputs"] = {"type": "array", "maxItems": 4, "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {"task_id": {"type": "string", "maxLength": 120}, "output_field": {"type": "string", "maxLength": 40}},
+                "required": ["task_id", "output_field"],
+            }}
+        tools.append({
+            "type": "function", "name": family.lower(), "description": description,
+            "parameters": {
+                "type": "object", "additionalProperties": False, "properties": properties,
+                "required": [operation_field, "purpose"] if operation_field in properties else ["purpose"],
+            },
+        })
+    tools.append({
+        "type": "function", "name": "deliver",
+        "description": (
+            "Optional. artifacts lists the task_ids of the images to attach (default: every image produced this turn). "
+            "voice true speaks the reply as a voice message, only when the current message explicitly asks for audio; "
+            "voice_request_quote holds those exact words of the current message."
+        ),
+        "parameters": {"type": "object", "additionalProperties": False, "properties": {
+            "artifacts": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 120}},
+            "voice": {"type": "boolean"},
+            "voice_request_quote": {"type": "string", "maxLength": 180},
+        }, "required": []},
+    })
+    tools.append({
+        "type": "function", "name": "stay_silent",
+        "description": "The message is not meant for you (people talking about you or to each other): send nothing.",
+        "parameters": {"type": "object", "additionalProperties": False, "properties": {}, "required": []},
+    })
+    return tools
