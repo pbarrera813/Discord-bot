@@ -345,9 +345,8 @@ def compile_football_operation(
     if fixture_focus and str(data_focus or "").casefold() in {"venue", "stadium", "team_venue"}:
         operation_type = "fixture_result"
     planned_leagues = _list(plan, "league_candidates")
-    text_leagues = extract_alias_candidates("league", request) if not typed_plan else []
     prior_league = _league_candidate_from_prior_context(prior_context)
-    prior_league_candidates = clean_entity_candidates("league", [prior_league] if prior_league and not planned_leagues and not text_leagues else [], request, allow_contextual=True)
+    prior_league_candidates = clean_entity_candidates("league", [prior_league] if prior_league and not planned_leagues else [], request, allow_contextual=True)
     prior_league_keys = _candidate_keys(prior_league_candidates)
     prior_request = _prior_request_from_context(prior_context)
     prior_league_keys.update(
@@ -362,7 +361,7 @@ def compile_football_operation(
     league_candidates = _dedupe(
         [
             *clean_entity_candidates(
-                "league", [*planned_leagues, *text_leagues], request,
+                "league", list(planned_leagues), request,
                 allow_contextual=typed_plan,
                 allow_static_alias=not typed_plan,
             ),
@@ -403,7 +402,7 @@ def compile_football_operation(
     }:
         team_text_candidates = []
     elif route in {"FOOTBALL_WATCH_TODAY", "FOOTBALL_LIVE_WATCH_START"} and not planned_teams:
-        team_text_candidates = extract_alias_candidates("team", request) if route == "FOOTBALL_WATCH_TODAY" else []
+        team_text_candidates = []
     elif date_correction_only:
         team_text_candidates = []
     else:
@@ -630,16 +629,6 @@ def _slot_metadata(
             "source_component": "validated_football_context",
             "evidence": "prior_validated_context",
         }
-    alias = _alias_evidence(kind, candidate, request) if allow_static_alias else None
-    if alias:
-        return {
-            "source": "alias",
-            "authority": "DERIVED_ALIAS",
-            "literal": alias,
-            "source_component": "alias_extractor",
-            "evidence": alias,
-            "equivalent_to": candidate,
-        }
     if _phrase_in_text(candidate, request):
         return {
             "source": "deterministic_parser",
@@ -655,34 +644,6 @@ def _slot_metadata(
         "source_component": "native_router",
         "evidence": "planner_candidate",
     }
-
-
-def _alias_evidence(kind: str, candidate: str, request: str) -> str | None:
-    aliases = (
-        football_resolver.TEAM_ALIASES
-        if kind == "team"
-        else football_resolver.LEAGUE_ALIASES
-        if kind == "league"
-        else football_resolver.PLAYER_SEED_ALIASES
-        if kind == "player"
-        else {}
-    )
-    candidate_key = football_resolver.normalize_key(candidate)
-    for alias, canonical in aliases.items():
-        if kind == "league" and alias == "liga":
-            continue
-        canonical_key = football_resolver.normalize_key(canonical)
-        resolved_candidate_key = football_resolver.normalize_league_key(candidate) if kind == "league" else None
-        if canonical_key != candidate_key and canonical_key != resolved_candidate_key:
-            continue
-        if kind == "league" and alias == "laliga":
-            words_text = _normalize_words_text(request)
-            matched = bool(re.search(r"\blaliga\b", words_text) or re.search(r"\bla\s+liga\b(?!\s+de\b)", words_text))
-        else:
-            matched = _phrase_in_text(alias, request)
-        if matched:
-            return alias
-    return None
 
 
 def _team_slots(
@@ -912,12 +873,7 @@ def clean_entity_candidates(
                 abs(hash(key)) % 100000,
             )
             continue
-        if not allow_contextual and not _candidate_is_grounded(
-            kind,
-            cleaned,
-            original_request,
-            allow_static_alias=allow_static_alias,
-        ):
+        if not allow_contextual and not _phrase_in_text(cleaned, original_request):
             logging.info(
                 "AI football ungrounded candidate rejected kind=%s candidate_hash=%s request_hash=%s",
                 kind,
@@ -986,70 +942,6 @@ def looks_like_raw_sentence(value: str, original_request: str | None = None) -> 
         return True
     hint_count = sum(1 for word in words if word in _SENTENCE_HINTS)
     return hint_count >= 2
-
-
-def extract_alias_candidates(kind: str, text: str) -> list[str]:
-    if not football_resolver.normalize_key(text):
-        return []
-    aliases = (
-        football_resolver.TEAM_ALIASES
-        if kind == "team"
-        else football_resolver.LEAGUE_ALIASES
-        if kind == "league"
-        else football_resolver.PLAYER_SEED_ALIASES
-    )
-    candidates: list[str] = []
-    words_text = _normalize_words_text(text)
-    for alias, canonical in sorted(aliases.items(), key=lambda item: len(item[0]), reverse=True):
-        if kind == "league" and alias == "liga":
-            matched = False
-        elif kind == "league" and alias == "laliga":
-            matched = bool(
-                re.search(r"\blaliga\b", words_text)
-                or re.search(r"\bla\s+liga\b(?!\s+de\b)", words_text)
-            )
-        else:
-            matched = _phrase_in_text(alias, text)
-        if matched:
-            candidates.append(canonical)
-    return clean_entity_candidates(kind, candidates, text)
-
-
-def _candidate_is_grounded(
-    kind: str,
-    candidate: str,
-    text: str,
-    *,
-    allow_static_alias: bool = True,
-) -> bool:
-    candidate_key = football_resolver.normalize_key(candidate)
-    if kind == "league" and candidate_key == "laliga" and re.search(r"\bla\s+liga\s+de\b", _normalize_words_text(text)):
-        return False
-    if _phrase_in_text(candidate, text):
-        return True
-    if kind == "league" and football_resolver.normalize_key(candidate) == "laliga":
-        normalized = _normalize_words_text(text)
-        if re.search(r"\bla\s+liga\b(?!\s+de\b)", normalized):
-            return True
-    if not allow_static_alias:
-        return False
-    aliases = (
-        football_resolver.TEAM_ALIASES
-        if kind == "team"
-        else football_resolver.LEAGUE_ALIASES
-        if kind == "league"
-        else football_resolver.PLAYER_SEED_ALIASES
-        if kind == "player"
-        else {}
-    )
-    for alias, canonical in aliases.items():
-        canonical_key = football_resolver.normalize_key(canonical)
-        resolved_candidate_key = football_resolver.normalize_league_key(candidate) if kind == "league" else None
-        if canonical_key != candidate_key and canonical_key != resolved_candidate_key:
-            continue
-        if _phrase_in_text(alias, text):
-            return True
-    return False
 
 
 def _phrase_in_text(phrase: str, text: str) -> bool:
@@ -1353,7 +1245,7 @@ def _operation_type(route_action: str, data_focus: str | None, request: str, has
 
 
 def _team_candidates_from_text(text: str) -> list[str]:
-    candidates = extract_alias_candidates("team", text)
+    candidates: list[str] = []
     for side in re.split(r"(?i)\b(?:vs|contra|versus)\b", text):
         side_cleaned = re.sub(
             r"(?i)\b(?:historial|h2h|head\s+to\s+head|partido|juego|goles|quien|qui[eé]n|metio|meti[oó]|de|del|la|el|los|las|ya|termin[oó]|termino|como|quedaron|quedo|resultado)\b",
@@ -1381,7 +1273,7 @@ def _player_candidates_from_text(parsed: football_resolver.PlayerQuery, route_ac
         and not _looks_like_player_entity_request(request)
     ):
         return []
-    candidates = [_title_candidate(item) for item in parsed.candidates if not _looks_like_known_team_or_league(item)]
+    candidates = [_title_candidate(item) for item in parsed.candidates]
     return _dedupe(candidates)
 
 
@@ -1428,12 +1320,7 @@ def _looks_like_player_entity_request(text: str) -> bool:
     ):
         return False
     parsed = football_resolver.parse_player_query(text)
-    return any(not looks_like_raw_sentence(candidate, text) and not _looks_like_known_team_or_league(candidate) for candidate in parsed.candidates)
-
-
-def _looks_like_known_team_or_league(candidate: str) -> bool:
-    key = football_resolver.normalize_key(candidate)
-    return key in football_resolver.TEAM_ALIASES or key in football_resolver.LEAGUE_ALIASES
+    return any(not looks_like_raw_sentence(candidate, text) for candidate in parsed.candidates)
 
 
 def _title_candidate(candidate: str) -> str:

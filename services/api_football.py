@@ -14,7 +14,6 @@ import aiohttp
 
 from services.football_api_request_compiler import (
     CoachSearchRequest,
-    FixtureIdsRequest,
     FixturePlayersRequest,
     FixtureRoundsRequest,
     FixtureStatisticsRequest,
@@ -37,14 +36,15 @@ from services.football_api_request_compiler import (
     TeamStatisticsRequest,
     TransferRequest,
     VenueSearchRequest,
-    _make_country_slot,
-    _make_league_slot,
     build_fixture_players_request,
     build_fixture_statistics_request,
-    build_league_search_request,
     build_team_statistics_request,
     validate_positive_int,
 )
+
+
+# ponytail: a surname with more than this many 250-row pages is cut here; raise it only if a real player is missed.
+PROFILE_SEARCH_MAX_PAGES = 4
 
 
 class FootballApiError(RuntimeError):
@@ -149,59 +149,6 @@ def _date_string(value: str) -> str:
 
 
 class ApiFootballClient:
-    _LEAGUE_DEFAULT_IDS: dict[str, int] = {
-        "ligamx": 262,
-        "premier": 39,
-        "laliga": 140,
-        "champions": 2,
-        "worldcup": 1,
-        "expansionmx": 263,
-    }
-    _LEAGUE_SEARCH_PROFILES: dict[str, list[dict[str, Any]]] = {
-        "ligamx": [
-            {"country": "Mexico", "name": "Liga MX"},
-            {"search": "Liga MX"},
-        ],
-        "premier": [
-            {"country": "England", "name": "Premier League"},
-            {"search": "Premier League"},
-        ],
-        "laliga": [
-            {"country": "Spain", "name": "La Liga"},
-            {"country": "Spain", "name": "Primera Division"},
-            {"search": "La Liga"},
-        ],
-        "champions": [
-            {"country": "World", "name": "UEFA Champions League"},
-            {"search": "Champions League"},
-        ],
-        "concacaf": [
-            {"country": "World", "name": "CONCACAF Champions Cup"},
-            {"country": "World", "name": "CONCACAF Champions League"},
-            {"search": "CONCACAF Champions"},
-            {"search": "Champions Cup"},
-        ],
-        "worldcup": [
-            {"country": "World", "name": "World Cup"},
-            {"search": "World Cup"},
-        ],
-        "expansionmx": [
-            {"country": "Mexico", "name": "Liga de Expansion MX"},
-            {"country": "Mexico", "name": "Liga de Expansión MX"},
-            {"search": "Liga de Expansion MX"},
-            {"search": "Liga de Expansión"},
-        ],
-    }
-    _LEAGUE_NAME_HINTS: dict[str, tuple[str, ...]] = {
-        "ligamx": ("liga", "mx"),
-        "premier": ("premier",),
-        "laliga": ("liga",),
-        "champions": ("champions",),
-        "concacaf": ("concacaf", "champions"),
-        "worldcup": ("world", "cup"),
-        "expansionmx": ("expansi",),
-    }
-
     def __init__(self, *, api_key: str, base_url: str = "https://v3.football.api-sports.io", timezone_name: str = "America/Mexico_City") -> None:
         self.api_key = api_key.strip()
         self.base_url = base_url.rstrip("/")
@@ -389,25 +336,6 @@ class ApiFootballClient:
                 items.append({"value": item})
         return items
 
-    async def resolve_league_id(
-        self,
-        league_key: str,
-    ) -> int:
-        key = str(league_key or "").strip().casefold()
-
-        now = time.monotonic()
-        cached = self._league_id_cache.get(key)
-        if cached and now - cached[0] <= 21600:
-            return cached[1]
-
-        selected = await self._resolve_league_id_from_api(key)
-        if selected is None:
-            selected = self._LEAGUE_DEFAULT_IDS.get(key)
-        if not isinstance(selected, int):
-            raise FootballApiError(f"Unsupported league key: {league_key}")
-        self._league_id_cache[key] = (now, selected)
-        return selected
-
     async def search_leagues(
         self,
         request: LeagueSearchRequest,
@@ -428,48 +356,6 @@ class ApiFootballClient:
         league_id = validate_positive_int(league_id, "league_id")
         season = _optional_season_int(season)
         return await self._request(_envelope("/leagues", {"id": league_id, "season": season}, cache_ttl_seconds=3600))
-
-    async def _resolve_league_id_from_api(self, league_key: str) -> int | None:
-        profiles = self._LEAGUE_SEARCH_PROFILES.get(league_key, [])
-        for params in profiles:
-            league_candidate = _make_league_slot(params.get("name") or params.get("search") or league_key, source="alias")
-            country_candidate = _make_country_slot(params["country"], source="alias") if params.get("country") else None
-            rows = await self.search_leagues(
-                build_league_search_request(
-                    league_candidate if params.get("name") else None,
-                    country=country_candidate,
-                    search=league_candidate if params.get("search") else None,
-                )
-            )
-            picked = self._pick_league_id(rows, league_key)
-            if isinstance(picked, int):
-                return picked
-        return None
-
-    @classmethod
-    def _pick_league_id(cls, leagues: list[dict[str, Any]], league_key: str) -> int | None:
-        hints = cls._LEAGUE_NAME_HINTS.get(league_key, ())
-        for item in leagues:
-            league = item.get("league")
-            if not isinstance(league, dict):
-                continue
-            league_id = league.get("id")
-            name = str(league.get("name", "")).strip().casefold()
-            league_type = str(league.get("type", "")).strip().casefold()
-            if not isinstance(league_id, int):
-                continue
-            if league_type not in ("league", "cup"):
-                continue
-            if all(hint in name for hint in hints):
-                return league_id
-        for item in leagues:
-            league = item.get("league")
-            if not isinstance(league, dict):
-                continue
-            league_id = league.get("id")
-            if isinstance(league_id, int):
-                return league_id
-        return None
 
     async def get_current_season(self, league_id: int) -> int:
         now = time.monotonic()
@@ -635,17 +521,6 @@ class ApiFootballClient:
         fixture_id = validate_positive_int(fixture_id, "fixture_id")
         return await self._request(_envelope("/fixtures", {"id": fixture_id, "timezone": self.timezone_name}, cache_ttl_seconds=cache_ttl_seconds))
 
-    async def get_fixtures_by_ids(self, request: FixtureIdsRequest) -> list[dict[str, Any]]:
-        if not isinstance(request, FixtureIdsRequest):
-            raise InvalidFootballApiRequest("get_fixtures_by_ids requires a compiled fixture IDs request.")
-        return await self._request(
-            _envelope(
-                "/fixtures",
-                {"ids": "-".join(str(item) for item in request.fixture_ids), "timezone": self.timezone_name},
-                cache_ttl_seconds=60,
-            )
-        )
-
     async def get_fixture_events(self, *, fixture_id: int) -> list[dict[str, Any]]:
         fixture_id = validate_positive_int(fixture_id, "fixture_id")
         return await self._request(_envelope("/fixtures/events", {"fixture": fixture_id}, cache_ttl_seconds=60))
@@ -707,7 +582,18 @@ class ApiFootballClient:
     async def search_player_profiles(self, request: PlayerProfileRequest) -> list[dict[str, Any]]:
         if not isinstance(request, PlayerProfileRequest):
             raise InvalidFootballApiRequest("search_player_profiles requires a compiled profile request.")
-        return await self._request(_envelope("/players/profiles", {"search": request.lastname.value}, cache_ttl_seconds=21600))
+        rows: list[dict[str, Any]] = []
+        for page_number in range(1, PROFILE_SEARCH_MAX_PAGES + 1):
+            # Page 1 keeps the plain request (and its cache entry); a common surname spans several 250-row pages.
+            page = await self._request(
+                _envelope("/players/profiles", {"search": request.lastname.value, "page": page_number if page_number > 1 else None}, cache_ttl_seconds=21600),
+                include_paging=True,
+            )
+            page = page if isinstance(page, FootballApiPage) else FootballApiPage(page)
+            rows.extend(page.rows)
+            if page_number >= (page.total or 1):
+                break
+        return rows
 
     async def get_player_stats(self, request: PlayerStatsRequest) -> list[dict[str, Any]]:
         if not isinstance(request, PlayerStatsRequest):

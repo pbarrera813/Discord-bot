@@ -20,7 +20,6 @@ import discord
 from discord.ext import commands
 
 from cogs.birthdays import (
-    BIRTHDAY_TEMPLATE_LIMIT,
     BirthdayError,
     add_birthday_template,
     birthday_module_enabled,
@@ -107,7 +106,6 @@ from services.ai_capability_orchestrator import (
     CapabilityTerminalResult,
     execute_ordered_capabilities,
     normalize_terminal_result,
-    evidence_read_key,
     hash_text,
 )
 from utils.i18n import tr
@@ -170,25 +168,6 @@ class ContinuationLease:
     active_typed_context: tuple[CapabilityExecutionPlan, CapabilityResultBundle] | None = None
 
 
-@dataclass
-class FootballTurnContext:
-    guild_id: int
-    channel_id: int
-    owner_user_id: int
-    payload: dict[str, object]
-    last_operation: str
-    source_user_message_id: int | None
-    source_assistant_message_id: int | None
-    updated_at: float
-    expires_at: float
-    dormant: bool = False
-
-    def to_prior_context(self) -> str:
-        data = dict(self.payload)
-        data["operation_type"] = data.get("operation_type") or self.last_operation
-        return json.dumps(data, ensure_ascii=False, separators=(",", ":"))[:700]
-
-
 @dataclass(frozen=True)
 class RouteDecision:
     participation: str
@@ -246,7 +225,7 @@ class FootballLiveWatch:
     canceled: bool = False
 
 
-STRONG_ANCHORS: Final[set[str]] = {"DIRECT_MENTION", "REPLY_TO_AI", "NAME_AT_START", "REPLY_TO_WATCH"}
+STRONG_ANCHORS: Final[set[str]] = {"DIRECT_MENTION", "REPLY_TO_AI", "NAME_REFERENCE", "REPLY_TO_WATCH"}
 # Keep typed continuity available through ordinary pauses while retaining bounded freshness.
 CONTINUATION_LEASE_SECONDS: Final[float] = 600.0
 PENDING_INTERACTION_SECONDS: Final[float] = 90.0
@@ -259,7 +238,6 @@ class AIChatCog(commands.Cog):
         self._cooldown_seconds = 4.0
         self._continuation_lease_seconds = CONTINUATION_LEASE_SECONDS
         self._continuation_leases: dict[tuple[int, int], ContinuationLease] = {}
-        self._football_turn_contexts: dict[tuple[int, int, int], FootballTurnContext] = {}
         self._pending_interactions: dict[tuple[int, int, int, int | None], PendingInteraction] = {}
         self._pending_versions: dict[tuple[int, int, int, int | None], int] = {}
         self._football_live_watches: dict[tuple[int, int], FootballLiveWatch] = {}
@@ -593,7 +571,7 @@ class AIChatCog(commands.Cog):
         execution_context.execution_plan = delivery_plan
         await self._deliver_turn_reply(
             message, reply=str(reply), convo_key=convo_key, user_prompt=user_prompt, dispatch_action="CHAT",
-            route_decision=route_decision, result_only_composition=True, execution_plan=delivery_plan,
+            route_decision=route_decision, execution_plan=delivery_plan,
             execution_context=execution_context, pending_for_send=pending_for_send, reply_to_trigger=reply_to_trigger,
             anchor_type=anchor_type,
         )
@@ -715,7 +693,7 @@ class AIChatCog(commands.Cog):
         if operation_effect(request) is None:
             return None, None, "unknown or missing operation"
         requirement = CapabilityRequirement(
-            requirement_id=call_id, objective=purpose or evidence, capability_owner=family, owner_task_id=call_id,
+            requirement_id=call_id, objective=purpose, capability_owner=family, owner_task_id=call_id,
         )
         return request, requirement, None
 
@@ -817,7 +795,7 @@ class AIChatCog(commands.Cog):
 
     async def _deliver_turn_reply(
         self, message, *, reply: str, convo_key, user_prompt: str, dispatch_action: str, route_decision: RouteDecision,
-        result_only_composition: bool, execution_plan, execution_context: CapabilityExecutionContext, pending_for_send,
+        execution_plan, execution_context: CapabilityExecutionContext, pending_for_send,
         reply_to_trigger: bool, anchor_type: str,
     ) -> None:
         if not self._pending_can_send(pending_for_send):
@@ -851,7 +829,7 @@ class AIChatCog(commands.Cog):
         )
         native_artifact_sinks: list[tuple[object, CapabilityTerminalResult, dict[str, object], bytes, str, str]] = []
         artifact_sinks_valid = True
-        if result_only_composition and execution_plan.semantic_plan.semantic_source == "router":
+        if execution_plan.semantic_plan.semantic_source == "router":
             declared_sinks = execution_plan.semantic_plan.response_delivery.get("artifacts", ())
             if isinstance(declared_sinks, (list, tuple)):
                 requests_by_task = {item.task_id: item for item in execution_plan.ordered_capabilities}
@@ -1069,7 +1047,7 @@ class AIChatCog(commands.Cog):
                 resolved_request=route_decision.resolved_request,
             )
         native_sink_delivery = bool(
-            result_only_composition and execution_plan.semantic_plan.semantic_source == "router"
+            execution_plan.semantic_plan.semantic_source == "router"
             and execution_plan.semantic_plan.response_delivery.get("artifacts")
         )
         if native_sink_delivery:
@@ -1125,8 +1103,6 @@ class AIChatCog(commands.Cog):
                 resolved_request=route_decision.resolved_request,
                 execution_context=continuation_context,
             )
-        if dispatch_action == "CHAT":
-            self._mark_football_context_dormant(message)
         self._clear_pending_interaction(pending_for_send, event="success")
 
     @commands.hybrid_command(
@@ -1596,11 +1572,8 @@ class AIChatCog(commands.Cog):
             logging.exception("Failed to check persisted AI reply message")
             return False
 
-    def _is_addressed_to_bot_by_name(self, content: str) -> bool:
-        return self._alias_at_start_match(content) is not None
-
     def _canonical_bot_aliases(self) -> set[str]:
-        return {"nitori", "nitori-buchona", "nitori buchona"}
+        return {"nitori"}
 
     def _bot_aliases(self) -> set[str]:
         aliases = set(self._canonical_bot_aliases())
@@ -1629,21 +1602,6 @@ class AIChatCog(commands.Cog):
         normalized = re.sub(r"[^\w\s]", " ", normalized, flags=re.UNICODE)
         return " ".join(normalized.split())
 
-    def _alias_at_start_match(self, content: str) -> str | None:
-        normalized = self._normalize_alias_text(content)
-        if not normalized:
-            return None
-        prefixes = ("", "oye ", "hey ", "ey ", "oie ")
-        for alias in sorted(self._bot_aliases(), key=len, reverse=True):
-            alias_norm = self._normalize_alias_text(alias)
-            if not alias_norm:
-                continue
-            for prefix in prefixes:
-                candidate = f"{prefix}{alias_norm}".strip()
-                if normalized == candidate or normalized.startswith(candidate + " "):
-                    return alias_norm
-        return None
-
     def _alias_reference_match(self, content: str) -> str | None:
         normalized = self._normalize_alias_text(content)
         if not normalized:
@@ -1653,7 +1611,7 @@ class AIChatCog(commands.Cog):
             alias_norm = self._normalize_alias_text(alias)
             if not alias_norm:
                 continue
-            if f" {alias_norm} " in padded and self._alias_at_start_match(content) is None:
+            if f" {alias_norm} " in padded:
                 return alias_norm
         return None
 
@@ -1676,8 +1634,6 @@ class AIChatCog(commands.Cog):
             return "REPLY_TO_AI"
         if self._is_reply_to_watch_message(message):
             return "REPLY_TO_WATCH"
-        if self._is_addressed_to_bot_by_name(message.content):
-            return "NAME_AT_START"
         if await self._is_same_user_continuation_candidate(
             message,
             prefix=prefix,
@@ -1858,32 +1814,6 @@ class AIChatCog(commands.Cog):
             resolved_request=resolved_request,
             active_typed_context=active_typed_context,
         )
-
-    def _football_context_key(self, message: discord.Message) -> tuple[int, int, int] | None:
-        guild_id = getattr(getattr(message, "guild", None), "id", None)
-        channel_id = getattr(getattr(message, "channel", None), "id", None)
-        author_id = getattr(getattr(message, "author", None), "id", None)
-        if guild_id is None or channel_id is None or author_id is None:
-            return None
-        return int(guild_id), int(channel_id), int(author_id)
-
-    def _valid_football_turn_context(self, message: discord.Message) -> FootballTurnContext | None:
-        key = self._football_context_key(message)
-        if key is None:
-            return None
-        context = self._football_turn_contexts.get(key)
-        if context is None:
-            return None
-        if time.monotonic() > context.expires_at:
-            self._football_turn_contexts.pop(key, None)
-            return None
-        return context
-
-
-    def _mark_football_context_dormant(self, message: discord.Message) -> None:
-        context = self._valid_football_turn_context(message)
-        if context is not None:
-            context.dormant = True
 
     def _pending_key(
         self,
@@ -2557,8 +2487,8 @@ class AIChatCog(commands.Cog):
             provider="admin_actions",
             payload=payload,
             provenance={"source": "AdminActionService"},
-            delivery_metadata={"direct_failure_message": direct_message} if direct_message else None,
-            reason=reason,
+            # Grok reads the reason, so the specific refusal text goes with the code and it can fix the arguments.
+            reason=f"{reason}: {direct_message}" if direct_message else reason,
             satisfies_request=False,
         )
 
@@ -3117,10 +3047,9 @@ class AIChatCog(commands.Cog):
         raw_memory_type = payload.get("memory_type")
         # Grok leaves memory_type out of a lookup when the user named no category: that searches every category.
         untyped_lookup = decision.action == "SERVER_MEMORY_LOOKUP" and raw_memory_type is None
+        if raw_memory_type is None and not untyped_lookup:
+            return refused("VALIDATION_FAILED", "missing required argument: memory_type")
         memory_type_identity = str(raw_memory_type or "")
-        normalization_identity = (
-            "SERVER_FACT" if raw_memory_type is None and not untyped_lookup else memory_type_identity
-        )
         bounded_memory_type_identity = memory_type_identity[:2400]
         input_type_name = type(raw_memory_type).__name__
         if input_type_name not in {"str", "int", "float", "bool", "list", "tuple", "dict", "NoneType"}:
@@ -3149,7 +3078,7 @@ class AIChatCog(commands.Cog):
             memory_type = None
         else:
             try:
-                memory_type = ServerMemoryService.normalize_memory_type(normalization_identity)
+                memory_type = ServerMemoryService.normalize_memory_type(memory_type_identity)
             except ValueError:
                 return refused("VALIDATION_FAILED", f"memory_type must be one of {sorted(MEMORY_TYPES)} or left out")
         authority = self._route_authority_metadata(message)
@@ -4128,60 +4057,6 @@ class AIChatCog(commands.Cog):
             payload={"operation": operation, "memory_id": memory_id, "status_after": status_after},
         )
 
-    async def _execute_translate_result_only(
-        self,
-        message: discord.Message,
-        replied_message: discord.Message | None,
-        operands: dict[str, object],
-    ) -> CapabilityTerminalResult:
-        def failure(status: CapabilityTerminalStatus, reason: str, *, provider: str = "orchestrator") -> CapabilityTerminalResult:
-            return normalize_terminal_result(
-                "TRANSLATE",
-                status,
-                provider=provider,
-                provenance={"source": "typed_task_operands" if provider == "orchestrator" else "xai_translate"},
-                reason=reason,
-                satisfies_request=False,
-            )
-
-        target = " ".join(str(operands.get("target_language") or "").split())
-        if not target:
-            return failure(CapabilityTerminalStatus.VALIDATION_FAILED, "missing_translate_operand")
-        text = str(operands.get("text") or "").strip()
-        source = operands.get("text_source")
-        if bool(text) == bool(source):
-            return failure(CapabilityTerminalStatus.VALIDATION_FAILED, "translate_text_source_invalid")
-        if source:
-            # Structural authority only: the exact referenced, non-bot message.
-            authorized, _content = self._authorized_reply_source(message, replied_message)
-            text = str(getattr(replied_message, "content", "") or "").strip() if authorized else ""
-            if not text:
-                return failure(CapabilityTerminalStatus.VALIDATION_FAILED, "reply_source_unavailable")
-            if len(text) > 1800:
-                return failure(CapabilityTerminalStatus.VALIDATION_FAILED, "translate_text_too_long")
-        try:
-            translated = await self.bot.llm_client.translate(text=text, target_language=target)
-        except Exception as exc:
-            logging.exception("AI TRANSLATE result-only translation failed")
-            return failure(CapabilityTerminalStatus.PROVIDER_FAILURE, type(exc).__name__, provider="xai_translate")
-        if getattr(translated, "refused", False):
-            return failure(CapabilityTerminalStatus.PROVIDER_FAILURE, "translation_refused", provider="xai_translate")
-        if getattr(translated, "incomplete", False):
-            return failure(CapabilityTerminalStatus.PROVIDER_FAILURE, "translation_incomplete", provider="xai_translate")
-        return normalize_terminal_result(
-            "TRANSLATE",
-            CapabilityTerminalStatus.SUCCESS,
-            provider="xai_translate",
-            payload={
-                "text": str(translated),
-                "target_language": target,
-                "text_source": "replied_message" if source else "provided",
-            },
-            provenance={"source": "xai_translate"},
-            scope={"target_language": target},
-            satisfies_request=True,
-        )
-
     async def _execute_meme_result_only(
         self,
         operands: dict[str, object],
@@ -4534,7 +4409,6 @@ class AIChatCog(commands.Cog):
         # Every task is one of Grok's function calls and carries its own typed operands.
         semantic_plan = getattr(execution_plan, "semantic_plan", None)
         resolution_message = message
-        preflight_lang = admin_lang
 
         def _task_operands(request: object, context: CapabilityExecutionContext) -> dict[str, object]:
             operands = getattr(request, "operands", None)
@@ -4576,8 +4450,6 @@ class AIChatCog(commands.Cog):
                 if isinstance(value, str) and value.strip():
                     return value
             task_id = getattr(request, "task_id", None)
-            if execution_context is not None and task_id in execution_context.evidence_requirements:
-                return str(getattr(request, "evidence_span", "") or "")
             for requirement in tuple(getattr(semantic_plan, "requirements", ()) or ()):
                 if getattr(requirement, "owner_task_id", None) == task_id:
                     value = str(getattr(requirement, "objective", "") or "").strip()
@@ -4596,60 +4468,6 @@ class AIChatCog(commands.Cog):
             )
 
         capability_requests = tuple(execution_plan.ordered_capabilities)
-        prepared_live_watch_fixtures: dict[str, dict[str, Any]] = {}
-
-        async def chat_handler(_request, _context):
-            task_operands = _task_operands(_request, _context)
-            objective = _task_objective(_request, task_operands)
-            if not objective:
-                return _task_failure("CHAT", "missing_chat_task_objective")
-            bound_lines: list[str] = []
-            for binding in tuple(getattr(_request, "input_bindings", ()) or ()):
-                upstream = _context.results.get(getattr(binding, "upstream_task_id", ""))
-                if (
-                    upstream is None
-                    or upstream.status != CapabilityTerminalStatus.SUCCESS
-                    or not upstream.satisfies_request
-                    or upstream.provenance.get("authorized") is False
-                ):
-                    return _task_failure("CHAT", "bound_chat_evidence_unavailable")
-                field = str(getattr(binding, "output_field", "") or "").strip()
-                value = task_operands.get(field.rsplit(".", 1)[-1])
-                if value is None:
-                    return _task_failure("CHAT", "bound_chat_evidence_missing")
-                bound_lines.append(f"{field}={value}")
-            trusted_context = (
-                "[AUTHORIZED_BOUND_TASK_EVIDENCE]\n" + "\n".join(bound_lines)
-                if bound_lines
-                else None
-            )
-            # A CHAT task owns only its own objective; the final answer sees the whole request.
-            answer = await self.bot.llm_client.chat(
-                server_context=settings.server_context,
-                user_message=objective,
-                trusted_capability_context=trusted_context,
-                author_name=message.author.display_name,
-                channel_name=getattr(message.channel, "name", "unknown"),
-                channel_reference=self._channel_reference(message.channel),
-                available_channels=self._serialize_text_channels(message.guild),
-                available_emojis=self._serialize_custom_emojis(message.guild),
-                conversation_history=[],
-                is_owner=self.bot.is_owner_user(message.author),
-                conversation_mode="command",
-                reply_language=getattr(settings, "language_code", None),
-                author_permissions=self._author_permissions_text(message),
-            )
-            if not isinstance(answer, str) or not answer.strip():
-                return _task_failure("CHAT", "empty_chat_answer")
-            return normalize_terminal_result(
-                "CHAT",
-                "SUCCESS",
-                provider="xai_chat",
-                payload={"answer": answer},
-                provenance={"source": "chat_handler", "authorized": True},
-                scope={"scope": "GENERAL_REASONING"},
-                satisfies_request=True,
-            )
 
         async def image_handler(_request, context):
             task_operands = _task_operands(_request, context)
@@ -4727,7 +4545,6 @@ class AIChatCog(commands.Cog):
                     message,
                     task_decision,
                     operands=task_operands,
-                    prepared_fixture=prepared_live_watch_fixtures.get(getattr(_request, "task_id", "")),
                 )
             return await self._execute_football_action(
                 message,
@@ -4754,18 +4571,12 @@ class AIChatCog(commands.Cog):
         async def birthday_handler(_request, _context):
             return await self._execute_birthday_result_only(message, _task_operands(_request, _context))
 
-        async def translate_handler(_request, _context):
-            return await self._execute_translate_result_only(
-                message, replied_message, _task_operands(_request, _context),
-            )
-
         async def memory_handler(_request, _context):
             task_operands = _task_operands(_request, _context)
             if is_memory_lifecycle(task_operands):
                 return await self._execute_memory_lifecycle_result_only(message, task_operands)
             if not task_operands:
                 return _task_failure("MEMORY", "missing_memory_task_operands")
-            # The task's own memory_action is the operation that preflight validated.
             task_action = str(task_operands.get("memory_action") or getattr(_request, "owner_action", None) or "").upper()
             task_decision = RouteDecision(
                 "RESPOND", task_action, 1.0, 1.0, "SERVER_MEMORY_REQUEST", memory=dict(task_operands),
@@ -4908,352 +4719,7 @@ class AIChatCog(commands.Cog):
                 reason=None if reaction_ok else "reaction_execution_failed",
             )
 
-        async def mutation_preflight(tasks, _context):
-            """Validate every declared mutation before the first mutation runs."""
-
-            for request in tasks:
-                task_name = str(getattr(request, "name", "") or "").upper()
-                task_operands = _task_operands(request, _context)
-                if not task_operands:
-                    return f"{task_name.lower()} was called without arguments"
-                if task_name == "REACTION":
-                    emoji = task_operands.get("emoji")
-                    emojis = task_operands.get("emojis")
-                    if not (emoji or (isinstance(emojis, (list, tuple)) and any(str(value).strip() for value in emojis))):
-                        return False
-                    target = (image_context.reaction_target if image_context is not None else None) or message
-                    permissions_for = getattr(getattr(target, "channel", None), "permissions_for", None)
-                    bot_member = self._admin_actions._bot_member(message.guild) if message.guild is not None else None
-                    try:
-                        reaction_permission = permissions_for(bot_member) if bot_member is not None and permissions_for is not None else None
-                    except Exception:
-                        logging.exception("Failed to read reaction permissions during mutation preflight")
-                        reaction_permission = None
-                    if bot_member is None or reaction_permission is None or not bool(getattr(reaction_permission, "add_reactions", False)):
-                        return False
-                    continue
-                if task_name == "MEMORY":
-                    if is_memory_lifecycle(task_operands):
-                        if error := self._memory_lifecycle_operand_error(message, task_operands):
-                            return error
-                        target = await self._server_memory.get_memory(message.guild.id, task_operands["memory_id"])
-                        if self._memory_decider_error(message, target) or not self._memory_is_actionable(
-                            target, task_operands["memory_action"],
-                        ):
-                            return False
-                        continue
-                    task_action = str(getattr(request, "owner_action", None) or task_operands.get("memory_action") or task_operands.get("operation") or "").upper()
-                    if task_action not in {"SERVER_MEMORY_WRITE", "SERVER_MEMORY_UPDATE", "SERVER_MEMORY_DELETE"}:
-                        return False
-                    if self._server_memory is None or not task_operands.get("memory_type"):
-                        return "missing required argument: memory_type"
-                    if task_action in {"SERVER_MEMORY_WRITE", "SERVER_MEMORY_UPDATE"} and not task_operands.get("value"):
-                        return "missing required argument: value"
-                    try:
-                        memory_type = ServerMemoryService.normalize_memory_type(
-                            str(task_operands.get("memory_type") or "")
-                        )
-                    except ValueError:
-                        return False
-                    if memory_type.startswith("USER_") and self._memory_subject_user_id(
-                        resolution_message,
-                        task_operands,
-                    ) is None:
-                        return False
-                    if memory_type == "BOT_BEHAVIOR_RULE" and not self._route_authority_metadata(message)["author_can_manage_bot_behavior"]:
-                        return False
-                    continue
-                if task_name == "REMINDER":
-                    if error := self._reminder_operand_error(message, task_operands):
-                        return error
-                    if task_operands["reminder_action"] == "remove" and not any(
-                        row["reminder_id"] == task_operands["reminder_id"]
-                        for row in await list_reminders(self.bot.db, message.guild.id, message.author.id, limit=-1)
-                    ):
-                        return "reminder_id is not one of the author's reminders"
-                    continue
-                if task_name == "BIRTHDAY":
-                    if task_operands.get("birthday_action") in BIRTHDAY_SETTINGS_OPERANDS:
-                        if self._birthday_operand_error(message, task_operands) or (
-                            task_operands["birthday_action"] == "preview"
-                            and await self._birthday_preview_target(message) is None
-                        ) or (
-                            task_operands["birthday_action"] == "blacklist_user"
-                            and await self._birthday_blacklist_member(message, task_operands) is None
-                        ):
-                            return False
-                        # Read-only lookups: the template limit and the template id must hold now; execution re-validates.
-                        if task_operands["birthday_action"] == "template_add" and await self.bot.db.count_birthday_templates(
-                            message.guild.id, task_operands["birthday_template_type"]
-                        ) >= BIRTHDAY_TEMPLATE_LIMIT:
-                            return False
-                        if task_operands["birthday_action"] == "template_remove" and not any(
-                            row["id"] == task_operands["birthday_template_id"]
-                            for row in await list_birthday_templates(
-                                self.bot.db, message.guild.id, task_operands["birthday_template_type"]
-                            )
-                        ):
-                            return False
-                        continue
-                    if error := self._birthday_operand_error(message, task_operands):
-                        return error
-                    if not await birthday_module_enabled(self.bot.db, message.guild.id):
-                        return "birthdays are disabled in this server"
-                    if task_operands["birthday_action"] == "remove" and await self.bot.db.get_birthday_profile(
-                        message.guild.id, message.author.id
-                    ) is None:
-                        return False
-                    continue
-                if task_name == "FOOTBALL":
-                    task_action = str(getattr(request, "owner_action", None) or task_operands.get("operation") or task_operands.get("operation_family") or "").upper()
-                    if task_action not in {"FOOTBALL_LIVE_WATCH_START", "FOOTBALL_LIVE_WATCH_STOP", "LIVE_WATCH_START", "LIVE_WATCH_STOP"}:
-                        return False
-                    if task_action.endswith("START"):
-                        client = getattr(self.bot, "api_football_client", None)
-                        if client is None or not any(
-                            task_operands.get(key)
-                            for key in ("fixture_id", "fixture_focus", "team_candidates", "league_candidates")
-                        ):
-                            return False
-                        request_text = _task_objective(request, task_operands) or ""
-                        football_plan = {**task_operands, "semantic_source": "router"}
-                        operation = build_operation(
-                            "FOOTBALL_LIVE_WATCH_START",
-                            request_text,
-                            football_plan,
-                        )
-                        fixture = await self._resolve_football_live_watch_fixture(
-                            client,
-                            request=request_text,
-                            plan=football_plan,
-                            operation=operation,
-                        )
-                        fixture_obj = fixture.get("fixture") if isinstance(fixture, dict) else {}
-                        if not isinstance(fixture_obj, dict) or not isinstance(fixture_obj.get("id"), int):
-                            return False
-                        prepared_live_watch_fixtures[getattr(request, "task_id", "")] = fixture
-                    continue
-                if task_name != "ADMIN":
-                    return False
-                guild = message.guild
-                if guild is None:
-                    return False
-                if not task_operands.get("admin_action"):
-                    return False
-                task_decision = RouteDecision(
-                    "RESPOND", "ADMIN_ACTION", 0.0, 0.0, "ADMIN_ACTION_REQUEST", admin=dict(task_operands),
-                )
-                # A dependent channel target is not available until its create
-                # task runs; validate the binding below, not a name fallback.
-                if isinstance(task_operands, dict) and any(
-                    str(getattr(binding, "output_field", "")).strip() == "resource_handle"
-                    for binding in tuple(getattr(request, "input_bindings", ()) or ())
-                ):
-                    task_decision = replace(
-                        task_decision,
-                        admin={**dict(task_decision.admin or {}), "resource_handle": {"resource_type": "channel", "guild_id": getattr(guild, "id", None), "resource_id": 1}},
-                    )
-                plan = self._coerce_admin_plan(task_decision.admin)
-                if not plan.get("valid"):
-                    return plan.get("clarification_question") or False
-                action = str(plan.get("admin_action") or "").casefold()
-                if action in {"join_stats", "leave_stats"}:
-                    authority = self._route_authority_metadata(message)
-                    if not (
-                        authority["author_is_bot_owner"]
-                        or authority["author_is_guild_owner"]
-                        or authority["author_has_administrator"]
-                        or authority["author_has_manage_guild"]
-                    ) or not plan.get("time_window_seconds"):
-                        return False
-                    continue
-                actor = message.author
-                bot_member = self._admin_actions._bot_member(guild)
-                if bot_member is None:
-                    return False
-                if action == "delete_messages":
-                    if not (1 <= int(plan.get("message_count") or 0) <= 500):
-                        return False
-                    if not self._admin_actions._actor_has(actor, "manage_messages"):
-                        return False
-                    if not self._admin_actions._has_channel_perm(bot_member, message.channel, "manage_messages"):
-                        return False
-                    continue
-                if action in {"create_role", "create_channel"}:
-                    permission = "manage_roles" if action == "create_role" else "manage_channels"
-                    if not self._admin_actions._actor_has(actor, permission):
-                        return False
-                    if not self._admin_actions._has_perm(bot_member, permission):
-                        return False
-                    if action == "create_role" and not plan.get("role_name"):
-                        return False
-                    if action == "create_channel" and not plan.get("channel_name"):
-                        return False
-                    continue
-                if action in {"delete_role", "add_role", "remove_role"}:
-                    role_binding = next(
-                        (
-                            binding
-                            for binding in tuple(getattr(request, "input_bindings", ()) or ())
-                            if str(getattr(binding, "output_field", "")).strip() == "resource_handle"
-                        ),
-                        None,
-                    )
-                    if role_binding is not None and action in {"add_role", "remove_role"}:
-                        upstream_task_id = getattr(role_binding, "upstream_task_id", None)
-                        if upstream_task_id not in tuple(getattr(request, "depends_on", ()) or ()):
-                            return False
-                        upstream = next(
-                            (
-                                item
-                                for item in execution_plan.ordered_capabilities
-                                if item.task_id == upstream_task_id
-                            ),
-                            None,
-                        )
-                        upstream_operands = getattr(upstream, "operands", {}) if upstream is not None else {}
-                        if (
-                            upstream is None
-                            or "resource_handle" not in tuple(getattr(upstream, "requested_outputs", ()) or ())
-                            or getattr(upstream, "name", "") != "ADMIN"
-                            or str(upstream_operands.get("admin_action") or "").casefold() != "create_role"
-                        ):
-                            return False
-                        role = None
-                    else:
-                        # A refusal returns its message, so Grok can fix the arguments or tell the user why.
-                        role = self._resolve_admin_target_role(resolution_message, plan, preflight_lang)
-                        if isinstance(role, str):
-                            return role
-                        if refusal := self._admin_actions._can_manage_role(guild, actor, role, preflight_lang):
-                            return refusal.message
-                    if action in {"add_role", "remove_role"}:
-                        # The member must exist; the role's position is the only limit, so the author may be the target.
-                        target = await self._resolve_admin_target_member(resolution_message, plan, preflight_lang)
-                        if isinstance(target, str):
-                            return target
-                    continue
-                if action in {"kick", "ban", "tempban", "mute", "tempmute", "unmute", "warn", "list_warnings", "remove_warning", "clear_warnings", "set_nickname"}:
-                    target = await self._resolve_admin_target_member(resolution_message, plan, preflight_lang)
-                    # Same rule as the service: only a nickname change may target the author.
-                    self_ok = {"allow_self": True} if action == "set_nickname" else {}
-                    if isinstance(target, str):
-                        return target
-                    if refusal := self._admin_actions._can_act_on_target(guild, actor, target, preflight_lang, **self_ok):
-                        return refusal.message
-                    permission = "manage_nicknames" if action == "set_nickname" else "moderate_members" if action in {"mute", "tempmute", "unmute", "warn", "list_warnings", "remove_warning", "clear_warnings"} else ("kick_members" if action == "kick" else "ban_members")
-                    if not self._admin_actions._actor_has(actor, permission) or not self._admin_actions._has_perm(bot_member, permission):
-                        return False
-                    if action == "tempban" and not plan.get("duration_seconds"):
-                        return False
-                    continue
-                if action == "unban":
-                    if not plan.get("target_user_id") or not self._admin_actions._actor_has(actor, "ban_members") or not self._admin_actions._has_perm(bot_member, "ban_members"):
-                        return False
-                    continue
-                if action == "purge_user_messages":
-                    # The current channel only; the plan already refused any channel operand, a missing count and a missing member.
-                    target = await self._resolve_admin_target_member(resolution_message, plan, preflight_lang)
-                    if (
-                        isinstance(target, str)
-                        or not 1 <= int(plan.get("message_count") or 0) <= 500
-                        or not callable(getattr(message.channel, "history", None))
-                        or not self._admin_actions._actor_has(actor, "manage_messages")
-                        or not self._admin_actions._has_channel_perm(bot_member, message.channel, "manage_messages")
-                    ):
-                        return False
-                    continue
-                if action == "say":
-                    # The current channel only; the text and the missing channel operand are validated by the plan.
-                    if not self._admin_actions._actor_has(actor, "manage_messages") or not self._admin_actions._has_channel_perm(bot_member, message.channel, "send_messages"):
-                        return False
-                    continue
-                if action in {"lock_channel", "unlock_channel", "delete_channel", "set_slowmode", "clear_channel", "clone_channel", "color_publish"} | ADMIN_CONFIG_CHANNEL_OPERATIONS:
-                    # Clearing needs the bot to manage messages in the channel; every other channel action manages the channel.
-                    # Configuration only writes the database: it needs Manage Server from the actor and nothing from the bot.
-                    # The color panel needs Administrator and the bot able to post it (in the channel, or guild-wide for one created in this batch).
-                    config_channel = action in ADMIN_CONFIG_CHANNEL_OPERATIONS
-                    color_panel = action == "color_publish"
-                    actor_permission = "administrator" if color_panel else "manage_guild" if config_channel else "manage_channels"
-                    bot_permission = "manage_messages" if action == "clear_channel" else "manage_channels"
-                    channel_binding = next(
-                        (
-                            binding
-                            for binding in tuple(getattr(request, "input_bindings", ()) or ())
-                            if str(getattr(binding, "output_field", "")).strip() == "resource_handle"
-                        ),
-                        None,
-                    )
-                    if channel_binding is not None:
-                        upstream_task_id = getattr(channel_binding, "upstream_task_id", None)
-                        upstream = next(
-                            (item for item in execution_plan.ordered_capabilities if item.task_id == upstream_task_id),
-                            None,
-                        )
-                        upstream_operands = getattr(upstream, "operands", {}) if upstream is not None else {}
-                        if (
-                            upstream_task_id not in tuple(getattr(request, "depends_on", ()) or ())
-                            or upstream is None
-                            or "resource_handle" not in tuple(getattr(upstream, "requested_outputs", ()) or ())
-                            or getattr(upstream, "name", "") != "ADMIN"
-                            or str(upstream_operands.get("admin_action") or "").casefold() not in {"create_channel", "clone_channel"}
-                        ):
-                            return False
-                        if action == "delete_channel" and upstream_task_id == getattr(request, "task_id", None):
-                            return False
-                        if (
-                            not self._admin_actions._actor_has(actor, actor_permission)
-                            or (not config_channel and not color_panel and not self._admin_actions._has_perm(bot_member, bot_permission))
-                            or (color_panel and (self.bot.get_cog("ModerationCog") is None or self._admin_actions.color_panel_bot_denied(guild, None, preflight_lang) is not None))
-                            or (action == "server_context_learn" and self.bot.get_cog("AdminCog") is None)
-                        ):
-                            return False
-                        continue
-                    channel = self._resolve_admin_target_channel(resolution_message, plan, preflight_lang)
-                    if isinstance(channel, str):
-                        return channel
-                    if action == "delete_channel" and getattr(channel, "id", None) == getattr(message.channel, "id", None):
-                        return False
-                    if (
-                        not self._admin_actions._actor_has(actor, actor_permission)
-                        or (not config_channel and not color_panel and not self._admin_actions._has_channel_perm(bot_member, channel, bot_permission))
-                        or (color_panel and (self.bot.get_cog("ModerationCog") is None or self._admin_actions.color_panel_bot_denied(guild, channel, preflight_lang) is not None))
-                        or (
-                            action == "server_context_learn"
-                            and (
-                                self._admin_actions.server_context_learn_denied(actor, channel, lang=preflight_lang) is not None
-                                # Executability: the bot must be able to read the channel and the AdminCog (the summarizer) must be loaded.
-                                or not all(self._admin_actions._has_channel_perm(bot_member, channel, name) for name in ("view_channel", "read_message_history"))
-                                or self.bot.get_cog("AdminCog") is None
-                            )
-                        )
-                    ):
-                        return False
-                    continue
-                if action in ADMIN_CONFIG_OPERATIONS:
-                    # The channel configuration actions continued above, so this is the channel-less rest (Manage Server only);
-                    # the plan already validated its operands and refused a channel.
-                    if not self._admin_actions._actor_has(actor, "manage_guild"):
-                        return False
-                    continue
-                if action in ADMIN_COLOR_OPERATIONS:
-                    # color_publish continued above. Administrator only, like the /color commands; ModerationCog does the work, so it must be
-                    # loaded. What depends on database state an earlier task may change (existing colors, the stored panel) is decided at execution.
-                    if not self._admin_actions._actor_has(actor, "administrator") or self.bot.get_cog("ModerationCog") is None:
-                        return False
-                    if action in {"color_setup", "color_add", "color_remove"} and not self._admin_actions._has_perm(bot_member, "manage_roles"):
-                        return False
-                    if action == "color_remove":
-                        entry = await self.bot.db.get_color_role_by_name(guild.id, plan["role_name"])
-                        role = guild.get_role(int(entry["role_id"])) if entry is not None else None
-                        if role is not None and self._admin_actions._can_manage_role(guild, actor, role, preflight_lang) is not None:
-                            return False
-                    continue
-                return False
-            return True
-
         handlers = {
-            "CHAT": chat_handler,
             "IMAGE_ANALYZE": image_handler,
             "FOOTBALL": football_handler,
             "MINECRAFT": minecraft_handler,
@@ -5261,7 +4727,6 @@ class AIChatCog(commands.Cog):
             "CODE": code_handler,
             "REMINDER": reminder_handler,
             "BIRTHDAY": birthday_handler,
-            "TRANSLATE": translate_handler,
             "MEME": meme_handler,
             "IMAGE_GENERATE": image_generate_handler,
             "IMAGE_EDIT": image_edit_handler,
@@ -5277,33 +4742,10 @@ class AIChatCog(commands.Cog):
         if not requested_capabilities.issubset(set(handlers)):
             raise RuntimeError("stage4_result_only_handler_registry_mismatch")
         execution_context = execution_context or CapabilityExecutionContext(execution_plan)
-        async def guarded_read(request, context):
-            if request.task_id in context.evidence_requirements:
-                operands = _task_operands(request, context)
-                typed = {key: value for key, value in operands.items() if key in operand_descriptors(request.name)}
-                if validate_operands(request.name, typed) or operation_effect(replace(request, operands=typed)) != "read":
-                    return _task_failure(request.name, "invalid_bound_investigation_operation")
-                key = evidence_read_key(replace(request, operands=operands))
-                for prior in context.execution_plan.ordered_capabilities:
-                    if prior.task_id in context.results and evidence_read_key(replace(prior, operands=_task_operands(prior, context))) == key:
-                        return _task_failure(request.name, "duplicate_investigation_read")
-            result = await handlers[request.name](request, context)
-            if request.task_id in context.evidence_requirements and isinstance(result.payload, FootballRetrievalResult):
-                scope = {key: value for key, value in result.scope.items() if key != "request_plan"}
-                for prior in context.results.values():
-                    if (scope and prior.status == result.status == CapabilityTerminalStatus.SUCCESS
-                            and isinstance(prior.payload, FootballRetrievalResult)
-                            and scope == {key: value for key, value in prior.scope.items() if key != "request_plan"}
-                            and result.payload.resolved_entities == prior.payload.resolved_entities):
-                        return replace(result, status=CapabilityTerminalStatus.NOT_EXECUTED, payload=None,
-                                       satisfies_request=False, reason=f"duplicate_resolved_read:{prior.task_id}")
-            return result
-
         return await execute_ordered_capabilities(
             specialized_execution_plan,
-            {name: guarded_read for name in handlers} if can_continue is not None else handlers,
+            handlers,
             context=execution_context,
-            preflight=mutation_preflight,
             can_continue=can_continue,
         )
 
@@ -5328,14 +4770,6 @@ class AIChatCog(commands.Cog):
         plan = decision.capability_plan
         action = "FOOTBALL_LOOKUP"
         operation_request = request if plan is not None else ""
-        lease_key = self._message_channel_key(message)
-        stored_lease = self._continuation_leases.get(lease_key)
-        active_lease = self._valid_lease_for_message(message)
-        lease_owner_matches_author = bool(
-            active_lease is not None
-            and getattr(message.author, "id", None) == active_lease.owner_user_id
-        )
-        active_football_turn_context = self._valid_football_turn_context(message)
         prior_context = self._football_prior_lease_context(message)
         try:
             operation = compile_football_operation(
@@ -5351,14 +4785,8 @@ class AIChatCog(commands.Cog):
                     }),
             )
         logging.info(
-            "AI football continuation branch input message=%s continuation_lease_present=%s "
-            "continuation_lease_active=%s lease_owner_matches_author=%s football_turn_context_active=%s "
-            "prior_context_present=%s league_candidates=%s team_candidates=%s league_slot_authorities=%s",
+            "AI football input message=%s prior_context_present=%s league_candidates=%s team_candidates=%s league_slot_authorities=%s",
             getattr(message, "id", None),
-            stored_lease is not None,
-            active_lease is not None,
-            lease_owner_matches_author,
-            active_football_turn_context is not None,
             prior_context is not None,
             list(operation.league_candidates)[:4],
             list(operation.team_candidates)[:4],
@@ -5427,21 +4855,10 @@ class AIChatCog(commands.Cog):
             )
 
     def _football_prior_lease_context(self, message: discord.Message) -> str | None:
-        turn_context = self._valid_football_turn_context(message)
-        if turn_context is not None:
-            return turn_context.to_prior_context()
         watch = self._watch_for_replied_message(message)
         if watch is not None:
             return f"Watched fixture: {watch.fixture_label}. Original watch request: {watch.request}"[:450]
-        lease = self._valid_lease_for_message(message)
-        if (
-            lease is None
-            or getattr(message.author, "id", None) != lease.owner_user_id
-            or not str(lease.last_action).startswith("FOOTBALL_")
-        ):
-            return None
-        prior = " ".join(str(lease.resolved_request or "").split())
-        return json.dumps({"prior_request": prior[:400]}, ensure_ascii=False, separators=(",", ":")) if prior else None
+        return None
 
     @staticmethod
     def _football_plan_text(plan: dict[str, Any] | None, key: str) -> str | None:
@@ -5476,7 +4893,6 @@ class AIChatCog(commands.Cog):
         decision: RouteDecision,
         *,
         operands: dict[str, object],
-        prepared_fixture: dict[str, Any] | None = None,
     ) -> CapabilityTerminalResult:
         if message.guild is None:
             return normalize_terminal_result("FOOTBALL", "VALIDATION_FAILED", provider="orchestrator", reason="missing_guild")
@@ -5498,7 +4914,7 @@ class AIChatCog(commands.Cog):
         request = " ".join(str(decision.resolved_request or "").split())[:900]
         football = {**operands, "semantic_source": "router"}
         operation = build_operation("FOOTBALL_LIVE_WATCH_START", request, football)
-        fixture = prepared_fixture or await self._resolve_football_live_watch_fixture(
+        fixture = await self._resolve_football_live_watch_fixture(
             client,
             request=request,
             plan=football,
@@ -6495,27 +5911,6 @@ class AIChatCog(commands.Cog):
 
 
 
-    def _authorized_reply_source(
-        self,
-        message: discord.Message,
-        replied_message: discord.Message | None,
-    ) -> tuple[bool, str]:
-        reference_id = getattr(getattr(message, "reference", None), "message_id", None)
-        target_id = getattr(replied_message, "id", None)
-        author = getattr(replied_message, "author", None)
-        if (
-            reference_id is None
-            or target_id is None
-            or str(reference_id) != str(target_id)
-            or replied_message is None
-            or bool(getattr(author, "bot", False))
-        ):
-            return False, ""
-        content = str(getattr(replied_message, "content", "") or "")
-        excerpt = content if len(content) <= self._history_entry_max_chars else content[:self._history_entry_max_chars - 15] + " [text omitted]"
-        return True, excerpt
-
-
     def _active_typed_context_for_message(
         self,
         message: discord.Message,
@@ -6786,13 +6181,11 @@ class AIChatCog(commands.Cog):
         *,
         mention_author: bool,
         reply_to_trigger: bool | None = None,
-        send_mode: str | None = None,
         delete_after: float | None = None,
-        attachment: discord.File | None = None,
         files: list[discord.File] | None = None,
         on_first_delivery: Any = None,
     ) -> int | object | None:
-        if attachment is not None or files:
+        if files:
             self._consume_voice_response_modality(trigger_message)
         elif self._consume_voice_response_modality(trigger_message):
             try:
@@ -6830,16 +6223,12 @@ class AIChatCog(commands.Cog):
         )
         allowed_mentions = discord.AllowedMentions(users=True, roles=True, everyone=False)
         # Cited links stay clickable without Discord preview cards, so a sourced answer stays compact.
-        if send_mode is None:
-            send_mode = "reply_to_trigger" if (True if reply_to_trigger is None else reply_to_trigger) else "normal"
-        should_reply = send_mode in {"reply_to_trigger", "force_reply"}
-        if send_mode == "force_channel":
-            should_reply = False
+        should_reply = True if reply_to_trigger is None else reply_to_trigger
         if should_reply:
             try:
                 first = await trigger_message.reply(
                     parts[0],
-                    **({"files": files} if files else {"file": attachment} if attachment is not None else {}),
+                    **({"files": files} if files else {}),
                     mention_author=mention_author,
                     allowed_mentions=allowed_mentions,
                     suppress_embeds=True,
@@ -6854,7 +6243,7 @@ class AIChatCog(commands.Cog):
                 )
                 first = await trigger_message.channel.send(
                     parts[0],
-                    **({"files": files} if files else {"file": attachment} if attachment is not None else {}),
+                    **({"files": files} if files else {}),
                     allowed_mentions=allowed_mentions,
                     suppress_embeds=True,
                     delete_after=delete_after,
@@ -6862,7 +6251,7 @@ class AIChatCog(commands.Cog):
         else:
             first = await trigger_message.channel.send(
                 parts[0],
-                **({"files": files} if files else {"file": attachment} if attachment is not None else {}),
+                **({"files": files} if files else {}),
                 allowed_mentions=allowed_mentions,
                 suppress_embeds=True,
                 delete_after=delete_after,
@@ -6878,7 +6267,7 @@ class AIChatCog(commands.Cog):
                 suppress_embeds=True,
             )
             self._remember_chat_response_message(extra.id)
-        return first if attachment is not None or files else int(first.id)
+        return first if files else int(first.id)
 
     def _is_chat_response_message(self, message_id: int) -> bool:
         return message_id in self._chat_response_id_set
@@ -6899,9 +6288,6 @@ class AIChatCog(commands.Cog):
         for key in list(self._continuation_leases.keys()):
             if key[0] == guild_id:
                 del self._continuation_leases[key]
-        for key in list(self._football_turn_contexts.keys()):
-            if key[0] == guild_id:
-                del self._football_turn_contexts[key]
 
 
 

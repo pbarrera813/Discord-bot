@@ -278,7 +278,7 @@ Admin commands (slash-visible for admins only):
 - `/football table <league>`
 - `/football player <player> [team]`
 - `/football h2h <team> <opponent>`
-- `/football top [category:scorers|assists|yellowcards|redcards] [league]`
+- `/football top <league> [category:scorers|assists|yellowcards|redcards]`
 - `/football myteam [team]`
 
 `match` and `team` use your saved team when no team is given; save it once with `/football myteam <team>`. `match` with `when:auto` opens the live match, otherwise today's, otherwise the next ones; `when:last` lists the previous ones. `team` uses the team's current domestic league. `fixtures` with `when:auto` shows the league's live matches, then today's, then the next ten. `h2h` shows the last 10 meetings.
@@ -291,12 +291,7 @@ The match menu includes preview, lineups, statistics, events, player performance
 
 Team cards also offer season statistics, the current squad, coach, venue, injuries and transfers. Player cards offer the previous season, career teams, transfer history, trophies and recorded absences. These sections load only when opened; career/history sections retain their full recorded scope.
 
-League fields support provider-backed autocomplete and league-name searches, subject to API-Football's league/season coverage. Existing shortcuts remain available:
-- `ligamx`
-- `premier`
-- `laliga`
-- `concacaf`
-- `worldcup`
+League fields take any league name: type it (for example Liga MX or Premier League) or pick a provider-backed suggestion, subject to API-Football's league/season coverage. There is no preset league list, and `/football top` needs a league.
 
 In chat, ask about any league, team or player by name. Nitori looks them up in API-Football, asks which one you mean when a name fits several, and can follow up on the same match or team, including results, events, statistics, lineups, injuries, transfers, top scorers, head-to-head and live-match updates.
 

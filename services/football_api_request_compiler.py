@@ -503,23 +503,6 @@ class TransferRequest:
 
 
 @dataclass(frozen=True)
-class FixtureIdsRequest:
-    fixture_ids: tuple[int, ...]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.fixture_ids, tuple) or not self.fixture_ids:
-            raise InvalidFootballApiRequest("fixture ids request requires fixture IDs.")
-        if len(self.fixture_ids) > 20:
-            raise InvalidFootballApiRequest("fixture ids request supports at most 20 IDs.")
-        seen: set[int] = set()
-        for fixture_id in self.fixture_ids:
-            validate_positive_int(fixture_id, "fixture_id")
-            if fixture_id in seen:
-                raise InvalidFootballApiRequest("fixture ids request contains duplicates.")
-            seen.add(fixture_id)
-
-
-@dataclass(frozen=True)
 class FixtureStatisticsRequest:
     fixture_id: int
     team_id: int | None = None

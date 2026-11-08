@@ -651,11 +651,6 @@ class FootballOperationService:
             note="",
         )
 
-    async def resolve_league_key(self, league_key: str) -> tuple[int, int]:
-        league_id = await self.client.resolve_league_id(league_key)
-        season = await self.client.get_current_season(league_id)
-        return league_id, season
-
     async def execute(
         self,
         operation: FootballQueryOperation,
@@ -1027,13 +1022,6 @@ class FootballOperationService:
         for tier_index, league_slots in enumerate(league_tiers):
             if not league_slots:
                 continue
-            for slot_index, slot in enumerate(league_slots):
-                slot_variants = (league_slots[slot_index],)
-                for variant in slot_variants:
-                    league_key = football_resolver.normalize_league_key(variant.name) if football_resolver.slot_allows_static_alias(variant) else None
-                    if league_key:
-                        resolved_id, resolved_season = await self.resolve_league_key(league_key)
-                        return resolved_id, _season_from_operation_hint(operation, season or resolved_season), {"league": {"name": football_resolver.league_label(league_key, "en")}}, FootballOutcome.SELECTED
             rows: list[dict[str, Any]] = []
             saw_ambiguous = False
             lookup_slots = tuple(
@@ -2909,9 +2897,7 @@ def _has_opponent_slot(operation: FootballQueryOperation) -> bool:
         return False
     first = football_resolver.normalize_key(operation.team_slots[0].name)
     second = football_resolver.normalize_key(operation.team_slots[1].name)
-    first_canonical = football_resolver.normalize_key(football_resolver.canonical_team_query(operation.team_slots[0].name))
-    second_canonical = football_resolver.normalize_key(football_resolver.canonical_team_query(operation.team_slots[1].name))
-    if first == second or first_canonical == second_canonical:
+    if first == second:
         return False
     if first and second and (first in second or second in first):
         return False
@@ -3332,18 +3318,11 @@ def _team_row_score(row: dict[str, Any], slot: Any) -> int:
     name_key = football_resolver.normalize_key(team.get("name"))
     slot_name = str(getattr(slot, "name", "") or "")
     slot_key = football_resolver.normalize_key(slot_name)
-    # A name Grok typed is never swapped for a static alias here; the same rule as resolve_team_candidate.
-    canonical_key = (
-        football_resolver.normalize_key(football_resolver.canonical_team_query(slot_name))
-        if football_resolver.slot_allows_static_alias(slot) else slot_key
-    )
     score = 0
-    if name_key and name_key in {slot_key, canonical_key}:
+    if name_key and name_key == slot_key:
         score += 100
     elif slot_key and slot_key in name_key:
         score += 60
-    elif canonical_key and canonical_key in name_key:
-        score += 55
     elif name_key:
         score += 1
     country_hint = football_resolver.normalize_key(getattr(slot, "country_hint", None))

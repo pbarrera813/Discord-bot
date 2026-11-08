@@ -2,10 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
-import json
 import hashlib
 from typing import Any, Awaitable, Callable, Mapping
-import inspect
 
 from services.ai_operation_catalog import operation_effect
 
@@ -168,9 +166,6 @@ def normalize_terminal_result(
         bounded_delivery_metadata["delete_after_seconds"] = float(delete_after_seconds)
     if (delivery_metadata or {}).get("delete_trigger_on_success") is True:
         bounded_delivery_metadata["delete_trigger_on_success"] = True
-    direct_failure_message = (delivery_metadata or {}).get("direct_failure_message")
-    if isinstance(direct_failure_message, str) and direct_failure_message.strip():
-        bounded_delivery_metadata["direct_failure_message"] = direct_failure_message.strip()[:500]
     return CapabilityTerminalResult(
         capability=str(capability or "UNKNOWN").strip().upper(),
         status=status,
@@ -194,8 +189,6 @@ class CapabilityExecutionContext:
     # projections and never overwrite repeated task instances.
     results: dict[str, CapabilityTerminalResult] = field(default_factory=dict)
     requirement_assessments: dict[str, dict[str, Any]] | None = None
-    evidence_requirements: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    investigation_stop_reason: str | None = None
 
     def record(self, result: CapabilityTerminalResult) -> None:
         declared = {item.task_id: item for item in self.execution_plan.ordered_capabilities}
@@ -266,7 +259,6 @@ class CapabilityExecutionContext:
             "missing": list(bundle.missing),
             "results": [result.to_payload() for result in bundle.results],
             "requirement_statuses": {key: value["status"] for key, value in (self.requirement_assessments or {}).items()},
-            "investigation_stop_reason": self.investigation_stop_reason,
         }
 
 
@@ -360,17 +352,12 @@ class CapabilityResultBundle:
 
 
 CapabilityHandler = Callable[[CapabilityRequest, CapabilityExecutionContext], Awaitable[CapabilityTerminalResult]]
-MutationPreflight = Callable[
-    [tuple[CapabilityRequest, ...], CapabilityExecutionContext],
-    Awaitable[bool] | bool,
-]
 
 async def execute_ordered_capabilities(
     execution_plan: "CapabilityExecutionPlan",
     handlers: Mapping[str, CapabilityHandler],
     *,
     context: CapabilityExecutionContext | None = None,
-    preflight: MutationPreflight | None = None,
     can_continue: Callable[[], bool] | None = None,
 ) -> CapabilityExecutionContext:
     """A failed dependency prevents downstream provider work, so incomplete and satisfied work stay distinct."""
@@ -379,57 +366,7 @@ async def execute_ordered_capabilities(
     if not execution_plan.valid:
         execution_context.defer_remaining(reason="invalid_execution_plan")
         return execution_context
-    mutation_tasks = tuple(
-        item for item in execution_plan.ordered_capabilities if operation_effect(item) == "mutate"
-    )
-    invalid_catalog_tasks = tuple(
-        item for item in execution_plan.ordered_capabilities if operation_effect(item) is None
-    )
-    catalog_invalid = bool(invalid_catalog_tasks)
-    if catalog_invalid:
-        for item in invalid_catalog_tasks:
-            execution_context.record(
-                normalize_terminal_result(
-                    item.name,
-                    CapabilityTerminalStatus.VALIDATION_FAILED,
-                    provider="orchestrator",
-                    provenance={"source": "operation_catalog"},
-                    reason="unknown_or_missing_operation",
-                    task_id=item.task_id,
-                )
-            )
-    preflight_allowed = True
-    if mutation_tasks and catalog_invalid:
-        preflight_allowed = False
-        preflight_reason = "operation_catalog_invalid"
-    elif mutation_tasks:
-        if preflight is None:
-            preflight_allowed = False
-            preflight_reason = "mutation_batch_preflight_missing"
-        else:
-            try:
-                decision = preflight(mutation_tasks, execution_context)
-                if inspect.isawaitable(decision):
-                    decision = await decision
-                # A preflight may refuse with a reason string, which reaches the caller so the arguments can be fixed.
-                preflight_allowed = bool(decision) and not isinstance(decision, str)
-                preflight_reason = decision if isinstance(decision, str) and decision else "mutation_batch_preflight_failed"
-            except Exception as exc:
-                preflight_allowed = False
-                preflight_reason = f"mutation_batch_preflight_exception:{type(exc).__name__}"
-        if not preflight_allowed:
-            for item in mutation_tasks:
-                execution_context.record(
-                    normalize_terminal_result(
-                        item.name,
-                        CapabilityTerminalStatus.NOT_EXECUTED,
-                        provider="orchestrator",
-                        provenance={"source": "mutation_batch_preflight"},
-                        reason=preflight_reason,
-                        task_id=item.task_id,
-                    )
-                )
-    mutation_failed = not preflight_allowed
+    mutation_failed = False
     for item in execution_plan.ordered_capabilities:
         if item.task_id in execution_context.results:
             continue
@@ -606,19 +543,6 @@ class CapabilityExecutionPlan:
             "overflow": self.overflow,
             "valid": self.valid,
         }
-
-
-def evidence_read_key(request: CapabilityRequest) -> str:
-    def normalize(value: Any) -> Any:
-        if isinstance(value, str):
-            return value.strip()
-        if isinstance(value, Mapping):
-            return {key: normalize(item) for key, item in value.items() if item is not None and item != []}
-        if isinstance(value, (list, tuple)):
-            return [normalize(item) for item in value]
-        return value
-
-    return json.dumps([request.name, normalize(request.operands)], sort_keys=True, default=str, separators=(",", ":"))
 
 
 def hash_text(value: str) -> str:

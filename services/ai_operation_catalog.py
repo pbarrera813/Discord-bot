@@ -104,9 +104,6 @@ BIRTHDAY_MODES = frozenset({"user", "server"})
 # The keys of /birthday event; preview accepts every one except disable.
 BIRTHDAY_EVENTS = frozenset({"birthday_default", "birthday_year", "member_anniversary", "server_anniversary", "disable"})
 BIRTHDAY_TEMPLATE_EVENTS = frozenset(BIRTHDAY_EVENT_TYPES)
-# TRANSLATE text is either supplied by the router or taken from the structurally
-# authorized replied message; the router never has to copy a long source verbatim.
-TRANSLATE_TEXT_SOURCES = frozenset({"REPLIED_MESSAGE"})
 MEME_OPERATIONS = frozenset({"template", "random", "custom"})
 MEME_TEXT_SLOTS = frozenset({"top", "bottom"})
 
@@ -156,14 +153,11 @@ KNOWN_OUTPUTS = {
     "CODE": {"result"},
     "REMINDER": {"result"},
     "BIRTHDAY": {"result"},
-    "TRANSLATE": {"text", "result"},
     "ADMIN": {"result", "resource_handle"},
     "MEMORY": {"result"},
     # "result" is the whole terminal result of a task and the router names it for every family it is not told otherwise;
     # the named outputs stay for typed bindings.
     "REACTION": {"reaction", "result"},
-    "CHAT": {"answer", "result"},
-    "CLARIFICATION": {"question", "result"},
 }
 
 
@@ -282,10 +276,6 @@ OPERAND_DESCRIPTORS: dict[str, dict[str, OperandDescriptor]] = {
         # true blocks the target (the commands' `blocked`); the block_* flags are the trusted command's blockmessage/blockrole/blocklist.
         "birthday_blocked": _boolean(), "birthday_block_message": _boolean(),
         "birthday_block_role": _boolean(), "birthday_block_list": _boolean(),
-    },
-    "TRANSLATE": {
-        "text": _string(1800), "target_language": _string(40),
-        "text_source": _string(20, enum=TRANSLATE_TEXT_SOURCES),
     },
     "MEME": {
         "meme_action": _string(12, enum=MEME_OPERATIONS), "meme_template": _string(80),
@@ -414,7 +404,7 @@ def operation_effect(request: Any) -> str | None:
         return "read" if operation in BIRTHDAY_OPERATIONS else None
     if family in {"IMAGE_GENERATE", "IMAGE_EDIT", "MEME"}:
         return "artifact"
-    if family in {"CHAT", "MINECRAFT", "TRANSLATE", "IMAGE_ANALYZE", "CLARIFICATION"}:
+    if family in {"MINECRAFT", "IMAGE_ANALYZE"}:
         return "read"
     return None
 

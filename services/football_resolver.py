@@ -17,7 +17,6 @@ from services.football_api_request_compiler import (
     TeamSlot,
     _make_league_slot,
     _make_player_slot,
-    _make_team_slot,
     build_league_search_request,
     build_player_profile_request,
     build_player_search_request,
@@ -27,81 +26,6 @@ from services.football_api_request_compiler import (
 
 logger = logging.getLogger(__name__)
 
-
-LEAGUE_ALIASES: Final[dict[str, str]] = {
-    "ligamx": "ligamx",
-    "ligabbvamx": "ligamx",
-    "liga": "ligamx",
-    "premier": "premier",
-    "premierleague": "premier",
-    "epl": "premier",
-    "laliga": "laliga",
-    "laligasantander": "laliga",
-    "champions": "champions",
-    "championsleague": "champions",
-    "ucl": "champions",
-    "concacaf": "concacaf",
-    "concacafchampions": "concacaf",
-    "concacafchampionscup": "concacaf",
-    "concacafchampionsleague": "concacaf",
-    "worldcup": "worldcup",
-    "fifaworldcup": "worldcup",
-    "mundial": "worldcup",
-    "copamundial": "worldcup",
-    "copamundialfifa": "worldcup",
-    "copadelmundo": "worldcup",
-    "copamundo": "worldcup",
-    "worldcupfinal": "worldcup",
-    "expansionmx": "expansionmx",
-    "ligaexpansionmx": "expansionmx",
-    "ligadeexpansionmx": "expansionmx",
-    "ligaexpansion": "expansionmx",
-    "ligadeexpansion": "expansionmx",
-}
-
-LEAGUE_LABELS: Final[dict[str, tuple[str, str]]] = {
-    "ligamx": ("Liga BBVA MX", "Liga BBVA MX"),
-    "premier": ("Premier League", "Premier League"),
-    "laliga": ("LaLiga", "LaLiga"),
-    "champions": ("UEFA Champions League", "UEFA Champions League"),
-    "concacaf": ("CONCACAF Champions Cup", "Copa de Campeones CONCACAF"),
-    "worldcup": ("FIFA World Cup", "Copa Mundial FIFA"),
-    "expansionmx": ("Liga de Expansion MX", "Liga de Expansion MX"),
-}
-
-TEAM_ALIASES: Final[dict[str, str]] = {
-    "america": "Club America",
-    "clubamerica": "Club America",
-    "barca": "Barcelona",
-    "barcelona": "Barcelona",
-    "pumas": "Pumas UNAM",
-    "pumasunam": "Pumas UNAM",
-    "universidadnacional": "Pumas UNAM",
-    "rayados": "Monterrey",
-    "rayadosdemonterrey": "Monterrey",
-    "monterrey": "Monterrey",
-    "tigres": "Tigres UANL",
-    "tigresuanl": "Tigres UANL",
-    "psg": "Paris Saint Germain",
-    "paris": "Paris Saint Germain",
-    "mexico": "Mexico",
-    "mexico national team": "Mexico",
-    "francia": "France",
-    "france": "France",
-    "jaibabrava": "Tampico Madero",
-    "tampicomadero": "Tampico Madero",
-    "irapuato": "Irapuato",
-    "irapuatofc": "Irapuato",
-}
-
-# Small bootstrap list for very common nicknames. The general path is API search
-# plus optional LLM canonicalizer fallback plus API validation.
-PLAYER_SEED_ALIASES: Final[dict[str, str]] = {
-    "dibu": "Emiliano Martinez",
-    "dibumtz": "Emiliano Martinez",
-    "dibumartinez": "Emiliano Martinez",
-    "emilianomartinez": "Emiliano Martinez",
-}
 
 PLAYER_STAT_FOCUS_TERMS: Final[dict[str, str]] = {
     "penal": "penalties",
@@ -358,25 +282,6 @@ def normalize_key(value: str | None) -> str:
     return re.sub(r"[^a-z0-9]+", "", text.casefold())
 
 
-def normalize_league_key(raw: str | None) -> str | None:
-    if not raw:
-        return None
-    return LEAGUE_ALIASES.get(normalize_key(raw))
-
-
-def league_label(league_key: str, lang: str = "en") -> str:
-    en, es = LEAGUE_LABELS.get(league_key, (league_key, league_key))
-    return es if str(lang).startswith("es") else en
-
-
-def canonical_team_query(query: str) -> str:
-    return TEAM_ALIASES.get(normalize_key(query), query.strip())
-
-
-def canonical_player_query(query: str) -> str:
-    return PLAYER_SEED_ALIASES.get(normalize_key(query), query.strip())
-
-
 def provider_search_variants(query: str) -> tuple[str, ...]:
     cleaned = " ".join(str(query or "").split())
     if not cleaned:
@@ -387,25 +292,12 @@ def provider_search_variants(query: str) -> tuple[str, ...]:
     return (cleaned, words[-1])
 
 
-def slot_allows_static_alias(slot: Any) -> bool:
-    authority = str(getattr(slot, "authority", "") or "")
-    if authority in {"DERIVED_ALIAS", "CANONICAL_EQUIVALENT", "VALIDATED_FOOTBALL_CONTEXT"}:
-        return bool(getattr(slot, "evidence", None) or getattr(slot, "equivalent_to", None))
-    return str(getattr(slot, "source", "") or "") in {"slash_arg", "alias", "canonicalizer"}
-
-
 async def resolve_league_candidate(client: Any, query: LeagueSlot, *, country: CountrySlot | None = None, season: int | None = None, selector: FootballIdentitySelector | None = None) -> FootballLeagueLookup:
     if not isinstance(query, LeagueSlot):
         raise InvalidFootballApiRequest("resolve_league_candidate requires a FootballQuerySpec league slot.")
     cleaned = query.name
     if not cleaned:
         return FootballLeagueLookup(candidate="", league_key=None, league_id=None, season=season)
-
-    league_key = normalize_league_key(cleaned) if slot_allows_static_alias(query) else None
-    if league_key is not None:
-        league_id = await client.resolve_league_id(league_key)
-        resolved_season = season or await client.get_current_season(league_id)
-        return FootballLeagueLookup(candidate=cleaned, league_key=league_key, league_id=league_id, season=resolved_season)
 
     rows: list[dict[str, Any]] = []
     selected_query = cleaned
@@ -537,30 +429,12 @@ async def resolve_team_candidate(
 ) -> FootballTeamLookup:
     if not isinstance(query, TeamSlot):
         raise InvalidFootballApiRequest("resolve_team_candidate requires a FootballQuerySpec team slot.")
-    alias_allowed = slot_allows_static_alias(query)
-    candidate = canonical_team_query(query.name) if alias_allowed else query.name.strip()
+    candidate = query.name.strip()
     if not candidate:
         return FootballTeamLookup(candidate="", resolution=FootballResolution(None), rows=(), searches=())
 
     rows: list[dict[str, Any]] = []
     searches: list[dict[str, Any]] = []
-    search_slots = [query]
-    if alias_allowed and normalize_key(candidate) != normalize_key(query.name):
-        try:
-            search_slots.append(
-                _make_team_slot(
-                    candidate,
-                    source="alias",
-                    authority="DERIVED_ALIAS",
-                    literal=query.literal or query.name,
-                    evidence=query.evidence or query.name,
-                    equivalent_to=candidate,
-                    league_hint=query.league_hint,
-                    country_hint=query.country_hint,
-                )
-            )
-        except InvalidFootballApiRequest:
-            pass
     scopes: list[tuple[int | None, int | None]] = [(league_id, season)]
     if allow_global and (league_id is not None or season is not None):
         scopes.append((None, None))
@@ -572,45 +446,44 @@ async def resolve_team_candidate(
         seen_scope.add(scope)
         scope_rows: list[dict[str, Any]] = []
         for use_search in ((False, True) if use_search_fallback and scope == (None, None) else (False,)):
-            for search_slot in search_slots:
-                search_name = search_slot.name
-                try:
-                    search_request = build_team_search_request(
-                        search_slot,
-                        league_id=scoped_league_id,
-                        season=scoped_season,
-                        search=use_search,
+            search_name = query.name
+            try:
+                search_request = build_team_search_request(
+                    query,
+                    league_id=scoped_league_id,
+                    season=scoped_season,
+                    search=use_search,
+                )
+            except InvalidFootballApiRequest as exc:
+                searches.append({"name": search_name, "mode": "search" if use_search else "name", "league_id": scoped_league_id, "season": scoped_season, "response_count": 0, "error": str(exc)[:160]})
+                continue
+            try:
+                found = await client.search_teams(search_request)
+            except FootballApiError as exc:
+                searches.append({"name": search_name, "mode": "search" if use_search else "name", "league_id": scoped_league_id, "season": scoped_season, "response_count": 0, "error": str(exc)[:160]})
+                continue
+            searches.append({"name": query.name, "mode": "search" if use_search else "name", "league_id": scoped_league_id, "season": scoped_season, "response_count": len(found)})
+            if use_search:
+                for index, row in enumerate(found, start=1):
+                    team = row.get("team") if isinstance(row, dict) else {}
+                    if not isinstance(team, dict):
+                        team = {}
+                    venue = team.get("venue") if isinstance(team.get("venue"), dict) else {}
+                    logger.debug(
+                        "AI football team search candidate evaluated query=%s candidate_index=%s team_id=%r team_name=%r team_code=%r country=%r national=%r venue_name=%r league_id=%s season=%s",
+                        query.name,
+                        index,
+                        team.get("id"),
+                        str(team.get("name"))[:160],
+                        str(team.get("code"))[:40],
+                        str(team.get("country"))[:120],
+                        team.get("national"),
+                        str(venue.get("name"))[:160],
+                        scoped_league_id,
+                        scoped_season,
                     )
-                except InvalidFootballApiRequest as exc:
-                    searches.append({"name": search_name, "mode": "search" if use_search else "name", "league_id": scoped_league_id, "season": scoped_season, "response_count": 0, "error": str(exc)[:160]})
-                    continue
-                try:
-                    found = await client.search_teams(search_request)
-                except FootballApiError as exc:
-                    searches.append({"name": search_name, "mode": "search" if use_search else "name", "league_id": scoped_league_id, "season": scoped_season, "response_count": 0, "error": str(exc)[:160]})
-                    continue
-                searches.append({"name": search_slot.name, "mode": "search" if use_search else "name", "league_id": scoped_league_id, "season": scoped_season, "response_count": len(found)})
-                if use_search:
-                    for index, row in enumerate(found, start=1):
-                        team = row.get("team") if isinstance(row, dict) else {}
-                        if not isinstance(team, dict):
-                            team = {}
-                        venue = team.get("venue") if isinstance(team.get("venue"), dict) else {}
-                        logger.debug(
-                            "AI football team search candidate evaluated query=%s candidate_index=%s team_id=%r team_name=%r team_code=%r country=%r national=%r venue_name=%r league_id=%s season=%s",
-                            search_slot.name,
-                            index,
-                            team.get("id"),
-                            str(team.get("name"))[:160],
-                            str(team.get("code"))[:40],
-                            str(team.get("country"))[:120],
-                            team.get("national"),
-                            str(venue.get("name"))[:160],
-                            scoped_league_id,
-                            scoped_season,
-                        )
-                rows.extend(found)
-                scope_rows.extend(found)
+            rows.extend(found)
+            scope_rows.extend(found)
             scope_deduped = _dedupe_entity_rows(scope_rows, "team")
             picked = pick_team(scope_deduped, candidate)
             if picked.selected is not None or picked.ambiguous:
@@ -632,18 +505,7 @@ def parse_player_query(query: str) -> PlayerQuery:
     filtered_words = [word for word in words if word not in PLAYER_QUERY_STOP_WORDS and not word.isdigit()]
     filtered = " ".join(filtered_words).strip()
 
-    candidates: list[str] = []
-    normalized_raw = normalize_key(raw)
-    normalized_filtered = normalize_key(filtered)
-    for alias, canonical in PLAYER_SEED_ALIASES.items():
-        if alias and (alias in normalized_raw or alias in normalized_filtered):
-            candidates.append(canonical)
-
-    if filtered:
-        candidates.append(PLAYER_SEED_ALIASES.get(normalize_key(filtered), filtered))
-    canonical = canonical_player_query(raw)
-    if canonical and canonical != raw:
-        candidates.append(canonical)
+    candidates: list[str] = [filtered] if filtered else []
 
     deduped: list[str] = []
     seen: set[str] = set()
@@ -952,10 +814,10 @@ def pick_player_identity(
         display_first_key = normalize_key(name_words[0] if len(name_words) >= 2 else None)
         display_last_key = normalize_key(name_words[-1] if name_words else None)
         first_key = profile_first_key or display_first_key
-        # The provider's firstname can hold every given name ("Cristiano Ronaldo"): the typed first name is its leading words.
+        # The provider's firstname holds every given name ("Cristiano Ronaldo", "Damián Emiliano"): the typed first name is any of them.
         first_match = bool(requested_first) and (
             first_key == requested_first
-            or _ascii_words(player.get("firstname"))[:len(requested_first_words)] == requested_first_words
+            or bool(requested_first_words) and all(word in _ascii_words(player.get("firstname")) for word in requested_first_words)
         )
         last_key = profile_last_key or display_last_key
         initial_match = bool(

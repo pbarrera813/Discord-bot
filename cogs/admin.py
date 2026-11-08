@@ -47,7 +47,6 @@ HELP_SECTION_ALIASES: dict[str, str] = {
     "sport": "sports",
     "deportes": "sports",
     "liga": "sports",
-    "ligamx": "sports",
     "fun": "fun",
     "diversion": "fun",
     "utility": "utility",
@@ -125,9 +124,6 @@ class HelpCapabilitySpec:
     body_es: str
     access: str = "everyone"
 
-HELP_INTENTIONAL_EXCLUSIONS: dict[str, str] = {}
-
-
 HELP_COMMANDS: tuple[HelpCommandSpec, ...] = (
     HelpCommandSpec("help", "general", "/help [section]", "/help [sección]", "Open this paginated guide.", "Abre esta guía por páginas."),
     HelpCommandSpec("setup", "general", "/setup", "/setup", "Show setup and capability summary.", "Muestra resumen de configuración y capacidades."),
@@ -160,7 +156,7 @@ HELP_COMMANDS: tuple[HelpCommandSpec, ...] = (
     HelpCommandSpec("football table", "sports", "/football table <league>", "/football table <liga>", "League standings.", "Tabla de posiciones."),
     HelpCommandSpec("football player", "sports", "/football player <player> [team]", "/football player <jugador> [equipo]", "Player profile, stats by competition, previous season, career teams, transfers, trophies and absences; team only separates players with the same name.", "Perfil, estadísticas por competición, temporada anterior, trayectoria, transferencias, palmarés y ausencias; el equipo solo distingue jugadores con el mismo nombre."),
     HelpCommandSpec("football h2h", "sports", "/football h2h <team> <opponent>", "/football h2h <equipo> <rival>", "The last 10 meetings between two teams.", "Los últimos 10 enfrentamientos entre dos equipos."),
-    HelpCommandSpec("football top", "sports", "/football top <scorers|assists|yellowcards|redcards>", "/football top <scorers|assists|yellowcards|redcards>", "Top scorers, assists, yellow cards, or red cards.", "Líderes de goles, asistencias, amarillas o rojas.", material_choices=("scorers", "assists", "yellowcards", "redcards")),
+    HelpCommandSpec("football top", "sports", "/football top <league> [scorers|assists|yellowcards|redcards]", "/football top <liga> [scorers|assists|yellowcards|redcards]", "Top scorers, assists, yellow cards, or red cards.", "Líderes de goles, asistencias, amarillas o rojas.", material_choices=("scorers", "assists", "yellowcards", "redcards")),
     HelpCommandSpec("football myteam", "sports", "/football myteam [team]", "/football myteam [equipo]", "Save your team for match and team, or show the saved one.", "Guarda tu equipo para match y team, o muestra el guardado."),
     HelpCommandSpec("birthday", "birthday", "/birthday", "/birthday", "Birthday command prompt.", "Ayuda rápida de cumpleaños."),
     HelpCommandSpec("birthday set", "birthday", "/birthday set <MM-DD|DD/MM> [year]", "/birthday set <MM-DD|DD/MM> [año]", "Save your birthday.", "Guarda tu cumpleaños."),

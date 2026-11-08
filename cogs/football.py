@@ -22,19 +22,11 @@ from services.server_memory import ServerMemoryInput, ServerMemoryService
 from utils.i18n import tr
 
 
-LEAGUE_CHOICES: Final[list[app_commands.Choice[str]]] = [
-    app_commands.Choice(name="ligamx", value="ligamx"),
-    app_commands.Choice(name="premier", value="premier"),
-    app_commands.Choice(name="laliga", value="laliga"),
-    app_commands.Choice(name="concacaf", value="concacaf"),
-    app_commands.Choice(name="worldcup", value="worldcup"),
-]
-LEAGUE_CODES: Final[tuple[str, ...]] = tuple(choice.value for choice in LEAGUE_CHOICES)
-LEAGUE_HELP_TEXT: Final[str] = f"Search a league or use: {', '.join(LEAGUE_CODES)}"
-LEAGUE_INVALID_TEXT_EN: Final[str] = f"Could not identify the league. Choose a suggestion or use: {', '.join(LEAGUE_CODES)}."
+LEAGUE_HELP_TEXT: Final[str] = "League name, for example Liga MX or Premier League (any league the provider lists)"
+LEAGUE_INVALID_TEXT_EN: Final[str] = "Could not identify the league. Choose a suggestion or type its full name."
 # The member's saved team: a FOOTBALL_PREFERENCE memory whose metadata holds the provider team id.
 MY_TEAM_KEY: Final[str] = "my_team"
-LEAGUE_INVALID_TEXT_ES: Final[str] = f"No se pudo identificar la liga. Elige una sugerencia o usa: {', '.join(LEAGUE_CODES)}."
+LEAGUE_INVALID_TEXT_ES: Final[str] = "No se pudo identificar la liga. Elige una sugerencia o escribe su nombre completo."
 
 
 class FootballCardView(discord.ui.View):
@@ -266,30 +258,6 @@ class FootballChoiceView(discord.ui.View):
 
 
 class FootballCog(commands.Cog):
-    _LEAGUE_ALIASES: Final[dict[str, str]] = {
-        "ligamx": "ligamx",
-        "ligabbvamx": "ligamx",
-        "premier": "premier",
-        "premierleague": "premier",
-        "epl": "premier",
-        "laliga": "laliga",
-        "laligasantander": "laliga",
-        "concacaf": "concacaf",
-        "concacafchampions": "concacaf",
-        "concacafchampionscup": "concacaf",
-        "concacafchampionsleague": "concacaf",
-        "worldcup": "worldcup",
-        "fifaworldcup": "worldcup",
-    }
-
-    _LEAGUE_LABELS: Final[dict[str, tuple[str, str]]] = {
-        "ligamx": ("Liga BBVA MX", "Liga BBVA MX"),
-        "premier": ("Premier League", "Premier League"),
-        "laliga": ("LaLiga", "LaLiga"),
-        "concacaf": ("CONCACAF Champions Cup", "Copa de Campeones CONCACAF"),
-        "worldcup": ("FIFA World Cup", "Copa Mundial FIFA"),
-    }
-
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self._table_logo_cache: dict[str, bytes] = {}
@@ -318,12 +286,6 @@ class FootballCog(commands.Cog):
     @staticmethod
     def _slug(value: str) -> str:
         return football_resolver.normalize_key(value)
-
-    def _normalize_league_key(self, raw: str | None) -> str | None:
-        return football_resolver.normalize_league_key(raw) or (self._LEAGUE_ALIASES.get(self._slug(raw)) if raw else None)
-
-    def _league_label(self, league_key: str, lang: str) -> str:
-        return football_resolver.league_label(league_key, lang)
 
     def _football_player_alias_cache(self) -> dict[str, dict[str, Any]]:
         cache = getattr(self.bot, "football_player_alias_cache", None)
@@ -368,37 +330,24 @@ class FootballCog(commands.Cog):
             await ctx.send(tr(lang, "The provider has no league/season data for that selection.",
                               "El proveedor no tiene datos de liga/temporada para esa seleccion."))
             return None
-        league_key = self._normalize_league_key(raw_league)
         service = FootballOperationService(client, identity_selector=identity_selector)
-        if league_key is None:
-            operation = compile_football_operation(
-                "FOOTBALL_LOOKUP",
-                raw_league,
-                {"data_focus": "league_lookup", "league_candidates": [raw_league]},
+        operation = compile_football_operation(
+            "FOOTBALL_LOOKUP",
+            raw_league,
+            {"data_focus": "league_lookup", "league_candidates": [raw_league]},
+        )
+        if operation.league_slots:
+            resolved_league_id, resolved_season, row, outcome = await service.resolve_league_and_season(
+                operation,
+                league_id=None,
+                season=season,
             )
-            if operation.league_slots:
-                resolved_league_id, resolved_season, row, outcome = await service.resolve_league_and_season(
-                    operation,
-                    league_id=None,
-                    season=season,
-                )
-                if outcome == FootballOutcome.SELECTED and resolved_league_id is not None and resolved_season is not None:
-                    league = row.get("league") if isinstance(row, dict) else {}
-                    label = str(league.get("name", raw_league)).strip() if isinstance(league, dict) else raw_league.strip()
-                    league_key = football_resolver.normalize_key(label) or "custom"
-                    return league_key, resolved_league_id, resolved_season
-        if league_key is None:
-            await ctx.send(
-                tr(
-                    lang,
-                    LEAGUE_INVALID_TEXT_EN,
-                    LEAGUE_INVALID_TEXT_ES,
-                )
-            )
-            return None
-        league_id = await client.resolve_league_id(league_key)
-        resolved_season = season if season is not None else await client.get_current_season(league_id)
-        return league_key, league_id, resolved_season
+            if outcome == FootballOutcome.SELECTED and resolved_league_id is not None and resolved_season is not None:
+                league = row.get("league") if isinstance(row, dict) else {}
+                label = str(league.get("name", raw_league)).strip() if isinstance(league, dict) else raw_league.strip()
+                return label, resolved_league_id, resolved_season
+        await ctx.send(tr(lang, LEAGUE_INVALID_TEXT_EN, LEAGUE_INVALID_TEXT_ES))
+        return None
 
     async def _defer_if_needed(self, ctx: commands.Context) -> None:
         if ctx.interaction and not ctx.interaction.response.is_done():
@@ -439,7 +388,7 @@ class FootballCog(commands.Cog):
                                                           identity_selector=selector)
             if context is None:
                 return
-            league_key, league_id, season = context
+            league_name, league_id, season = context
 
             async def fetch_kind(item: str) -> list[dict]:
                 focus = {"live": "live_fixtures", "today": "today_fixtures", "next": "next_fixtures", "last": "last_fixtures"}[item]
@@ -464,7 +413,7 @@ class FootballCog(commands.Cog):
         except Exception as exc:
             await ctx.send(tr(lang, f"Could not load fixtures: {exc}", f"No se pudieron cargar los partidos: {exc}"))
             return
-        label = self._league_label(league_key, lang)
+        label = league_name
         if not fixtures:
             description = tr(lang, *{"live": ("live", "en vivo"), "today": ("today's", "de hoy"),
                                      "next": ("upcoming", "proximos"), "last": ("finished", "finalizados")}[shown])
@@ -835,7 +784,7 @@ class FootballCog(commands.Cog):
                                     reload_fixtures=reload_fixtures, h2h_teams=teams)
 
     @football.command(name="top", description="Show top scorers, assists, or cards.")
-    @app_commands.describe(category="scorers, assists, yellowcards, redcards", league=LEAGUE_HELP_TEXT)
+    @app_commands.describe(league=LEAGUE_HELP_TEXT, category="scorers, assists, yellowcards, redcards")
     @app_commands.choices(
         category=[
             app_commands.Choice(name="scorers", value="scorers"),
@@ -844,16 +793,8 @@ class FootballCog(commands.Cog):
             app_commands.Choice(name="redcards", value="redcards"),
         ],
     )
-    async def football_top(self, ctx: commands.Context, category: str = "scorers", league: str = "ligamx") -> None:
-        key = category.strip().casefold()
-        if key in {"assists", "asistencias"}:
-            focus = "top_assists"
-        elif key in {"yellowcards", "yellow", "amarillas"}:
-            focus = "top_yellow_cards"
-        elif key in {"redcards", "red", "rojas"}:
-            focus = "top_red_cards"
-        else:
-            focus = "top_scorers"
+    async def football_top(self, ctx: commands.Context, league: str, category: str = "scorers") -> None:
+        focus = {"assists": "top_assists", "yellowcards": "top_yellow_cards", "redcards": "top_red_cards"}.get(category.strip().casefold(), "top_scorers")
         await self._send_league_card(ctx, league=league, focus=focus)
 
     @football_fixtures.autocomplete("league")
@@ -861,10 +802,9 @@ class FootballCog(commands.Cog):
     @football_top.autocomplete("league")
     async def football_match_league_autocomplete(self, interaction: discord.Interaction, current: str):
         query = current.strip()
-        choices = [app_commands.Choice(name=self._league_label(code, "en"), value=code) for code in LEAGUE_CODES
-                   if not query or query.casefold() in code.casefold() or query.casefold() in self._league_label(code, "en").casefold()]
+        choices: list[app_commands.Choice[str]] = []
         client = getattr(self.bot, "api_football_client", None)
-        if client is None or len(query) < 3 or self._normalize_league_key(query):
+        if client is None or len(query) < 3:
             return choices
         try:
             request = build_league_search_request(search=_make_league_slot(query, source="slash_arg"))
@@ -1133,7 +1073,7 @@ class FootballCog(commands.Cog):
             context = await self._resolve_league_context(ctx, client=client, lang=lang, raw_league=league)
             if context is None:
                 return
-            league_key, league_id, season = context
+            league_name, league_id, season = context
             is_table = focus == "standings"
             operation = compile_football_operation("FOOTBALL_TABLE" if is_table else "FOOTBALL_LOOKUP", league,
                 {"data_focus": "scorers" if focus == "top_scorers" else focus, "league_candidates": [league]})
@@ -1152,7 +1092,7 @@ class FootballCog(commands.Cog):
                 if snapshot.outcome != FootballOutcome.SELECTED:
                     notice = self._football_result_message(snapshot, lang)
                 elif not rows:
-                    name = self._league_label(league_key, lang)
+                    name = league_name
                     if is_table:
                         notice = tr(lang, f"No standings are recorded for {name} (season {season}).",
                                     f"No hay tabla registrada para {name} (temporada {season}).")
@@ -1167,7 +1107,7 @@ class FootballCog(commands.Cog):
                 if notice:
                     return {key: [{"title": label, "text": notice}] for key, label in labels.items()}, labels
                 branding = dict((snapshot.league_context_row or {}).get("league") or {})
-                branding["name"] = branding.get("name") or self._league_label(league_key, lang)
+                branding["name"] = branding.get("name") or league_name
                 if is_table:
                     pages = {key: football_cards.standings_pages(rows, league=branding, season=season,
                                                                  section=key, lang=lang) for key in labels}

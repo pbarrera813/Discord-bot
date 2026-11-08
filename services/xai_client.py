@@ -138,7 +138,6 @@ class XAIClient:
     IMAGE_GENERATION_URL = "https://api.x.ai/v1/images/generations"
     IMAGE_EDIT_URL = "https://api.x.ai/v1/images/edits"
     TTS_URL = "https://api.x.ai/v1/tts"
-    _MAX_TRUSTED_CAPABILITY_CONTEXT = 11000
     _MAX_HISTORY_MESSAGE = 900
     _MAX_SERVER_CONTEXT = 2600
     _MAX_RELAY_INSTRUCTION = 700
@@ -207,7 +206,6 @@ class XAIClient:
         *,
         server_context: str,
         user_message: str,
-        trusted_capability_context: str | None = None,
         author_name: str,
         channel_name: str,
         request_date: str | None = None,
@@ -220,7 +218,6 @@ class XAIClient:
         is_owner: bool = False,
         conversation_mode: str = "mention",
         image_urls: list[str] | None = None,
-        image_artifacts: list[object] | None = None,
         image_inputs: list[object] | None = None,
         reply_language: str | None = None,
         author_permissions: str | None = None,
@@ -241,10 +238,6 @@ class XAIClient:
         )
         if not safe_user_message:
             safe_user_message = "..."
-        safe_trusted_capability_context = self._sanitize_untrusted_text(
-            trusted_capability_context,
-            limit=self._MAX_TRUSTED_CAPABILITY_CONTEXT,
-        )
         safe_conversation_mode = self._sanitize_untrusted_text(
             conversation_mode,
             limit=40,
@@ -270,7 +263,7 @@ class XAIClient:
         safe_image_urls: list[str] = []
         raw_image_inputs = image_inputs
         if raw_image_inputs is None:
-            raw_image_inputs = list(image_urls or []) + list(image_artifacts or [])
+            raw_image_inputs = list(image_urls or [])
         for image_input in raw_image_inputs:
             if len(safe_image_urls) >= 4:
                 break
@@ -447,13 +440,6 @@ class XAIClient:
                         ),
                     }
                 )
-        if safe_trusted_capability_context:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": safe_trusted_capability_context,
-                }
-            )
         messages.append(
             {
                 "role": "user",
@@ -491,8 +477,6 @@ class XAIClient:
                 payload_context_sources.append("mention_hints")
             if safe_relay_instruction:
                 payload_context_sources.append("relay_instruction")
-            if safe_trusted_capability_context:
-                payload_context_sources.append("trusted_capability_context")
             if available_channels:
                 payload_context_sources.append("channel_catalog")
             if available_emojis:
